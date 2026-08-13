@@ -1,0 +1,39 @@
+[package]
+name = "exsolis_client"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "exsolis"
+path = "src/main.rs"
+
+[dependencies]
+exsolis_common.workspace = true
+exsolis_server.workspace = true
+
+bevy_app.workspace = true
+bevy_ecs.workspace = true
+bevy_asset.workspace = true
+bevy_input.workspace = true
+bevy_window.workspace = true
+bevy_winit.workspace = true
+bevy_time.workspace = true
+bevy_transform.workspace = true
+bevy_tasks.workspace = true
+bevy_log.workspace = true
+bevy_a11y.workspace = true
+bevy_diagnostic.workspace = true
+bevy_renet.workspace = true
+
+
+glam.workspace = true
+image.workspace = true
+winit.workspace = true
+vulkano.workspace = true
+vulkano-macros.workspace = true
+vulkano-shaders.workspace = true
+vulkano-taskgraph.workspace = true
+
+mimalloc.workspace = true
+rand.workspace = true
+bincode.workspace = true

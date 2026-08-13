@@ -1,0 +1,43 @@
+[package]
+name = "exsolis_server"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "exsolis_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "exsolis_server_bin"
+path = "src/main.rs"
+
+[dependencies]
+exsolis_common.workspace = true
+
+bevy_app.workspace = true
+bevy_ecs.workspace = true
+bevy_time.workspace = true
+bevy_transform.workspace = true
+bevy_tasks.workspace = true
+bevy_log.workspace = true
+bevy_diagnostic.workspace = true
+bevy_renet.workspace = true
+bevy_internal.workspace = true
+
+glam.workspace = true
+rand.workspace = true
+rayon.workspace = true
+opensimplex2.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+bincode.workspace = true
+
+
+mlua.workspace = true
+
+mimalloc = { workspace = true, optional = true }
+
+
+[features]
+default = []
+standalone = ["dep:mimalloc"]

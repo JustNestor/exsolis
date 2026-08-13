@@ -1,0 +1,12 @@
+[package]
+name = "exsolis_common"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bevy_ecs.workspace = true
+bevy_reflect.workspace = true
+glam.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+serde.workspace = true
