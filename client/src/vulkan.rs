@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use bevy_log::info;
 use bevy_window::{PrimaryWindow, RawHandleWrapperHolder, Window};
 pub use vulkano::{
     VulkanError, VulkanLibrary,
@@ -44,11 +45,13 @@ pub fn setup_vulkan(
     windows: Query<(Entity, &Window, &RawHandleWrapperHolder), With<PrimaryWindow>>,
 ) {
     let Ok((_, window, handle)) = windows.single() else {
+        info!("still no window");
         return;
     };
     let raw_handle = handle.0.lock().unwrap();
 
     let Some(raw_handle_ref) = raw_handle.as_ref().map(|x| unsafe { x.get_handle() }) else {
+        info!("still no handle");
         return;
     };
 
@@ -171,6 +174,8 @@ pub fn setup_vulkan(
         min_depth: 0.0,
         max_depth: 1.0,
     };
+
+    info!("Creating context");
 
     commands.insert_resource(VulkanContext {
         instance,

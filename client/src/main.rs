@@ -3,8 +3,10 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use bevy_a11y::AccessibilityPlugin;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_internal::DefaultPlugins;
 use bevy_log::{LogPlugin, prelude::*};
 use bevy_renet::{
     RenetClient, RenetClientPlugin, client_connected,
@@ -14,17 +16,31 @@ use bevy_renet::{
     renet::{ConnectionConfig, DefaultChannel},
 };
 
+use bevy_window::{Window, WindowPlugin, WindowResolution};
 use exsolis_common::{ClientMessage, PROTOCOL_ID, SERVER_ADDR, ServerMessage};
+
+mod render;
+mod vulkan;
+use render::*;
+use vulkan::*;
 
 fn main() {
     App::new()
         .add_plugins((
-            bevy_app::TaskPoolPlugin::default(),
-            bevy_diagnostic::FrameCountPlugin,
-            bevy_time::TimePlugin,
-            bevy_app::ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
+            WindowPlugin {
+                primary_window: Some(Window {
+                    present_mode: bevy_window::PresentMode::Mailbox,
+                    title: "Exsolis".to_string(),
+                    resolution: WindowResolution::new(1920, 1080).with_scale_factor_override(1.0),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            AccessibilityPlugin,
             LogPlugin::default(),
+            DefaultPlugins,
         ))
+        .add_plugins(bevy_winit::WinitPlugin::default())
         .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
         .insert_resource(RenetClient::new(ConnectionConfig::default()))
         .insert_resource(new_transport())
@@ -35,6 +51,7 @@ fn main() {
                 .chain()
                 .run_if(client_connected),
         )
+        .add_systems(PostStartup, setup_vulkan)
         .run();
 }
 

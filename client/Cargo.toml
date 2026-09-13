@@ -24,6 +24,7 @@ bevy_log.workspace = true
 bevy_a11y.workspace = true
 bevy_diagnostic.workspace = true
 bevy_renet.workspace = true
+bevy_internal.workspace = true
 
 
 glam.workspace = true

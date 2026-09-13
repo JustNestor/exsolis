@@ -1,7 +1,7 @@
 use super::*;
 use bevy_ecs::message::Message;
 use bevy_renet::renet::SendType::Unreliable;
-use glam::Vec3;
+use glam::{Vec3, Vec4};
 
 pub struct EventsPlugin;
 

@@ -24,6 +24,7 @@ mod network;
 
 use events::*;
 use network::*;
+// mod level;
 
 #[derive(Component)]
 pub struct Player(PlayerId);
@@ -36,20 +37,12 @@ pub struct PlayerMap {
 
 fn main() {
     App::new()
-        .add_plugins((
-            // bevy_app::TaskPoolPlugin::default(),
-            // bevy_diagnostic::FrameCountPlugin,
-            // bevy_time::TimePlugin,
-            // bevy_app::ScheduleRunnerPlugin::run_loop(Duration::from_secs_f64(1.0 / 60.0)),
-            DefaultPlugins,
-            LogPlugin::default(),
-        ))
+        .add_plugins((DefaultPlugins, LogPlugin::default()))
         .add_plugins((RenetServerPlugin, NetcodeServerPlugin))
         .add_plugins(EventsPlugin)
         .insert_resource(RenetServer::new(ConnectionConfig::default()))
         .insert_resource(new_transport())
         .init_resource::<PlayerMap>()
         .add_observer(log_netcode_error)
-        // .add_systems(Update, (receive_movement, broadcast_positions).chain())
         .run();
 }
