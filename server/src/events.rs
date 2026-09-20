@@ -2,7 +2,9 @@ use super::*;
 use bevy_ecs::message::Message;
 use bevy_renet::renet::SendType::Unreliable;
 use chunks::{PlayerPosition, RenderDistanceRequested};
+use exsolis_common::SPAWN_POS;
 use glam::{Vec3, Vec4};
+use movement::{PlayerInput, PositionSync};
 
 pub struct EventsPlugin;
 
@@ -54,7 +56,12 @@ pub fn on_server_event(
             // them and they never get sent a single chunk — this was the
             // root cause of the blue-screen-with-no-blocks symptom.
             let entity = commands
-                .spawn((Player(client_id), PlayerPosition(Vec3::new(0.0, 80.0, 0.0))))
+                .spawn((
+                    Player(client_id),
+                    PlayerPosition(Vec3::from(SPAWN_POS)),
+                    PlayerInput::default(),
+                    PositionSync::default(),
+                ))
                 .id();
             player_map.playerid_to_entity.insert(client_id, entity);
             player_map.entity_to_playerid.insert(entity, client_id);
@@ -75,23 +82,21 @@ pub fn on_server_event(
     }
 }
 
-/// Units/second the server moves a player along the direction vector
-/// their client sends. This is a placeholder authoritative speed —
-/// swap for whatever your single-player FlyCamera's `speed`/`sprint_multiplier`
-/// should map to server-side once sprint state is part of the packet too.
-const SERVER_MOVE_SPEED: f32 = 8.0;
-
+/// All client -> server messages arrive on ReliableOrdered. Clients only
+/// send movement when it *changes*, so a lost or reordered packet would
+/// leave the server with a stale direction (e.g. a dropped "stop" = the
+/// player runs forever). Reliable + ordered rules that out, and the
+/// client->server ReliableOrdered channel only carries these tiny messages
+/// (chunk data uses the separate server->client channel), so there's no
+/// head-of-line blocking behind chunk streaming.
 pub fn recive_packets(
     mut server: ResMut<RenetServer>,
     mut commands: Commands,
     player_map: Res<PlayerMap>,
-    mut positions: Query<&mut PlayerPosition>,
-    time: Res<bevy_time::Time>,
+    mut inputs: Query<&mut PlayerInput>,
 ) {
-    let dt = time.delta_secs();
-
     for client_id in server.clients_id() {
-        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
+        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
             let Ok(msg) = bincode::deserialize::<ClientMessage>(&bytes) else {
                 warn!("bad packet from {client_id}, dropping");
                 continue;
@@ -99,18 +104,21 @@ pub fn recive_packets(
 
             match msg {
                 ClientMessage::Move { x, y, z } => {
+                    // x/y/z is the direction the client is moving in (zero =
+                    // stopped), not a destination. It's stored and applied
+                    // every tick by movement.rs::apply_player_input.
+                    let dir = Vec3::new(x, y, z);
+                    if !dir.is_finite() {
+                        continue;
+                    }
                     let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
                         continue;
                     };
-                    let Ok(mut pos) = positions.get_mut(entity) else {
+                    let Ok(mut input) = inputs.get_mut(entity) else {
                         continue;
                     };
-                    // x/y/z here is the normalized direction the client is
-                    // pressing, not a destination — see player.rs on the
-                    // client. No collision/physics yet, same as the rest
-                    // of this server; this just gets something visibly
-                    // moving so compute_desired_chunks has real input.
-                    pos.0 += Vec3::new(x, y, z) * SERVER_MOVE_SPEED * dt;
+                    // Clamp so a malicious client can't send (1000, 0, 0) to speed-hack.
+                    input.0 = dir.clamp_length_max(1.0);
                 }
                 ClientMessage::SetRenderDistance(radius) => {
                     commands.write_message(RenderDistanceRequested {

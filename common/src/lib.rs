@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
+
 mod chunk_blocks;
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 pub const PROTOCOL_ID: u64 = 1;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
+
+/// Where players spawn, shared by server and client so they can't drift.
+/// Terrain surface tops out around y=24, so this is just above ground.
+pub const SPAWN_POS: [f32; 3] = [0.0, 28.0, 0.0];
 
 pub type LevelId = u32;
 pub type PlayerId = u64;
@@ -35,9 +40,10 @@ impl BlockPos {
     }
 }
 
-// #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+/// `#[repr(u8)]` + explicit discriminants: the numeric id is what goes into
+/// `ChunkBlocks` palettes on the wire. Never reorder/renumber existing
+/// variants without bumping the protocol; append new ones and extend `ALL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum BlockType {
     Air = 0,
@@ -53,32 +59,33 @@ pub enum BlockType {
 }
 
 impl BlockType {
+    /// Every variant, indexed by its `u8` discriminant (checked by a test in
+    /// chunk_blocks.rs).
     pub const ALL: [BlockType; 10] = [
-        Self::Air,
-        Self::Stone,
-        Self::Dirt,
-        Self::Grass,
-        Self::Sand,
-        Self::Water,
-        Self::Snow,
-        Self::Glass,
-        Self::Log,
-        Self::Leaves,
+        BlockType::Air,
+        BlockType::Stone,
+        BlockType::Dirt,
+        BlockType::Grass,
+        BlockType::Sand,
+        BlockType::Water,
+        BlockType::Snow,
+        BlockType::Glass,
+        BlockType::Log,
+        BlockType::Leaves,
     ];
+
     pub fn from_u8(id: u8) -> Option<Self> {
         Self::ALL.get(id as usize).copied()
     }
 
-    pub fn is_solid(&self) -> bool {
-        !matches!(self, Self::Air | Self::Water)
+    pub fn is_air(self) -> bool {
+        matches!(self, BlockType::Air)
     }
 
-    pub fn is_air(&self) -> bool {
-        self == &Self::Air
+    pub fn is_solid(self) -> bool {
+        !matches!(self, BlockType::Air | BlockType::Water)
     }
 }
-
-// pub type ChunkBlocks = Vec<BlockType>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Face {
@@ -148,5 +155,15 @@ pub enum ServerMessage {
     },
     EntityDisappear {
         entity_id: u64,
+    },
+    /// Authoritative position of the receiving player themself. Sent on the
+    /// unreliable channel whenever it changes (and repeated a few ticks
+    /// after it stops so a single dropped packet can't leave the client
+    /// parked at a stale spot). Appended last so existing variant indices
+    /// don't shift.
+    YourPosition {
+        x: f32,
+        y: f32,
+        z: f32,
     },
 }

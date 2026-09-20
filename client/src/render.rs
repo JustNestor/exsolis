@@ -375,7 +375,10 @@ fn setup_renderer(
             viewport_state: Some(&ViewportState::default()),
             rasterization_state: Some(&RasterizationState {
                 cull_mode: CullMode::Back,
-                front_face: FrontFace::CounterClockwise,
+                // mesh.rs emits faces clockwise when seen from outside, and
+                // FlyCamera::view_projection flips Y for Vulkan's Y-down NDC,
+                // so the rasterizer sees front faces as clockwise.
+                front_face: FrontFace::Clockwise,
                 ..Default::default()
             }),
             multisample_state: Some(&MultisampleState::default()),
@@ -643,7 +646,7 @@ fn render_frame(
     mut vk: ResMut<VulkanContext>,
     mut render_state: ResMut<RenderState>,
     windows: Query<&Window, With<PrimaryWindow>>,
-    camera: Query<&Transform, With<crate::player::LocalPlayer>>,
+    camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -684,19 +687,15 @@ fn render_frame(
             .unwrap();
     }
 
-    // Placeholder view-proj until a real camera component exists in this
-    // project — swap for the same eye/view_projection pattern the
-    // established project's FlyCamera uses once you have one here.
     let aspect = vk.viewport.extent[0] / vk.viewport.extent[1];
-    let proj = glam::Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 1000.0);
-    let view = camera
+    let view_proj = camera
         .iter()
         .next()
-        .map(|t| glam::Mat4::look_to_rh(t.translation, t.forward().as_vec3(), glam::Vec3::Y))
+        .map(|(transform, cam)| cam.view_projection(transform, aspect))
         .unwrap_or(glam::Mat4::IDENTITY);
 
     let frame = FrameData {
-        view_proj: (proj * view).to_cols_array_2d(),
+        view_proj: view_proj.to_cols_array_2d(),
         viewport: vk.viewport.clone(),
     };
 

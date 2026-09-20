@@ -4,9 +4,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bevy_app::prelude::*;
+use bevy_app::{ScheduleRunnerPlugin, prelude::*};
 use bevy_ecs::prelude::*;
-use bevy_internal::DefaultPlugins;
+use bevy_internal::MinimalPlugins;
 use bevy_log::{LogPlugin, prelude::*};
 use bevy_renet::{
     RenetServer, RenetServerEvent, RenetServerPlugin,
@@ -17,14 +17,16 @@ use bevy_renet::{
     renet::{ChannelConfig, ConnectionConfig, DefaultChannel, SendType, ServerEvent},
 };
 
-use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMessage};
+use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMessage, TICK_RATE};
 
 mod chunks;
 mod events;
+mod movement;
 mod network;
 
 use chunks::*;
 use events::*;
+use movement::*;
 use network::*;
 // mod level;
 
@@ -54,10 +56,20 @@ pub fn connection_config() -> ConnectionConfig {
 }
 
 fn main() {
+    // Headless server: no window / renderer, and the main loop is paced to
+    // TICK_RATE (20 TPS) instead of spinning as fast as the CPU allows.
+    // MinimalPlugins already includes TaskPoolPlugin (needed for
+    // AsyncComputeTaskPool in chunks.rs) and TimePlugin.
+    let tick = Duration::from_secs_f64(1.0 / TICK_RATE as f64);
+
     App::new()
-        .add_plugins((DefaultPlugins, LogPlugin::default()))
+        .add_plugins((
+            MinimalPlugins.set(ScheduleRunnerPlugin::run_loop(tick)),
+            LogPlugin::default(),
+        ))
         .add_plugins((RenetServerPlugin, NetcodeServerPlugin))
         .add_plugins(EventsPlugin)
+        .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)
         .insert_resource(RenetServer::new(connection_config()))
         .insert_resource(new_transport())

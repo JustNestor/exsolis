@@ -1,16 +1,18 @@
 // src/player.rs — client-side camera + input.
 //
-// Adapted from the single-player FlyCamera. The single-player version
-// ran movement AND collision locally against `Chunk` because there was
-// no server. Here the server is authoritative over position, so this
-// version is split in two:
-//   - FlyCamera + look + cursor grab: purely local, no networking needed.
-//   - Movement: WASD/space/ctrl/shift state is sampled and sent to the
-//     server as ClientMessage::Move every frame it changes; the actual
-//     Transform is NOT stepped locally by input. If you want local
-//     movement to feel instant instead of waiting on a round trip,
-//     add client-side prediction later — start simple first and get
-//     something moving before adding that complexity.
+// The server is authoritative over position. This module:
+//   - FlyCamera + look + cursor grab: purely local (rotation is instant).
+//   - Movement input: WASD/space/ctrl are sampled into a direction vector
+//     and sent to the server as ClientMessage::Move ONLY WHEN IT CHANGES
+//     (throttled to the server tick rate). The server keeps applying the
+//     last direction every tick, so holding a key costs zero packets.
+//   - Movement result: the server sends its authoritative position back
+//     (ServerMessage::YourPosition); the camera's Transform eases toward it.
+//     There is no client-side prediction yet, so movement has about one
+//     round trip plus one server tick of latency. If that starts to feel
+//     bad, add prediction with input sequence numbers + reconciliation.
+
+use std::time::{Duration, Instant};
 
 use bevy_app::prelude::*;
 use bevy_ecs::message::MessageReader;
@@ -22,11 +24,24 @@ use bevy_renet::RenetClient;
 use bevy_renet::renet::DefaultChannel;
 use bevy_transform::prelude::Transform;
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use exsolis_common::ClientMessage;
+use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, Vec3};
 
 #[derive(Component)]
 pub struct LocalPlayer;
+
+/// Latest authoritative position from the server (`None` until the first
+/// snapshot arrives). The local Transform eases toward it.
+#[derive(Component, Default)]
+pub struct ServerTarget(pub Option<Vec3>);
+
+/// Exponential-follow rate (1/s) toward the server position. ~15 hides the
+/// 20 Hz snapshot cadence without adding noticeable lag.
+const FOLLOW_RATE: f32 = 15.0;
+
+/// If we're further than this from the server (teleport, big desync), snap
+/// instead of easing.
+const SNAP_DISTANCE: f32 = 8.0;
 
 #[derive(Component)]
 pub struct FlyCamera {
@@ -54,14 +69,18 @@ impl FlyCamera {
         transform.translation + Vec3::Y * self.eye_height
     }
 
-    /// Same shape as render.rs's placeholder view_proj — call this from
-    /// render_frame instead of the `Mat4::IDENTITY` fallback once a
-    /// LocalPlayer entity exists.
+    /// World -> clip matrix for the renderer. Vulkan's NDC has +Y pointing
+    /// DOWN, but `glam::Mat4::perspective_rh` produces OpenGL-style +Y up,
+    /// so Y is flipped here; without it the whole world renders upside-down.
+    /// (That flip also reverses triangle winding as the rasterizer sees it,
+    /// which is why the pipeline in render.rs uses `FrontFace::Clockwise`
+    /// for the clockwise-from-outside faces produced by mesh.rs.)
     pub fn view_projection(&self, transform: &Transform, aspect: f32) -> glam::Mat4 {
         let eye = self.eye_position(transform);
         let forward = transform.rotation * Vec3::NEG_Z;
-        glam::Mat4::perspective_rh(self.fov_y, aspect, 0.1, 1000.0)
-            * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
+        let mut proj = glam::Mat4::perspective_rh(self.fov_y, aspect, 0.1, 1000.0);
+        proj.y_axis.y *= -1.0;
+        proj * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
     }
 }
 
@@ -71,7 +90,12 @@ impl Plugin for PlayerPlugin {
     fn build(&self, app: &mut App) {
         app.add_systems(Startup, spawn_local_player).add_systems(
             Update,
-            (toggle_cursor_grab, fly_camera_look, send_movement_input),
+            (
+                toggle_cursor_grab,
+                fly_camera_look,
+                send_movement_input,
+                (receive_server_position, follow_server_position).chain(),
+            ),
         );
     }
 }
@@ -80,7 +104,8 @@ fn spawn_local_player(mut commands: Commands) {
     commands.spawn((
         LocalPlayer,
         FlyCamera::default(),
-        Transform::from_xyz(0.0, 80.0, 0.0),
+        Transform::from_translation(Vec3::from(SPAWN_POS)),
+        ServerTarget::default(),
     ));
 }
 
@@ -133,22 +158,36 @@ fn fly_camera_look(
     }
 }
 
-/// Sends raw WASD/space/ctrl axis state to the server every frame the
-/// window is grabbed. This is deliberately dumb (no client-side physics,
-/// no dead-reckoning) — see the module doc comment. Server decides what
-/// "Move" actually means once events.rs stops ignoring it (see the
-/// server-side patch).
+/// What we last told the server, so we only send when something changed.
+#[derive(Default)]
+struct InputSyncState {
+    last_sent: Vec3,
+    last_sent_at: Option<Instant>,
+}
+
+/// Samples WASD (+ Space up / Ctrl down) into a world-space direction and
+/// sends it to the server only when it changes.
+///
+/// - Sent over ReliableOrdered: since we don't resend, a lost "stop" packet
+///   would otherwise leave the server moving the player forever.
+/// - Throttled to the server tick rate: turning while walking changes the
+///   direction every frame, but the server only integrates at TICK_RATE, so
+///   anything faster is wasted. A change blocked by the throttle isn't lost;
+///   it's compared against `last_sent` again next frame and goes out as soon
+///   as the interval elapses.
+/// - Releasing the cursor counts as "stop", otherwise Esc while holding W
+///   would keep the player running.
 fn send_movement_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     query: Query<&Transform, With<LocalPlayer>>,
     mut client: ResMut<RenetClient>,
+    mut sync: Local<InputSyncState>,
 ) {
-    let grabbed = windows
-        .single()
-        .map(|cursor| cursor.grab_mode != CursorGrabMode::None)
-        .unwrap_or(false);
-    if !grabbed {
+    if !client.is_connected() {
+        // A (re)connection gets a fresh server-side player with zero input,
+        // so reset our baseline and resend whatever is held once connected.
+        *sync = InputSyncState::default();
         return;
     }
 
@@ -156,38 +195,111 @@ fn send_movement_input(
         return;
     };
 
+    let grabbed = windows
+        .single()
+        .map(|cursor| cursor.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+
     let mut direction = Vec3::ZERO;
-    let forward_3d = transform.rotation * Vec3::NEG_Z;
-    let forward = Vec3::new(forward_3d.x, 0.0, forward_3d.z).normalize_or_zero();
-    let right_3d = transform.rotation * Vec3::X;
-    let right = Vec3::new(right_3d.x, 0.0, right_3d.z).normalize_or_zero();
+    if grabbed {
+        let forward_3d = transform.rotation * Vec3::NEG_Z;
+        let forward = Vec3::new(forward_3d.x, 0.0, forward_3d.z).normalize_or_zero();
+        let right_3d = transform.rotation * Vec3::X;
+        let right = Vec3::new(right_3d.x, 0.0, right_3d.z).normalize_or_zero();
 
-    if keys.pressed(KeyCode::KeyW) {
-        direction += forward;
-    }
-    if keys.pressed(KeyCode::KeyS) {
-        direction -= forward;
-    }
-    if keys.pressed(KeyCode::KeyD) {
-        direction += right;
-    }
-    if keys.pressed(KeyCode::KeyA) {
-        direction -= right;
-    }
-    if direction.length_squared() > 0.0 {
-        direction = direction.normalize();
+        if keys.pressed(KeyCode::KeyW) {
+            direction += forward;
+        }
+        if keys.pressed(KeyCode::KeyS) {
+            direction -= forward;
+        }
+        if keys.pressed(KeyCode::KeyD) {
+            direction += right;
+        }
+        if keys.pressed(KeyCode::KeyA) {
+            direction -= right;
+        }
+        if keys.pressed(KeyCode::Space) {
+            direction += Vec3::Y;
+        }
+        if keys.pressed(KeyCode::ControlLeft) {
+            direction -= Vec3::Y;
+        }
+        direction = direction.normalize_or_zero();
     }
 
-    // Sent every grabbed frame, not just on change: ClientMessage::Move
-    // goes over the Unreliable channel (see events.rs), so a dropped
-    // packet should just get superseded by the next one rather than
-    // leaving the server holding stale input.
+    if direction.abs_diff_eq(sync.last_sent, 1e-3) {
+        return;
+    }
+
+    let now = Instant::now();
+    let min_interval = Duration::from_secs_f32(1.0 / TICK_RATE);
+    if let Some(at) = sync.last_sent_at {
+        if now.duration_since(at) < min_interval {
+            return;
+        }
+    }
+
     let msg = bincode::serialize(&ClientMessage::Move {
         x: direction.x,
         y: direction.y,
         z: direction.z,
     })
     .unwrap();
-    // info!("sending move");
-    // client.send_message(DefaultChannel::Unreliable, msg);
+    client.send_message(DefaultChannel::ReliableOrdered, msg);
+    sync.last_sent = direction;
+    sync.last_sent_at = Some(now);
+}
+
+/// Drains authoritative position snapshots. Nothing else reads the
+/// Unreliable server->client channel (chunks use ReliableOrdered, read in
+/// streaming.rs), so this can't steal anyone else's messages.
+fn receive_server_position(
+    mut client: ResMut<RenetClient>,
+    mut query: Query<(&mut Transform, &mut ServerTarget), With<LocalPlayer>>,
+) {
+    let Ok((mut transform, mut target)) = query.single_mut() else {
+        return;
+    };
+
+    while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
+        let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
+            continue;
+        };
+        if let ServerMessage::YourPosition { x, y, z } = msg {
+            let pos = Vec3::new(x, y, z);
+            if target.0.is_none() {
+                transform.translation = pos; // first snapshot: snap, don't glide from spawn
+            }
+            target.0 = Some(pos);
+        }
+    }
+}
+
+/// Eases the camera toward the last server position (frame-rate independent).
+fn follow_server_position(
+    mut query: Query<(&mut Transform, &ServerTarget), With<LocalPlayer>>,
+    mut last_frame: Local<Option<Instant>>,
+) {
+    let now = Instant::now();
+    let dt = last_frame
+        .replace(now)
+        .map(|prev| now.duration_since(prev).as_secs_f32())
+        .unwrap_or(0.0)
+        .min(0.1);
+
+    let Ok((mut transform, target)) = query.single_mut() else {
+        return;
+    };
+    let Some(target) = target.0 else {
+        return;
+    };
+
+    let delta = target - transform.translation;
+    if delta.length_squared() > SNAP_DISTANCE * SNAP_DISTANCE {
+        transform.translation = target;
+        return;
+    }
+    let alpha = 1.0 - (-FOLLOW_RATE * dt).exp();
+    transform.translation += delta * alpha;
 }

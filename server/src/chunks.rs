@@ -11,6 +11,12 @@ pub const DEFAULT_RENDER_DISTANCE: u8 = 5;
 /// Hard cap so a malicious/buggy client can't ask for a radius that melts the server.
 const MAX_RENDER_DISTANCE: u8 = 32;
 
+/// Chunk layers kept loaded above and below the player's chunk. Terrain
+/// lives in y=0 while a player may be anywhere vertically, so a flat ring
+/// at `center.y` used to stream nothing but empty sky. All-air / all-stone
+/// chunks are 34 bytes on the wire, so extra layers are cheap.
+const VERTICAL_RENDER_DISTANCE: i32 = 2;
+
 /// Chunk packets sent to any one player per tick, across ALL their pending
 /// chunks combined. Without this, a fresh join (or a big render-distance
 /// bump) computes dozens of desired chunks that can all finish generating
@@ -21,7 +27,12 @@ const MAX_RENDER_DISTANCE: u8 = 32;
 /// and gets the connection killed with "reliable channel memory usage
 /// was exhausted". Keeping this modest turns the burst into a steady
 /// trickle across many ticks instead.
-const MAX_CHUNK_SENDS_PER_PLAYER_PER_TICK: usize = 4;
+///
+/// Chunks are palette-compressed now (~8 KB terrain, 34 B for uniform
+/// chunks), so 16/tick at 20 TPS is a few hundred KB/s at worst. The
+/// `RESERVE_BYTES` check in `stream_chunks_to_players` is still the real
+/// safety net against exhausting the channel.
+const MAX_CHUNK_SENDS_PER_PLAYER_PER_TICK: usize = 16;
 
 pub struct ChunksPlugin;
 
@@ -55,6 +66,10 @@ pub struct ChunkRenderState {
     /// Chunks that should be loaded on their client right now (recomputed each tick
     /// from current_chunk + render_distance).
     pub desired: HashSet<ChunkCoord>,
+    /// (center chunk, radius) that `desired` was last built for. Lets
+    /// `compute_desired_chunks` rebuild when the radius changes, not only
+    /// when the player crosses a chunk border.
+    desired_key: Option<(ChunkCoord, u8)>,
 }
 
 impl Default for ChunkRenderState {
@@ -65,6 +80,7 @@ impl Default for ChunkRenderState {
             current_chunk: ChunkCoord::new(i32::MIN, i32::MIN, i32::MIN),
             loaded: HashSet::new(),
             desired: HashSet::new(),
+            desired_key: None,
         }
     }
 }
@@ -120,26 +136,33 @@ fn init_player_render_state(
 }
 
 /// Recompute each player's desired chunk set from their current position + radius.
-/// Cheap: only rebuild when the player has actually changed chunk or radius since last tick.
+/// Only rebuilds when the player's chunk or render distance actually changed.
 fn compute_desired_chunks(mut query: Query<(&PlayerPosition, &mut ChunkRenderState)>) {
     for (pos, mut state) in &mut query {
         let center = world_to_chunk(pos.0);
-        let radius = state.render_distance as i32;
-
-        // Skip recompute if nothing that affects the desired set has changed.
-        let radius_matches_len_hint = true; // desired is rebuilt fresh below either way
-        if center == state.current_chunk && radius_matches_len_hint && !state.desired.is_empty() {
+        let key = (center, state.render_distance);
+        if state.desired_key == Some(key) {
             continue;
         }
+        state.desired_key = Some(key);
         state.current_chunk = center;
 
-        let mut desired = HashSet::with_capacity(((radius * 2 + 1).pow(2)) as usize);
-        // Simple square/cylindrical radius (x/z), flat in y for now — swap for a sphere
-        // trivially later by adding a dy loop + distance check if you want vertical falloff.
-        for dx in -radius..=radius {
-            for dz in -radius..=radius {
-                if dx * dx + dz * dz <= radius * radius {
-                    desired.insert(ChunkCoord::new(center.x + dx, center.y, center.z + dz));
+        let radius = state.render_distance as i32;
+        let columns = ((radius * 2 + 1).pow(2)) as usize;
+        let layers = (VERTICAL_RENDER_DISTANCE * 2 + 1) as usize;
+        let mut desired = HashSet::with_capacity(columns * layers);
+
+        // Circular in x/z, a fixed number of layers in y.
+        for dy in -VERTICAL_RENDER_DISTANCE..=VERTICAL_RENDER_DISTANCE {
+            for dx in -radius..=radius {
+                for dz in -radius..=radius {
+                    if dx * dx + dz * dz <= radius * radius {
+                        desired.insert(ChunkCoord::new(
+                            center.x + dx,
+                            center.y + dy,
+                            center.z + dz,
+                        ));
+                    }
                 }
             }
         }
@@ -197,6 +220,10 @@ fn stream_chunks_to_players(
 ) {
     for (player, mut state) in &mut query {
         let center = state.current_chunk;
+
+        // Ready-but-not-yet-sent chunks, nearest to the player first
+        // (HashSet iteration order is arbitrary, which would otherwise
+        // stream the horizon before the ground under their feet).
         let mut coords: Vec<ChunkCoord> = state
             .desired
             .iter()
@@ -213,14 +240,18 @@ fn stream_chunks_to_players(
             if sent >= MAX_CHUNK_SENDS_PER_PLAYER_PER_TICK {
                 break;
             }
+
             let blocks = world.ready[&coord].clone();
             let msg = bincode::serialize(&ServerMessage::ChunkData { coord, blocks }).unwrap();
+
             let available =
                 server.channel_available_memory(player.0, DefaultChannel::ReliableOrdered);
             if available < msg.len() + RESERVE_BYTES {
-                break;
+                break; // channel is full; resume next tick once acks free space
             }
+
             debug!("chunk {coord:?}: {} bytes", msg.len());
+
             server.send_message(player.0, DefaultChannel::ReliableOrdered, msg);
             state.loaded.insert(coord);
             sent += 1;
