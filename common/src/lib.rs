@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+mod chunk_blocks;
+pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
-pub const PROTOCOL_ID: u64 = 0;
+pub const PROTOCOL_ID: u64 = 1;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -33,31 +35,50 @@ impl BlockPos {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+// #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[repr(u8)]
 pub enum BlockType {
-    Air,
-    Stone,
-    Dirt,
-    Grass,
-    Sand,
-    Water,
-    Snow,
-    Glass,
-    Log,
-    Leaves,
+    Air = 0,
+    Stone = 1,
+    Dirt = 2,
+    Grass = 3,
+    Sand = 4,
+    Water = 5,
+    Snow = 6,
+    Glass = 7,
+    Log = 8,
+    Leaves = 9,
 }
 
 impl BlockType {
-    pub fn is_air(self) -> bool {
-        matches!(self, BlockType::Air)
+    pub const ALL: [BlockType; 10] = [
+        Self::Air,
+        Self::Stone,
+        Self::Dirt,
+        Self::Grass,
+        Self::Sand,
+        Self::Water,
+        Self::Snow,
+        Self::Glass,
+        Self::Log,
+        Self::Leaves,
+    ];
+    pub fn from_u8(id: u8) -> Option<Self> {
+        Self::ALL.get(id as usize).copied()
     }
 
-    pub fn is_solid(self) -> bool {
-        !matches!(self, BlockType::Air | BlockType::Water)
+    pub fn is_solid(&self) -> bool {
+        !matches!(self, Self::Air | Self::Water)
+    }
+
+    pub fn is_air(&self) -> bool {
+        self == &Self::Air
     }
 }
 
-pub type ChunkBlocks = Vec<BlockType>;
+// pub type ChunkBlocks = Vec<BlockType>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Face {

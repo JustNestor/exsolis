@@ -1,3 +1,12 @@
+#![allow(
+    dead_code,
+    unsafe_op_in_unsafe_fn,
+    unused_variables,
+    clippy::too_many_arguments,
+    clippy::unnecessary_wraps,
+    unused_imports
+)]
+
 use std::{
     net::{SocketAddr, UdpSocket},
     time::{Duration, SystemTime},
@@ -13,16 +22,41 @@ use bevy_renet::{
     netcode::{
         ClientAuthentication, NetcodeClientPlugin, NetcodeClientTransport, NetcodeErrorEvent,
     },
-    renet::{ConnectionConfig, DefaultChannel},
+    renet::{ChannelConfig, ConnectionConfig, DefaultChannel, SendType},
 };
 
 use bevy_window::{Window, WindowPlugin, WindowResolution};
-use exsolis_common::{ClientMessage, PROTOCOL_ID, SERVER_ADDR, ServerMessage};
+use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 
+mod chunk;
+mod chunk_registry;
+mod mesh;
+mod player;
 mod render;
-mod vulkan;
+mod streaming;
+mod vulkan_prelude;
+
+use player::PlayerPlugin;
 use render::*;
-use vulkan::*;
+use streaming::StreamingPlugin;
+use vulkan_prelude::*;
+
+pub fn connection_config() -> ConnectionConfig {
+    let mut config = ConnectionConfig::default();
+
+    for channel in config
+        .server_channels_config
+        .iter_mut()
+        .chain(config.client_channels_config.iter_mut())
+    {
+        // channel_id 2 == DefaultChannel::ReliableOrdered
+        if channel.channel_id == DefaultChannel::ReliableOrdered as u8 {
+            channel.max_memory_usage_bytes = 64 * 1024 * 1024;
+        }
+    }
+
+    config
+}
 
 fn main() {
     App::new()
@@ -42,16 +76,15 @@ fn main() {
         ))
         .add_plugins(bevy_winit::WinitPlugin::default())
         .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
-        .insert_resource(RenetClient::new(ConnectionConfig::default()))
+        .insert_resource(RenetClient::new(connection_config()))
         .insert_resource(new_transport())
         .add_observer(log_netcode_error)
+        .add_plugins(StreamingPlugin)
+        .add_plugins((RendererPlugin, PlayerPlugin))
         .add_systems(
             Update,
-            (send_fake_movement, receive_state)
-                .chain()
-                .run_if(client_connected),
+            setup_vulkan.run_if(not(resource_exists::<VulkanContext>)),
         )
-        .add_systems(PostStartup, setup_vulkan)
         .run();
 }
 
@@ -69,7 +102,7 @@ fn new_transport() -> NetcodeClientTransport {
 
     let authentication = ClientAuthentication::Unsecure {
         client_id,
-        protocol_id: PROTOCOL_ID,
+        protocol_id: 1,
         server_addr,
         user_data: None,
     };
@@ -80,36 +113,4 @@ fn new_transport() -> NetcodeClientTransport {
 
 fn log_netcode_error(error: On<NetcodeErrorEvent>) {
     warn!("netcode error: {}", *error);
-}
-
-fn send_fake_movement(mut client: ResMut<RenetClient>) {
-    let msg = bincode::serialize(&ClientMessage::Move {
-        x: 0.1,
-        y: 0.0,
-        z: 0.0,
-    })
-    .unwrap();
-    client.send_message(DefaultChannel::Unreliable, msg);
-}
-
-fn receive_state(mut client: ResMut<RenetClient>) {
-    while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
-        let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
-            warn!("bad packet from server, dropping");
-            continue;
-        };
-        match msg {
-            ServerMessage::PlayerJoined(id) => info!("player {id} joined"),
-            ServerMessage::PlayerLeft(id) => info!("player {id} left"),
-            _ => {}
-        }
-    }
-
-    // while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
-    //     let Ok(ServerMessage::Positions(positions)) = bincode::deserialize::<ServerMessage>(&bytes)
-    //     else {
-    //         continue;
-    //     };
-    //     info!("positions: {positions:?}");
-    // }
 }

@@ -1,6 +1,13 @@
+//! Vulkan device/swapchain bring-up only.
+//!
+//! Deliberately stops short of building a task graph: doing that needs
+//! the actual render task (vertex/index buffers, depth image, pipeline),
+//! which is `renderer.rs`'s job, not this module's. Splitting it this
+//! way means `setup_vulkan` here runs once and never has to change again
+//! as the render task graph evolves.
+
 use std::sync::Arc;
 
-use bevy_log::info;
 use bevy_window::{PrimaryWindow, RawHandleWrapperHolder, Window};
 pub use vulkano::{
     VulkanError, VulkanLibrary,
@@ -27,6 +34,9 @@ use bevy_ecs::prelude::*;
 pub const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 pub const MIN_SWAPCHAIN_IMAGES: u32 = MAX_FRAMES_IN_FLIGHT + 1;
 
+/// Everything device/swapchain bring-up produces, held as a single
+/// resource. `renderer.rs`'s `setup_renderer` reads this to build the
+/// actual task graph, buffers, and pipeline once it runs.
 #[derive(Resource)]
 pub struct VulkanContext {
     pub instance: Arc<Instance>,
@@ -37,6 +47,9 @@ pub struct VulkanContext {
     pub swapchain_id: Id<Swapchain>,
     pub swapchain_format: Format,
     pub viewport: Viewport,
+    /// Set when a resize is detected or the swapchain comes back
+    /// `OutOfDate` from a failed present; `renderer.rs`'s frame system
+    /// clears it after recreating the swapchain + depth image.
     pub recreate_swapchain: bool,
 }
 
@@ -45,13 +58,11 @@ pub fn setup_vulkan(
     windows: Query<(Entity, &Window, &RawHandleWrapperHolder), With<PrimaryWindow>>,
 ) {
     let Ok((_, window, handle)) = windows.single() else {
-        info!("still no window");
         return;
     };
     let raw_handle = handle.0.lock().unwrap();
 
     let Some(raw_handle_ref) = raw_handle.as_ref().map(|x| unsafe { x.get_handle() }) else {
-        info!("still no handle");
         return;
     };
 
@@ -80,6 +91,7 @@ pub fn setup_vulkan(
     let (physical_device, queue_family_index) = instance
         .enumerate_physical_devices()
         .unwrap()
+        .into_iter()
         .filter(|p| {
             p.supported_extensions().contains(&device_extensions)
                 && p.supported_features().contains(&device_features)
@@ -117,7 +129,7 @@ pub fn setup_vulkan(
     )
     .unwrap();
 
-    let queue = queues.next().unwrap();
+    let queue = queues.into_iter().next().unwrap();
 
     let resources = Resources::new(
         &device,
@@ -174,8 +186,6 @@ pub fn setup_vulkan(
         min_depth: 0.0,
         max_depth: 1.0,
     };
-
-    info!("Creating context");
 
     commands.insert_resource(VulkanContext {
         instance,

@@ -32,7 +32,7 @@ pub fn new_transport() -> NetcodeServerTransport {
     let server_config = ServerConfig {
         current_time,
         max_clients: 32,
-        protocol_id: PROTOCOL_ID,
+        protocol_id: 1,
         public_addresses: vec![public_addr],
         authentication: ServerAuthentication::Unsecure,
     };

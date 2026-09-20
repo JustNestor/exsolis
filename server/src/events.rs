@@ -1,6 +1,7 @@
 use super::*;
 use bevy_ecs::message::Message;
 use bevy_renet::renet::SendType::Unreliable;
+use chunks::{PlayerPosition, RenderDistanceRequested};
 use glam::{Vec3, Vec4};
 
 pub struct EventsPlugin;
@@ -11,6 +12,7 @@ impl Plugin for EventsPlugin {
             .add_message::<PlayerJoined>()
             .add_message::<PlayerLeaved>()
             .add_message::<ChatMessage>()
+            .add_message::<RenderDistanceRequested>()
             .add_systems(Update, (recive_packets, handle_player_join))
             .add_observer(on_server_event);
     }
@@ -46,6 +48,17 @@ pub fn on_server_event(
     match **event {
         ServerEvent::ClientConnected { client_id } => {
             info!("client {client_id} connected");
+
+            // Without this, the player entity has no PlayerPosition, so
+            // chunks.rs::compute_desired_chunks' query matches nothing for
+            // them and they never get sent a single chunk — this was the
+            // root cause of the blue-screen-with-no-blocks symptom.
+            let entity = commands
+                .spawn((Player(client_id), PlayerPosition(Vec3::new(0.0, 80.0, 0.0))))
+                .id();
+            player_map.playerid_to_entity.insert(client_id, entity);
+            player_map.entity_to_playerid.insert(entity, client_id);
+
             commands.write_message(PlayerJoined(client_id));
 
             // let msg = bincode::serialize(&ServerMessage::PlayerJoined(client_id)).unwrap();
@@ -53,26 +66,58 @@ pub fn on_server_event(
         }
         ServerEvent::ClientDisconnected { client_id, reason } => {
             info!("client {client_id} disconnected: {reason}");
-
+            if let Some(entity) = player_map.playerid_to_entity.remove(&client_id) {
+                player_map.entity_to_playerid.remove(&entity);
+                commands.entity(entity).despawn();
+            }
             commands.write_message(PlayerLeaved(client_id));
-
-            // let msg = bincode::serialize(&ServerMessage::PlayerLeft(client_id)).unwrap();
-            // server.broadcast_message(DefaultChannel::ReliableOrdered, msg);
         }
     }
 }
 
-pub fn recive_packets(mut server: ResMut<RenetServer>) {
+/// Units/second the server moves a player along the direction vector
+/// their client sends. This is a placeholder authoritative speed —
+/// swap for whatever your single-player FlyCamera's `speed`/`sprint_multiplier`
+/// should map to server-side once sprint state is part of the packet too.
+const SERVER_MOVE_SPEED: f32 = 8.0;
+
+pub fn recive_packets(
+    mut server: ResMut<RenetServer>,
+    mut commands: Commands,
+    player_map: Res<PlayerMap>,
+    mut positions: Query<&mut PlayerPosition>,
+    time: Res<bevy_time::Time>,
+) {
+    let dt = time.delta_secs();
+
     for client_id in server.clients_id() {
         while let Some(bytes) = server.receive_message(client_id, DefaultChannel::Unreliable) {
             let Ok(msg) = bincode::deserialize::<ClientMessage>(&bytes) else {
                 warn!("bad packet from {client_id}, dropping");
                 continue;
             };
-            info!("recived packet from {client_id}");
 
             match msg {
-                ClientMessage::Move { x, y, z } => {}
+                ClientMessage::Move { x, y, z } => {
+                    let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
+                        continue;
+                    };
+                    let Ok(mut pos) = positions.get_mut(entity) else {
+                        continue;
+                    };
+                    // x/y/z here is the normalized direction the client is
+                    // pressing, not a destination — see player.rs on the
+                    // client. No collision/physics yet, same as the rest
+                    // of this server; this just gets something visibly
+                    // moving so compute_desired_chunks has real input.
+                    pos.0 += Vec3::new(x, y, z) * SERVER_MOVE_SPEED * dt;
+                }
+                ClientMessage::SetRenderDistance(radius) => {
+                    commands.write_message(RenderDistanceRequested {
+                        player_id: client_id,
+                        radius,
+                    });
+                }
                 _ => {}
             }
         }
