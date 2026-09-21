@@ -30,6 +30,8 @@ pub use vulkano_taskgraph::{
 };
 
 use bevy_ecs::prelude::*;
+use vulkano::image::sampler::{Filter, SamplerAddressMode, SamplerCreateInfo, SamplerMipmapMode};
+use vulkano_taskgraph::descriptor_set::SamplerId;
 
 pub const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 pub const MIN_SWAPCHAIN_IMAGES: u32 = MAX_FRAMES_IN_FLIGHT + 1;
@@ -47,6 +49,14 @@ pub struct VulkanContext {
     pub swapchain_id: Id<Swapchain>,
     pub swapchain_format: Format,
     pub viewport: Viewport,
+    /// Bindless sampler for block textures (chunk meshes, item icons):
+    /// NEAREST magnification for the crisp pixel-art look up close, linear
+    /// min + linear mip blend so distant terrain doesn't shimmer. Uses the
+    /// mip chains `texture.rs` generates.
+    pub block_sampler_id: SamplerId,
+    /// Bindless sampler for smooth content: SDF text (`text.rs`) needs
+    /// linear magnification or glyph edges come out blocky.
+    pub linear_sampler_id: SamplerId,
     /// Set when a resize is detected or the swapchain comes back
     /// `OutOfDate` from a failed present; `renderer.rs`'s frame system
     /// clears it after recreating the swapchain + depth image.
@@ -142,6 +152,33 @@ pub fn setup_vulkan(
 
     let flight_id = resources.create_flight(MAX_FRAMES_IN_FLIGHT).unwrap();
 
+    // Samplers live in the bindless global set; shaders receive them as a
+    // `SamplerId` push constant. `anisotropy` is deliberately left None:
+    // `BindlessContext::required_features` doesn't enable `sampler_anisotropy`,
+    // so requesting it here would fail validation.
+    let (block_sampler_id, linear_sampler_id) = {
+        let global_set = resources.bindless_context().unwrap().global_set();
+        let block = global_set
+            .create_sampler(&SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Linear,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..Default::default()
+            })
+            .unwrap();
+        let linear = global_set
+            .create_sampler(&SamplerCreateInfo {
+                mag_filter: Filter::Linear,
+                min_filter: Filter::Linear,
+                mipmap_mode: SamplerMipmapMode::Linear,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                ..Default::default()
+            })
+            .unwrap();
+        (block, linear)
+    };
+
     let surface = unsafe { Surface::from_window_ref(&instance, &raw_handle_ref).unwrap() };
 
     let window_size = [
@@ -196,6 +233,8 @@ pub fn setup_vulkan(
         swapchain_id,
         swapchain_format,
         viewport,
+        block_sampler_id,
+        linear_sampler_id,
         recreate_swapchain: false,
     });
 }

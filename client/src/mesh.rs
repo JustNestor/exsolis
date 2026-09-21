@@ -1,6 +1,12 @@
-//! Chunk mesh building with hardcoded per-block colors (no textures yet
-//! — see `chunk::block_color`) and full 3D cross-chunk-boundary face
-//! culling.
+//! Chunk mesh building with bindless per-face textures and full 3D
+//! cross-chunk-boundary face culling.
+//!
+//! Textures: each face resolves its texture name (`TextureManager::get`,
+//! via `BlockTextures::texture_mapping`) to a bindless index at mesh time
+//! and bakes it into every vertex as `sampled_text`. The fragment shader
+//! samples through the `SamplerId` in the push constants. There is no AO
+//! in this pass (see the note on corner neighbours below); instead each
+//! face gets a fixed directional `shade` so cubes don't look flat.
 //!
 //! This differs from the older 16x16x256-column project's
 //! `ChunkNeighborhood` in one important way: those chunks were full
@@ -21,35 +27,56 @@ use exsolis_common::BlockType;
 use glam::IVec3;
 use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
-use crate::chunk::{CHUNK_SIZE, Chunk, block_color};
+use crate::{
+    block_textures::BlockTextures,
+    chunk::{CHUNK_SIZE, Chunk},
+    texture::{TextureManager, TextureMapping, sampled_image_index},
+};
 
 #[derive(Clone, Copy, BufferContents, Vertex)]
 #[repr(C)]
 pub struct ChunkVertex {
     #[format(R32G32B32_SFLOAT)]
     pub position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    pub color: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
+    #[format(R32_UINT)]
+    pub sampled_text: u32,
+    /// Fixed per-face brightness multiplier (see `face_shade`).
+    #[format(R32_SFLOAT)]
+    pub shade: f32,
 }
 
+/// The push-constant block is declared identically in BOTH stages: Vulkan
+/// merges per-stage ranges, and mismatched declarations of the same block
+/// are a validation error. Only the fragment stage reads `sampler_id`.
 pub mod vs {
     vulkano_shaders::shader! {
         ty: "vertex",
+        root_path_env: "CARGO_MANIFEST_DIR",
         src: r"
         #version 450
+        #include <vulkano.glsl>
 
         layout(push_constant) uniform PushConstants {
             mat4 view_proj;
+            SamplerId sampler_id;
         } push_constants;
 
         layout(location = 0) in vec3 position;
-        layout(location = 1) in vec3 color;
+        layout(location = 1) in vec2 uv;
+        layout(location = 2) in uint sampled_text;
+        layout(location = 3) in float shade;
 
-        layout(location = 0) out vec3 v_color;
+        layout(location = 0) out vec2 v_uv;
+        layout(location = 1) out flat uint v_text;
+        layout(location = 2) out float v_shade;
 
         void main() {
             gl_Position = push_constants.view_proj * vec4(position, 1.0);
-            v_color = color;
+            v_uv = uv;
+            v_text = sampled_text;
+            v_shade = shade;
         }
         ",
     }
@@ -58,14 +85,30 @@ pub mod vs {
 pub mod fs {
     vulkano_shaders::shader! {
         ty: "fragment",
+        root_path_env: "CARGO_MANIFEST_DIR",
         src: r"
         #version 450
+        #include <vulkano.glsl>
 
-        layout(location = 0) in vec3 v_color;
+        layout(push_constant) uniform PushConstants {
+            mat4 view_proj;
+            SamplerId sampler_id;
+        } push_constants;
+
+        layout(location = 0) in vec2 v_uv;
+        layout(location = 1) in flat uint v_text;
+        layout(location = 2) in float v_shade;
+
         layout(location = 0) out vec4 f_color;
 
         void main() {
-            f_color = vec4(v_color, 1.0);
+            SampledImageId g = SampledImageId(v_text, 256);
+            vec4 color = texture(vko_sampler2D(g, push_constants.sampler_id), v_uv);
+            // Cutout alpha (glass panes, leaves). No blending in this pass.
+            if (color.a < 0.1) {
+                discard;
+            }
+            f_color = vec4(color.rgb * v_shade, 1.0);
         }
         ",
     }
@@ -141,19 +184,49 @@ fn push_face(
     y: f32,
     z: f32,
     face: Face,
-    color: [f32; 3],
+    sampled_text: u32,
 ) {
     let start = vertices.len() as u32;
     let positions = face_positions(face, x, y, z);
+    // Corner order matches `face_positions` (top-left, top-right,
+    // bottom-right, bottom-left as seen from outside), so v=0 is the top
+    // edge and side textures come out upright.
+    const UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    let shade = face_shade(face);
 
-    for pos in positions {
+    for (pos, uv) in positions.into_iter().zip(UVS) {
         vertices.push(ChunkVertex {
             position: pos,
-            color,
+            uv,
+            sampled_text,
+            shade,
         });
     }
 
     indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+/// Fixed directional lighting: sky-lit top is full brightness, bottom is
+/// darkest, and the two horizontal axes differ slightly so adjacent side
+/// faces of a cube are distinguishable. Placeholder for real AO/lighting.
+fn face_shade(face: Face) -> f32 {
+    match face {
+        Face::Top => 1.0,
+        Face::Front | Face::Back => 0.8,
+        Face::Left | Face::Right => 0.65,
+        Face::Bottom => 0.5,
+    }
+}
+
+fn texture_name_for_face(mapping: TextureMapping, face: Face) -> &'static str {
+    match mapping {
+        TextureMapping::Single(name) => name,
+        TextureMapping::TopBottomSide { top, bottom, side } => match face {
+            Face::Top => top,
+            Face::Bottom => bottom,
+            Face::Left | Face::Right | Face::Front | Face::Back => side,
+        },
+    }
 }
 
 /// Up to 6 face-adjacent chunks (plus the center one) around the chunk
@@ -200,10 +273,12 @@ fn is_face_visible(
     this: BlockType,
 ) -> bool {
     let neighbour = neighborhood.get_block(x, y, z);
-    // Air/water-style "see through" check via is_solid(); same-type
-    // transparent neighbours (e.g. two water blocks) don't get an
-    // internal face between them.
-    !neighbour.is_solid() && neighbour != this
+    // Was `!neighbour.is_solid()`. That treats glass and leaves as solid,
+    // which would cull the faces of whatever sits behind them and leave a
+    // see-through hole to the void once they have alpha textures. Use
+    // "transparent" instead; same-type neighbours (water/water,
+    // glass/glass) still get no internal face between them.
+    neighbour.is_transparent() && neighbour != this
 }
 
 #[derive(Default)]
@@ -212,7 +287,10 @@ pub(crate) struct ChunkMeshData {
     pub indices: Vec<u32>,
 }
 
-pub(crate) fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> ChunkMeshData {
+pub(crate) fn build_chunk_mesh(
+    neighborhood: &ChunkNeighborhood,
+    textures: &TextureManager,
+) -> ChunkMeshData {
     let mut mesh = ChunkMeshData::default();
     let chunk = &neighborhood.chunks[&IVec3::ZERO];
     let origin = chunk.world_origin();
@@ -224,7 +302,9 @@ pub(crate) fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> ChunkMeshDat
                 if block.is_air() {
                     continue;
                 }
-                let color = block_color(block);
+                let Some(mapping) = block.texture_mapping() else {
+                    continue;
+                };
                 let (fx, fy, fz) = (
                     origin.x + x as f32,
                     origin.y + y as f32,
@@ -233,17 +313,23 @@ pub(crate) fn build_chunk_mesh(neighborhood: &ChunkNeighborhood) -> ChunkMeshDat
                 let (ix, iy, iz) = (x as i32, y as i32, z as i32);
 
                 for &(face, dir) in &FACE_DIRS {
-                    if is_face_visible(neighborhood, ix + dir.x, iy + dir.y, iz + dir.z, block) {
-                        push_face(
-                            &mut mesh.vertices,
-                            &mut mesh.indices,
-                            fx,
-                            fy,
-                            fz,
-                            face,
-                            color,
-                        );
+                    if !is_face_visible(neighborhood, ix + dir.x, iy + dir.y, iz + dir.z, block) {
+                        continue;
                     }
+                    // `get` only returns None when NO texture loaded at all,
+                    // which render.rs already refuses to mesh through.
+                    let Some(id) = textures.get(texture_name_for_face(mapping, face)) else {
+                        continue;
+                    };
+                    push_face(
+                        &mut mesh.vertices,
+                        &mut mesh.indices,
+                        fx,
+                        fy,
+                        fz,
+                        face,
+                        sampled_image_index(id),
+                    );
                 }
             }
         }

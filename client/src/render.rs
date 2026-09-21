@@ -57,6 +57,7 @@ use vulkano::{
 use vulkano_taskgraph::{
     ClearValues, Id, Task, TaskContext, TaskResult,
     command_buffer::RecordingCommandBuffer,
+    descriptor_set::SamplerId,
     graph::{AttachmentInfo, CompileInfo, ExecutableTaskGraph, ExecuteError, TaskGraph},
     resource::{AccessTypes, HostAccessType, ImageLayoutType::Optimal},
     resource_map,
@@ -66,6 +67,7 @@ use crate::{
     chunk::Chunk,
     chunk_registry::ChunkRegistry,
     mesh::{ChunkMeshData, ChunkNeighborhood, ChunkVertex, build_chunk_mesh, fs, vs},
+    texture::{TextureManager, TexturePlugin},
     vulkan_prelude::VulkanContext,
 };
 
@@ -99,6 +101,27 @@ pub(crate) struct MeshingChunk(pub(crate) Option<AsyncTask<ChunkMeshData>>);
 #[derive(Component)]
 struct ChunkMeshReady(ChunkMeshData);
 
+/// The six face-adjacent chunk offsets. ORDER MATTERS: entries come in
+/// opposite pairs (0,1), (2,3), (4,5), so `i ^ 1` is the opposite direction
+/// (used by `invalidate_stale_meshes`).
+const NEIGHBOR_DIRS: [IVec3; 6] = [
+    IVec3::new(1, 0, 0),
+    IVec3::new(-1, 0, 0),
+    IVec3::new(0, 1, 0),
+    IVec3::new(0, -1, 0),
+    IVec3::new(0, 0, 1),
+    IVec3::new(0, 0, -1),
+];
+
+/// Which of the six neighbours (bit `i` = `NEIGHBOR_DIRS[i]`) actually existed
+/// in the snapshot this chunk's mesh was built from. A neighbour that wasn't
+/// loaded reads as air, so faces toward it were DRAWN; when it later arrives
+/// those faces are hidden internal surfaces and the chunk must be re-meshed.
+/// Stays on the entity for the mesh's whole life (in flight, ready, uploaded)
+/// and is overwritten each time the chunk is re-queued.
+#[derive(Component, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MeshNeighbors(u8);
+
 #[derive(Debug, Clone, Copy)]
 struct GpuMeshAllocation {
     vertex_offset_bytes: u64,
@@ -115,6 +138,9 @@ struct RenderStateShared {
 pub struct FrameData {
     pub view_proj: [[f32; 4]; 4],
     pub viewport: vulkano::pipeline::graphics::viewport::Viewport,
+    /// Bindless sampler used to read every block texture. Same sampler for
+    /// all chunks; per-texture state lives in the image, not here.
+    pub sampler_id: SamplerId,
 }
 
 struct ChunkRenderTask {
@@ -151,6 +177,7 @@ impl Task for ChunkRenderTask {
                 0,
                 &vs::PushConstants {
                     view_proj: world.view_proj,
+                    sampler_id: world.sampler_id,
                 },
             );
             cbf.bind_pipeline(pipeline);
@@ -196,10 +223,11 @@ pub struct RendererPlugin;
 
 impl Plugin for RendererPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(
+        app.add_plugins(TexturePlugin).add_systems(
             Update,
             (
                 setup_renderer,
+                invalidate_stale_meshes.run_if(resource_exists::<RenderState>),
                 queue_chunk_meshing.run_if(resource_exists::<RenderState>),
                 collect_finished_meshes.run_if(resource_exists::<RenderState>),
                 upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
@@ -415,12 +443,74 @@ fn setup_renderer(
     });
 }
 
+/// Stage 0: keep meshes consistent with the chunk data around them.
+///
+/// Meshes are snapshots: a not-yet-loaded neighbour reads as air, so faces
+/// toward it get drawn. Nothing else revisits a chunk once it is uploaded,
+/// so without this those boundary faces stay forever (visible as walls of
+/// internal faces when flying underground).
+///
+/// Two cases, both driven by `Changed<Chunk>`:
+/// - NEW chunk (`is_added`): re-mesh only neighbours whose `MeshNeighbors`
+///   lacks it. Ones that already saw it are fine.
+/// - RE-SENT chunk (same coord, new contents): `streaming.rs` does
+///   `entity.insert(chunk)`, which Bevy reports as Changed but NOT Added,
+///   so `Added<Chunk>` alone would miss it. Its own mesh is stale, and so
+///   are its neighbours' boundary faces even if they "saw" it, so drop all
+///   of them. This also covers future block edits (a `&mut Chunk` write).
+///
+/// Drops `ChunkMeshUploaded` / `MeshingChunk` / `ChunkMeshReady` together
+/// rather than just the "uploaded" marker: a chunk can be mid-flight or
+/// waiting for upload with a stale snapshot, and dropping `MeshingChunk`
+/// cancels the task. Old GPU geometry keeps drawing until the replacement
+/// uploads, so there is no flicker.
+fn invalidate_stale_meshes(
+    mut commands: Commands,
+    registry: Res<ChunkRegistry>,
+    changed: Query<(Entity, Ref<Chunk>), Changed<Chunk>>,
+    meshed: Query<&MeshNeighbors>,
+) {
+    for (entity, chunk) in &changed {
+        let resent = !chunk.is_added();
+        if resent {
+            commands
+                .entity(entity)
+                .try_remove::<(ChunkMeshUploaded, MeshingChunk, ChunkMeshReady)>();
+        }
+
+        for (i, dir) in NEIGHBOR_DIRS.into_iter().enumerate() {
+            let coord = ChunkCoord::new(
+                chunk.coord.x + dir.x,
+                chunk.coord.y + dir.y,
+                chunk.coord.z + dir.z,
+            );
+            let Some(neighbor) = registry.entity_at(coord) else {
+                continue;
+            };
+            // No `MeshNeighbors` = never queued yet; it will snapshot fresh.
+            let Ok(seen) = meshed.get(neighbor) else {
+                continue;
+            };
+            // From the neighbour's side, this chunk sits in the opposite
+            // direction. A brand-new chunk it already saw needs no re-mesh;
+            // a re-sent one always does (its contents may have changed).
+            if !resent && seen.0 & (1 << (i ^ 1)) != 0 {
+                continue;
+            }
+            commands
+                .entity(neighbor)
+                .try_remove::<(ChunkMeshUploaded, MeshingChunk, ChunkMeshReady)>();
+        }
+    }
+}
+
 /// Stage 1 of 3: snapshot the 6 face-adjacent neighbours (up, down, and
 /// the 4 horizontal — cubic chunks need the vertical pair too, unlike
 /// the old column-based project) and hand meshing to the async compute
 /// pool.
 fn queue_chunk_meshing(
     mut commands: Commands,
+    textures: Option<Res<TextureManager>>,
     registry: Res<ChunkRegistry>,
     all_chunks: Query<&Chunk>,
     needs_mesh: Query<
@@ -432,40 +522,57 @@ fn queue_chunk_meshing(
         ),
     >,
 ) {
+    // Faces bake a bindless texture index into each vertex, so meshing
+    // before `TextureManager` exists would bake in nothing. Chunks stay
+    // un-meshed (no `ChunkMeshUploaded`) and are picked up next frame.
+    let Some(textures) = textures else {
+        return;
+    };
+    if !textures.has_textures() {
+        // assets/ had no loadable PNGs. Without this, the world would just
+        // silently never appear, which is miserable to debug.
+        bevy_log::warn_once!(
+            "TextureManager has no textures (no PNGs found under assets/?); \
+             no chunks will be meshed"
+        );
+        return;
+    }
     let pool = AsyncComputeTaskPool::get();
-
-    const NEIGHBOR_DIRS: [IVec3; 6] = [
-        IVec3::new(1, 0, 0),
-        IVec3::new(-1, 0, 0),
-        IVec3::new(0, 1, 0),
-        IVec3::new(0, -1, 0),
-        IVec3::new(0, 0, 1),
-        IVec3::new(0, 0, -1),
-    ];
 
     for (entity, chunk) in needs_mesh.iter().take(MAX_MESH_TASKS_STARTED_PER_FRAME) {
         let mut neighbor_chunks = HashMap::with_capacity(7);
         neighbor_chunks.insert(IVec3::ZERO, chunk.clone());
-        for dir in NEIGHBOR_DIRS {
+        let mut seen_mask = 0u8;
+        for (i, dir) in NEIGHBOR_DIRS.into_iter().enumerate() {
             let coord = ChunkCoord::new(
                 chunk.coord.x + dir.x,
                 chunk.coord.y + dir.y,
                 chunk.coord.z + dir.z,
             );
             if let Some(neighbor_entity) = registry.entity_at(coord) {
+                // Record presence from the query result, NOT from the registry:
+                // the registry can name an entity whose components aren't
+                // visible yet, and what matters is what the mesh really saw.
                 if let Ok(neighbor_chunk) = all_chunks.get(neighbor_entity) {
                     neighbor_chunks.insert(dir, neighbor_chunk.clone());
+                    seen_mask |= 1 << i;
                 }
             }
         }
 
+        // `Res<T>` derefs to T; `.clone()` on the Res itself would clone the
+        // borrow wrapper (not 'static, can't move into the task). TextureManager
+        // wraps its map in an Arc, so this is a refcount bump, not a HashMap copy.
+        let textures: TextureManager = (*textures).clone();
         let task = pool.spawn(async move {
             let neighborhood = ChunkNeighborhood {
                 chunks: neighbor_chunks,
             };
-            build_chunk_mesh(&neighborhood)
+            build_chunk_mesh(&neighborhood, &textures)
         });
-        commands.entity(entity).insert(MeshingChunk(Some(task)));
+        commands
+            .entity(entity)
+            .insert((MeshingChunk(Some(task)), MeshNeighbors(seen_mask)));
     }
 }
 
@@ -563,8 +670,17 @@ fn upload_ready_chunk_meshes(
         ) {
             pending_allocations.push((entity, alloc));
         } else {
-            // Fully-air chunk: no geometry, but still mark it done so it
-            // doesn't get requeued for meshing every frame.
+            // No geometry: either a fully-air chunk, or (after a re-mesh) a
+            // chunk that is now completely hidden by its neighbours, e.g.
+            // buried stone. Its PREVIOUS mesh must be released here, or the
+            // stale boundary faces we just re-meshed to remove keep drawing.
+            render_state
+                .shared
+                .write()
+                .unwrap()
+                .allocations
+                .remove(&entity);
+            // Still mark it done so it doesn't get requeued every frame.
             commands
                 .entity(entity)
                 .remove::<ChunkMeshReady>()
@@ -697,6 +813,8 @@ fn render_frame(
     let frame = FrameData {
         view_proj: view_proj.to_cols_array_2d(),
         viewport: vk.viewport.clone(),
+        // Created once in vulkan_prelude::setup_vulkan (nearest-mag / trilinear).
+        sampler_id: vk.block_sampler_id,
     };
 
     vk.resources.flight(vk.flight_id).wait(None).unwrap();

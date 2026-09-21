@@ -28,12 +28,14 @@ use bevy_renet::{
 use bevy_window::{Window, WindowPlugin, WindowResolution};
 use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 
+mod block_textures;
 mod chunk;
 mod chunk_registry;
 mod mesh;
 mod player;
 mod render;
 mod streaming;
+mod texture;
 mod vulkan_prelude;
 
 use player::PlayerPlugin;
