@@ -1,6 +1,6 @@
 //! Client-side block targeting: raycasts from the camera through loaded
 //! chunks to find what the player is aiming at, and sends
-//! `PlaceBlock`/`BreakBlock` requests on click.
+//! `PlaceBlock`/`BreakBlock` requests on click or continuous press.
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -10,6 +10,7 @@ use bevy_input::mouse::MouseButton;
 use bevy_log::{info, warn};
 use bevy_renet::RenetClient;
 use bevy_renet::renet::DefaultChannel;
+use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
 use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE};
 use glam::{IVec3, Vec3};
@@ -23,6 +24,22 @@ use crate::player::{FlyCamera, LocalPlayer};
 /// actually matters.
 const REACH: f32 = 8.0;
 const RAYCAST_STEP_LIMIT: i32 = 64;
+
+/// Cooldown resource to prevent per-frame network packet spam when holding action buttons.
+#[derive(Resource)]
+pub struct InteractionCooldown {
+    pub break_timer: Timer,
+    pub place_timer: Timer,
+}
+
+impl Default for InteractionCooldown {
+    fn default() -> Self {
+        Self {
+            break_timer: Timer::from_seconds(0.2, TimerMode::Once),
+            place_timer: Timer::from_seconds(0.2, TimerMode::Once),
+        }
+    }
+}
 
 /// What the player is currently aiming at, if anything: the targeted
 /// block, and the empty cell just before it along the ray.
@@ -53,16 +70,18 @@ pub struct InteractionPlugin;
 
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<ClientInventory>().add_systems(
-            Update,
-            (
-                ensure_targeting_component,
-                select_hotbar_by_number_input,
-                update_targeting,
-                handle_break_input,
-                handle_place_input,
-            ),
-        );
+        app.init_resource::<ClientInventory>()
+            .init_resource::<InteractionCooldown>()
+            .add_systems(
+                Update,
+                (
+                    ensure_targeting_component,
+                    select_hotbar_by_number_input,
+                    update_targeting,
+                    handle_break_input,
+                    handle_place_input,
+                ),
+            );
     }
 }
 
@@ -242,13 +261,24 @@ fn update_targeting(
 }
 
 fn handle_break_input(
+    time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
+    mut cooldown: ResMut<InteractionCooldown>,
     mut client: ResMut<RenetClient>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
-    if !mouse.just_pressed(MouseButton::Left) {
+    if !mouse.pressed(MouseButton::Left) {
+        cooldown.break_timer.reset();
         return;
     }
+
+    cooldown.break_timer.tick(time.delta());
+
+    if !mouse.just_pressed(MouseButton::Left) && !cooldown.break_timer.is_finished() {
+        return;
+    }
+
+    cooldown.break_timer.reset();
 
     if !client.is_connected() {
         warn!("[BreakBlock] Left click pressed, but RenetClient is NOT connected!");
@@ -283,14 +313,25 @@ fn handle_break_input(
 }
 
 fn handle_place_input(
+    time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
+    mut cooldown: ResMut<InteractionCooldown>,
     mut client: ResMut<RenetClient>,
     inventory: Res<ClientInventory>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
-    if !mouse.just_pressed(MouseButton::Right) {
+    if !mouse.pressed(MouseButton::Right) {
+        cooldown.place_timer.reset();
         return;
     }
+
+    cooldown.place_timer.tick(time.delta());
+
+    if !mouse.just_pressed(MouseButton::Right) && !cooldown.place_timer.is_finished() {
+        return;
+    }
+
+    cooldown.place_timer.reset();
 
     if !client.is_connected() {
         warn!("[PlaceBlock] Right click pressed, but RenetClient is NOT connected!");
