@@ -12,12 +12,11 @@
 //!   position (`PlayerPosition`), not wherever the client says it's aiming;
 //! - break requires the target to be non-air; place requires it to be air
 //!   AND the player's selected hotbar slot to actually hold that item.
-//! A request that fails any check is silently dropped — no error is sent
-//! back, matching how a malformed packet is already handled in events.rs.
 
 use bevy_app::prelude::*;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
+use bevy_log::warn;
 use bevy_renet::RenetServer;
 use bevy_renet::renet::DefaultChannel;
 use exsolis_common::{BlockPos, BlockType, ChunkCoord, PlayerId, ServerMessage};
@@ -81,9 +80,17 @@ fn handle_select_hotbar(
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            warn!(
+                "[SelectHotbar] Player ID {:?} not in PlayerMap",
+                ev.player_id
+            );
             continue;
         };
         let Ok(mut inventory) = inventories.get_mut(entity) else {
+            warn!(
+                "[SelectHotbar] Entity {:?} missing Inventory component",
+                entity
+            );
             continue;
         };
         inventory.select(ev.index);
@@ -104,14 +111,15 @@ fn world_to_chunk(pos: BlockPos) -> (ChunkCoord, usize) {
     (ChunkCoord::new(cx, cy, cz), idx)
 }
 
-fn within_reach(player_pos: Vec3, target: BlockPos) -> bool {
+fn within_reach(player_pos: Vec3, target: BlockPos) -> (bool, f32) {
     // Center of the target block, not its corner.
     let center = Vec3::new(
         target.x as f32 + 0.5,
         target.y as f32 + 0.5,
         target.z as f32 + 0.5,
     );
-    player_pos.distance(center) <= MAX_REACH
+    let dist = player_pos.distance(center);
+    (dist <= MAX_REACH, dist)
 }
 
 /// Applies the mutation and broadcasts `BlockUpdate` to exactly the
@@ -128,10 +136,18 @@ fn apply_and_broadcast(
     loaded_by: &Query<(&crate::Player, &ChunkRenderState)>,
 ) -> bool {
     let Some(existing) = world.ready.get(&coord) else {
-        return false; // chunk not loaded server-side; nothing to mutate
+        warn!(
+            "[apply_and_broadcast] Target chunk {:?} not loaded in ChunkWorld.ready",
+            coord
+        );
+        return false;
     };
     let Some(updated) = existing.set_block(idx, new_block) else {
-        return false; // out-of-range idx or corrupt data; shouldn't happen
+        warn!(
+            "[apply_and_broadcast] Out of range index {} or corrupt chunk data for chunk {:?}",
+            idx, coord
+        );
+        return false;
     };
     world.ready.insert(coord, updated);
 
@@ -159,38 +175,68 @@ fn handle_place_block(
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            warn!("[PlaceBlock] Player ID {:?} not in PlayerMap", ev.player_id);
             continue;
         };
         let Ok(player_pos) = positions.get(entity) else {
+            warn!(
+                "[PlaceBlock] Entity {:?} (PlayerId: {:?}) missing PlayerPosition component",
+                entity, ev.player_id
+            );
             continue;
         };
-        if !within_reach(player_pos.0, ev.pos) {
+        let (in_reach, dist) = within_reach(player_pos.0, ev.pos);
+        if !in_reach {
+            warn!(
+                "[PlaceBlock] Reach check failed for PlayerId {:?}: distance {:.2} > MAX_REACH {:.1} (player_pos: {:?}, target_pos: {:?})",
+                ev.player_id, dist, MAX_REACH, player_pos.0, ev.pos
+            );
             continue;
         }
         let Ok(mut inventory) = inventories.get_mut(entity) else {
+            warn!(
+                "[PlaceBlock] Entity {:?} missing Inventory component",
+                entity
+            );
             continue;
         };
-        // Must actually be holding this item — the client's claimed `kind`
-        // is not trusted on its own, only as "which item, if you have it".
         let Some(selected) = inventory.selected_slot() else {
+            warn!(
+                "[PlaceBlock] Selected hotbar slot {} is empty for PlayerId {:?}",
+                inventory.selected_index(),
+                ev.player_id
+            );
             continue;
         };
         if selected.item != ev.kind {
+            warn!(
+                "[PlaceBlock] Item mismatch for PlayerId {:?}: hotbar holds {:?}, request claims {:?}",
+                ev.player_id, selected.item, ev.kind
+            );
             continue;
         }
 
         let (coord, idx) = world_to_chunk(ev.pos);
         let Some(target) = world.ready.get(&coord) else {
+            warn!(
+                "[PlaceBlock] Target chunk {:?} not loaded/ready in ChunkWorld for target pos {:?}",
+                coord, ev.pos
+            );
             continue;
         };
         let Some(unpacked) = target.unpack() else {
+            warn!("[PlaceBlock] Failed to unpack target chunk {:?}", coord);
             continue;
         };
         if unpacked[idx] != BlockType::Air {
-            continue; // occupied; place fails without consuming the item
+            warn!(
+                "[PlaceBlock] Target block at {:?} is not Air (currently {:?}, attempted place {:?}",
+                ev.pos, unpacked[idx], ev.kind
+            );
+            continue;
         }
 
-        if apply_and_broadcast(
+        if !apply_and_broadcast(
             coord,
             idx,
             ev.kind,
@@ -199,6 +245,11 @@ fn handle_place_block(
             &mut server,
             &loaded_by,
         ) {
+            warn!(
+                "[PlaceBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
+                coord, ev.pos
+            );
+        } else {
             let selected_index = inventory.selected_index();
             inventory.remove_one(selected_index, ev.kind);
         }
@@ -216,28 +267,47 @@ fn handle_break_block(
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            warn!("[BreakBlock] Player ID {:?} not in PlayerMap", ev.player_id);
             continue;
         };
         let Ok(player_pos) = positions.get(entity) else {
+            warn!(
+                "[BreakBlock] Entity {:?} (PlayerId: {:?}) missing PlayerPosition component",
+                entity, ev.player_id
+            );
             continue;
         };
-        if !within_reach(player_pos.0, ev.pos) {
+        let (in_reach, dist) = within_reach(player_pos.0, ev.pos);
+        if !in_reach {
+            warn!(
+                "[BreakBlock] Reach check failed for PlayerId {:?}: distance {:.2} > MAX_REACH {:.1} (player_pos: {:?}, target_pos: {:?})",
+                ev.player_id, dist, MAX_REACH, player_pos.0, ev.pos
+            );
             continue;
         }
 
         let (coord, idx) = world_to_chunk(ev.pos);
         let Some(target) = world.ready.get(&coord) else {
+            warn!(
+                "[BreakBlock] Target chunk {:?} not loaded/ready in ChunkWorld for target pos {:?}",
+                coord, ev.pos
+            );
             continue;
         };
         let Some(unpacked) = target.unpack() else {
+            warn!("[BreakBlock] Failed to unpack target chunk {:?}", coord);
             continue;
         };
         let broken = unpacked[idx];
         if broken == BlockType::Air {
-            continue; // nothing to break
+            warn!(
+                "[BreakBlock] Target block at {:?} is Air (nothing to break)",
+                ev.pos
+            );
+            continue;
         }
 
-        if apply_and_broadcast(
+        if !apply_and_broadcast(
             coord,
             idx,
             BlockType::Air,
@@ -246,11 +316,12 @@ fn handle_break_block(
             &mut server,
             &loaded_by,
         ) {
-            if let Ok(mut inventory) = inventories.get_mut(entity) {
-                // Pickup overflow (full hotbar) is silently dropped for
-                // now — there's no ground-item entity to spawn it as yet.
-                inventory.add_item(broken, 1);
-            }
+            warn!(
+                "[BreakBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
+                coord, ev.pos
+            );
+        } else if let Ok(mut inventory) = inventories.get_mut(entity) {
+            inventory.add_item(broken, 1);
         }
     }
 }
