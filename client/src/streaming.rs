@@ -1,14 +1,17 @@
+use crate::chunk::CHUNK_SIZE_I32;
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_log::prelude::*;
 use bevy_renet::{RenetClient, renet::DefaultChannel};
-use exsolis_common::{ChunkCoord, ServerMessage};
+use exsolis_common::{ChunkCoord, PlayerId, SPAWN_POS, ServerMessage};
+use glam::Vec3;
 
 use crate::{
-    chunk::{CHUNK_SIZE_I32, Chunk},
-    chunk_registry::ChunkRegistry,
-    interaction::ClientInventory,
+    chunk::Chunk, chunk_registry::ChunkRegistry, interaction::ClientInventory, player::ServerTarget,
 };
+
+#[derive(Component)]
+pub struct RemotePlayer(pub PlayerId);
 
 pub struct StreamingPlugin;
 
@@ -24,10 +27,11 @@ fn receive_chunk_updates(
     mut client: ResMut<RenetClient>,
     mut registry: ResMut<ChunkRegistry>,
     mut inventory: ResMut<ClientInventory>,
-    mut chunks: Query<&mut Chunk>, // existing: Query<(Entity, &Chunk)>
+    mut chunks: Query<&mut Chunk>,
+    remote_players: Query<(Entity, &RemotePlayer)>,
+    mut targets: Query<&mut ServerTarget>,
 ) {
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
-        // debug!("reciving {} bytes", bytes.len());
         let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
             warn!("bad packet from server, dropping");
             continue;
@@ -59,8 +63,6 @@ fn receive_chunk_updates(
                 if let Some(entity) = registry.entity_at(coord) {
                     if let Ok(mut chunk) = chunks.get_mut(entity) {
                         chunk.set(lx, ly, lz, kind);
-                        // Mutating `chunk` marks the component as Changed<Chunk>,
-                        // triggering your client mesh building system query automatically.
                     }
                 }
             }
@@ -74,9 +76,41 @@ fn receive_chunk_updates(
                 inventory.slots = slots;
                 inventory.selected = selected;
             }
+            ServerMessage::PlayerJoined(id) => {
+                let exists = remote_players.iter().any(|(_, p)| p.0 == id);
+                if !exists {
+                    commands.spawn((
+                        RemotePlayer(id),
+                        bevy_transform::prelude::Transform::from_translation(Vec3::from(SPAWN_POS)),
+                        ServerTarget(Some(Vec3::from(SPAWN_POS))),
+                    ));
+                }
+            }
+            ServerMessage::PlayerLeft(id) => {
+                for (entity, p) in &remote_players {
+                    if p.0 == id {
+                        commands.entity(entity).despawn();
+                    }
+                }
+            }
             _ => {}
         }
     }
 
-    // let _ = existing; // kept for future use (e.g. diffing); silences unused warning for now
+    // Process unreliable messages (position updates)
+    while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
+        let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
+            continue;
+        };
+        if let ServerMessage::PlayerMoved { player_id, x, y, z } = msg {
+            let pos = Vec3::new(x, y, z);
+            for (entity, p) in &remote_players {
+                if p.0 == player_id {
+                    if let Ok(mut target) = targets.get_mut(entity) {
+                        target.0 = Some(pos);
+                    }
+                }
+            }
+        }
+    }
 }

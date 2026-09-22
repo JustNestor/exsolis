@@ -22,13 +22,14 @@ use std::{
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_log::info;
 use bevy_tasks::AsyncComputeTaskPool;
 use bevy_tasks::Task as AsyncTask;
 use bevy_tasks::futures_lite::future;
 use bevy_transform::prelude::Transform;
 use bevy_window::{PrimaryWindow, Window};
 use exsolis_common::ChunkCoord;
-use glam::IVec3;
+use glam::{IVec3, Vec3};
 
 use vulkano::{
     DeviceSize, VulkanError,
@@ -121,6 +122,9 @@ const NEIGHBOR_DIRS: [IVec3; 6] = [
 /// and is overwritten each time the chunk is re-queued.
 #[derive(Component, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MeshNeighbors(u8);
+
+#[derive(Component, PartialEq, Clone, Copy)]
+pub struct LastHeadPosition(pub Vec3);
 
 #[derive(Debug, Clone, Copy)]
 struct GpuMeshAllocation {
@@ -231,6 +235,7 @@ impl Plugin for RendererPlugin {
                 queue_chunk_meshing.run_if(resource_exists::<RenderState>),
                 collect_finished_meshes.run_if(resource_exists::<RenderState>),
                 upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
+                render_player_heads.run_if(resource_exists::<RenderState>),
                 cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
                 render_frame.run_if(resource_exists::<RenderState>),
             )
@@ -837,5 +842,230 @@ fn render_frame(
             vk.recreate_swapchain = true;
         }
         Err(e) => panic!("failed to execute frame: {e:?}"),
+    }
+}
+
+fn build_player_head_mesh(pos: Vec3, stone_tex: u32, glass_tex: u32) -> ChunkMeshData {
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+
+    let min_x = pos.x - 0.25;
+    let max_x = pos.x + 0.25;
+    let min_y = pos.y + 1.35;
+    let max_y = pos.y + 1.85;
+    let min_z = pos.z - 0.25;
+    let max_z = pos.z + 0.25;
+
+    let faces = [
+        // Top (Stone)
+        (
+            1.0f32,
+            stone_tex,
+            [
+                [min_x, max_y, min_z],
+                [max_x, max_y, min_z],
+                [max_x, max_y, max_z],
+                [min_x, max_y, max_z],
+            ],
+        ),
+        // Bottom (Stone)
+        (
+            0.5f32,
+            stone_tex,
+            [
+                [min_x, min_y, max_z],
+                [max_x, min_y, max_z],
+                [max_x, min_y, min_z],
+                [min_x, min_y, min_z],
+            ],
+        ),
+        // Back (Stone)
+        (
+            0.8f32,
+            stone_tex,
+            [
+                [max_x, max_y, min_z],
+                [min_x, max_y, min_z],
+                [min_x, min_y, min_z],
+                [max_x, min_y, min_z],
+            ],
+        ),
+        // Front - Eyes (Glass)
+        (
+            0.8f32,
+            glass_tex,
+            [
+                [min_x, max_y, max_z],
+                [max_x, max_y, max_z],
+                [max_x, min_y, max_z],
+                [min_x, min_y, max_z],
+            ],
+        ),
+        // Left (Stone)
+        (
+            0.65f32,
+            stone_tex,
+            [
+                [min_x, max_y, min_z],
+                [min_x, max_y, max_z],
+                [min_x, min_y, max_z],
+                [min_x, min_y, min_z],
+            ],
+        ),
+        // Right (Stone)
+        (
+            0.65f32,
+            stone_tex,
+            [
+                [max_x, max_y, max_z],
+                [max_x, max_y, min_z],
+                [max_x, min_y, min_z],
+                [max_x, min_y, max_z],
+            ],
+        ),
+    ];
+
+    const UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+
+    for (shade, tex, positions) in faces {
+        let start = vertices.len() as u32;
+        for (p, uv) in positions.into_iter().zip(UVS) {
+            vertices.push(ChunkVertex {
+                position: p,
+                uv,
+                sampled_text: tex,
+                shade,
+            });
+        }
+        indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+    }
+
+    ChunkMeshData { vertices, indices }
+}
+
+fn render_player_heads(
+    mut commands: Commands,
+    vk: Res<VulkanContext>,
+    textures: Option<Res<TextureManager>>,
+    mut render_state: ResMut<RenderState>,
+    players: Query<
+        (Entity, &Transform, Option<&LastHeadPosition>),
+        (With<crate::streaming::RemotePlayer>, Changed<Transform>),
+    >,
+    mut removed: RemovedComponents<crate::streaming::RemotePlayer>,
+) {
+    let Some(textures) = textures else {
+        return;
+    };
+    if !textures.has_textures() {
+        return;
+    }
+
+    let Some(stone_id) = textures.get("stone") else {
+        return;
+    };
+    let Some(glass_id) = textures.get("glass") else {
+        return;
+    };
+    let stone_tex = crate::texture::sampled_image_index(stone_id);
+    let glass_tex = crate::texture::sampled_image_index(glass_id);
+
+    // 1. Очищення алокацій деспавнутих гравців
+    {
+        let mut shared = render_state.shared.write().unwrap();
+        for entity in removed.read() {
+            shared.allocations.remove(&entity);
+        }
+    }
+
+    let mut pending_vertex_writes = Vec::new();
+    let mut pending_index_writes = Vec::new();
+    let mut pending_allocations = Vec::new();
+
+    // 2. Інвалідація та перебудова мешу лише для тих гравців, чий Transform змінився
+    for (entity, transform, last_pos) in &players {
+        let current_pos = transform.translation;
+
+        if let Some(last) = last_pos {
+            if last.0 == current_pos {
+                continue;
+            }
+        }
+
+        // Видаляємо стару алокацію з RenderState перед завантаженням нових вершин
+        render_state
+            .shared
+            .write()
+            .unwrap()
+            .allocations
+            .remove(&entity);
+
+        let head_mesh = build_player_head_mesh(current_pos, stone_tex, glass_tex);
+        if let Some(alloc) = reserve_mesh(
+            &mut render_state,
+            head_mesh.vertices,
+            head_mesh.indices,
+            &mut pending_vertex_writes,
+            &mut pending_index_writes,
+        ) {
+            pending_allocations.push((entity, alloc, current_pos));
+        }
+    }
+
+    if pending_allocations.is_empty() {
+        return;
+    }
+
+    // 3. Запис нових вершин у Vulkan-буфери
+    let vertex_buffer_id = render_state.vertex_buffer_id;
+    let index_buffer_id = render_state.index_buffer_id;
+
+    if !pending_vertex_writes.is_empty() || !pending_index_writes.is_empty() {
+        vk.resources.flight(vk.flight_id).wait(None).unwrap();
+
+        unsafe {
+            vulkano_taskgraph::execute(
+                &vk.queue,
+                &vk.resources,
+                vk.flight_id,
+                |_cbf, tcx| {
+                    for write in &pending_vertex_writes {
+                        let end = write.offset_bytes
+                            + (write.data.len() * std::mem::size_of::<ChunkVertex>()) as u64;
+                        tcx.try_write_buffer::<[ChunkVertex]>(
+                            vertex_buffer_id,
+                            write.offset_bytes..end,
+                        )?
+                        .copy_from_slice(&write.data);
+                    }
+                    for write in &pending_index_writes {
+                        let end = write.offset_bytes
+                            + (write.data.len() * std::mem::size_of::<u32>()) as u64;
+                        tcx.try_write_buffer::<[u32]>(index_buffer_id, write.offset_bytes..end)?
+                            .copy_from_slice(&write.data);
+                    }
+                    Ok(())
+                },
+                [
+                    (vertex_buffer_id, HostAccessType::Write),
+                    (index_buffer_id, HostAccessType::Write),
+                ],
+                [],
+                [],
+            )
+            .unwrap();
+        }
+    }
+
+    // 4. Оновлення збережених алокацій та маркування останньої позиції
+    for (entity, allocation, pos) in pending_allocations {
+        render_state
+            .shared
+            .write()
+            .unwrap()
+            .allocations
+            .insert(entity, allocation);
+
+        commands.entity(entity).insert(LastHeadPosition(pos));
     }
 }

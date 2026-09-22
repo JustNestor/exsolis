@@ -27,6 +27,8 @@ use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, Vec3};
 
+use crate::streaming::RemotePlayer;
+
 #[derive(Component)]
 pub struct LocalPlayer;
 
@@ -257,6 +259,7 @@ fn send_movement_input(
 fn receive_server_position(
     mut client: ResMut<RenetClient>,
     mut query: Query<(&mut Transform, &mut ServerTarget), With<LocalPlayer>>,
+    mut remote: Query<(&RemotePlayer, &mut ServerTarget), Without<LocalPlayer>>,
 ) {
     let Ok((mut transform, mut target)) = query.single_mut() else {
         return;
@@ -266,19 +269,30 @@ fn receive_server_position(
         let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
             continue;
         };
-        if let ServerMessage::YourPosition { x, y, z } = msg {
-            let pos = Vec3::new(x, y, z);
-            if target.0.is_none() {
-                transform.translation = pos; // first snapshot: snap, don't glide from spawn
+        match msg {
+            ServerMessage::YourPosition { x, y, z } => {
+                let pos = Vec3::new(x, y, z);
+                if target.0.is_none() {
+                    transform.translation = pos;
+                }
+                target.0 = Some(pos);
             }
-            target.0 = Some(pos);
+            ServerMessage::PlayerMoved { player_id, x, y, z } => {
+                let pos = Vec3::new(x, y, z);
+                for (p, mut t) in &mut remote {
+                    if p.0 == player_id {
+                        t.0 = Some(pos);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
 
 /// Eases the camera toward the last server position (frame-rate independent).
 fn follow_server_position(
-    mut query: Query<(&mut Transform, &ServerTarget), With<LocalPlayer>>,
+    mut query: Query<(&mut Transform, &ServerTarget)>,
     mut last_frame: Local<Option<Instant>>,
 ) {
     let now = Instant::now();
@@ -288,18 +302,17 @@ fn follow_server_position(
         .unwrap_or(0.0)
         .min(0.1);
 
-    let Ok((mut transform, target)) = query.single_mut() else {
-        return;
-    };
-    let Some(target) = target.0 else {
-        return;
-    };
+    for (mut transform, target) in &mut query {
+        let Some(target_pos) = target.0 else {
+            continue;
+        };
 
-    let delta = target - transform.translation;
-    if delta.length_squared() > SNAP_DISTANCE * SNAP_DISTANCE {
-        transform.translation = target;
-        return;
+        let delta = target_pos - transform.translation;
+        if delta.length_squared() > SNAP_DISTANCE * SNAP_DISTANCE {
+            transform.translation = target_pos;
+            continue;
+        }
+        let alpha = 1.0 - (-FOLLOW_RATE * dt).exp();
+        transform.translation += delta * alpha;
     }
-    let alpha = 1.0 - (-FOLLOW_RATE * dt).exp();
-    transform.translation += delta * alpha;
 }

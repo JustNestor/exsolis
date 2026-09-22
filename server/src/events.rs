@@ -37,27 +37,36 @@ pub struct ChatMessage {
     message: String,
 }
 
-// #[derive(Message)]
-// pub struct BlockPlaced {
-//     author: Entity,
-//     message: String,
-// }
-
 pub fn on_server_event(
     event: On<RenetServerEvent>,
-    // server: Res<RenetServer>,
+    mut server: ResMut<RenetServer>,
     mut commands: Commands,
     mut player_map: ResMut<PlayerMap>,
+    positions: Query<&PlayerPosition>,
 ) {
     match **event {
         ServerEvent::ClientConnected { client_id } => {
             info!("client {client_id} connected");
 
-            // Without this, the player entity has no PlayerPosition, so
-            // chunks.rs::compute_desired_chunks' query matches nothing for
-            // them and they never get sent a single chunk — this was the
-            // root cause of the blue-screen-with-no-blocks symptom.
+            // 1. Send all existing connected players to the new client
+            for (&existing_id, &existing_entity) in &player_map.playerid_to_entity {
+                let join_msg =
+                    bincode::serialize(&ServerMessage::PlayerJoined(existing_id)).unwrap();
+                server.send_message(client_id, DefaultChannel::ReliableOrdered, join_msg);
 
+                if let Ok(pos) = positions.get(existing_entity) {
+                    let move_msg = bincode::serialize(&ServerMessage::PlayerMoved {
+                        player_id: existing_id,
+                        x: pos.0.x,
+                        y: pos.0.y,
+                        z: pos.0.z,
+                    })
+                    .unwrap();
+                    server.send_message(client_id, DefaultChannel::ReliableOrdered, move_msg);
+                }
+            }
+
+            // 2. Initialize inventory and spawn entity for new player
             let mut inventory = crate::Inventory::default();
             for block in [
                 BlockType::Dirt,
@@ -83,8 +92,9 @@ pub fn on_server_event(
 
             commands.write_message(PlayerJoined(client_id));
 
-            // let msg = bincode::serialize(&ServerMessage::PlayerJoined(client_id)).unwrap();
-            // server.broadcast_message(DefaultChannel::ReliableOrdered, msg);
+            // 3. Broadcast PlayerJoined for the new client to everyone else
+            // let join_msg = bincode::serialize(&ServerMessage::PlayerJoined(client_id)).unwrap();
+            // server.broadcast_message_except(client_id, DefaultChannel::ReliableOrdered, join_msg);
         }
         ServerEvent::ClientDisconnected { client_id, reason } => {
             info!("client {client_id} disconnected: {reason}");
@@ -93,74 +103,76 @@ pub fn on_server_event(
                 commands.entity(entity).despawn();
             }
             commands.write_message(PlayerLeaved(client_id));
+
+            // Broadcast disconnect packet to remaining peers
+            let left_msg = bincode::serialize(&ServerMessage::PlayerLeft(client_id)).unwrap();
+            server.broadcast_message(DefaultChannel::ReliableOrdered, left_msg);
         }
     }
 }
 
-/// All client -> server messages arrive on ReliableOrdered. Clients only
-/// send movement when it *changes*, so a lost or reordered packet would
-/// leave the server with a stale direction (e.g. a dropped "stop" = the
-/// player runs forever). Reliable + ordered rules that out, and the
-/// client->server ReliableOrdered channel only carries these tiny messages
-/// (chunk data uses the separate server->client channel), so there's no
-/// head-of-line blocking behind chunk streaming.
 pub fn recive_packets(
     mut server: ResMut<RenetServer>,
     mut commands: Commands,
     player_map: Res<PlayerMap>,
     mut inputs: Query<&mut PlayerInput>,
 ) {
-    for client_id in server.clients_id() {
-        while let Some(bytes) = server.receive_message(client_id, DefaultChannel::ReliableOrdered) {
-            let Ok(msg) = bincode::deserialize::<ClientMessage>(&bytes) else {
-                warn!("bad packet from {client_id}, dropping");
-                continue;
-            };
+    let channels: [u8; 2] = [
+        DefaultChannel::ReliableOrdered.into(),
+        DefaultChannel::Unreliable.into(),
+    ];
 
-            match msg {
-                ClientMessage::Move { x, y, z } => {
-                    // x/y/z is the direction the client is moving in (zero =
-                    // stopped), not a destination. It's stored and applied
-                    // every tick by movement.rs::apply_player_input.
-                    let dir = Vec3::new(x, y, z);
-                    if !dir.is_finite() {
-                        continue;
+    for client_id in server.clients_id() {
+        for channel in channels {
+            while let Some(bytes) = server.receive_message(client_id, channel) {
+                let Ok(msg) = bincode::deserialize::<ClientMessage>(&bytes) else {
+                    warn!("bad packet from {client_id}, dropping");
+                    continue;
+                };
+
+                debug!("Recived packet {:?} from player {}", msg, client_id);
+
+                match msg {
+                    ClientMessage::Move { x, y, z } => {
+                        let dir = Vec3::new(x, y, z);
+                        if !dir.is_finite() {
+                            continue;
+                        }
+                        let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
+                            continue;
+                        };
+                        let Ok(mut input) = inputs.get_mut(entity) else {
+                            continue;
+                        };
+                        input.0 = dir.clamp_length_max(1.0);
                     }
-                    let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
-                        continue;
-                    };
-                    let Ok(mut input) = inputs.get_mut(entity) else {
-                        continue;
-                    };
-                    // Clamp so a malicious client can't send (1000, 0, 0) to speed-hack.
-                    input.0 = dir.clamp_length_max(1.0);
+                    ClientMessage::SetRenderDistance(radius) => {
+                        commands.write_message(RenderDistanceRequested {
+                            player_id: client_id,
+                            radius,
+                        });
+                    }
+                    ClientMessage::PlaceBlock { pos, kind } => {
+                        commands.write_message(PlaceBlockRequested {
+                            player_id: client_id,
+                            pos,
+                            kind,
+                        });
+                    }
+                    ClientMessage::BreakBlock { pos } => {
+                        commands.write_message(BreakBlockRequested {
+                            player_id: client_id,
+                            pos,
+                        });
+                    }
+                    ClientMessage::SelectHotbar(index) => {
+                        commands.write_message(SelectHotbarRequested {
+                            player_id: client_id,
+                            index,
+                        });
+                    }
+                    _ => {}
                 }
-                ClientMessage::SetRenderDistance(radius) => {
-                    commands.write_message(RenderDistanceRequested {
-                        player_id: client_id,
-                        radius,
-                    });
-                }
-                ClientMessage::PlaceBlock { pos, kind } => {
-                    commands.write_message(PlaceBlockRequested {
-                        player_id: client_id,
-                        pos,
-                        kind,
-                    });
-                }
-                ClientMessage::BreakBlock { pos } => {
-                    commands.write_message(BreakBlockRequested {
-                        player_id: client_id,
-                        pos,
-                    });
-                }
-                ClientMessage::SelectHotbar(index) => {
-                    commands.write_message(SelectHotbarRequested {
-                        player_id: client_id,
-                        index,
-                    });
-                }
-                _ => {}
             }
         }
     }
