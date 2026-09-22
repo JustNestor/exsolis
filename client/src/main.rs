@@ -31,6 +31,7 @@ use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 mod block_textures;
 mod chunk;
 mod chunk_registry;
+mod interaction;
 mod mesh;
 mod player;
 mod render;
@@ -82,6 +83,7 @@ fn main() {
         .insert_resource(new_transport())
         .add_observer(log_netcode_error)
         .add_plugins(StreamingPlugin)
+        .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))
         .add_systems(
             Update,

@@ -1,0 +1,273 @@
+//! Server-authoritative block placement/breaking + hotbar selection.
+//!
+//! `PlaceBlock`/`BreakBlock`/`SelectHotbar` arrive on the client->server
+//! ReliableOrdered channel (same as `Move`), get bridged out of
+//! `events.rs::recive_packets` as `Message`s (same pattern `chunks.rs`
+//! uses for `RenderDistanceRequested`), and are handled here so this file
+//! doesn't need to know about packet framing.
+//!
+//! Everything the client claims is treated as a request, not a fact:
+//! - the target chunk must actually be loaded server-side (`ChunkWorld`);
+//! - the target must be within `MAX_REACH` of the player's OWN server
+//!   position (`PlayerPosition`), not wherever the client says it's aiming;
+//! - break requires the target to be non-air; place requires it to be air
+//!   AND the player's selected hotbar slot to actually hold that item.
+//! A request that fails any check is silently dropped — no error is sent
+//! back, matching how a malformed packet is already handled in events.rs.
+
+use bevy_app::prelude::*;
+use bevy_ecs::message::Message;
+use bevy_ecs::prelude::*;
+use bevy_renet::RenetServer;
+use bevy_renet::renet::DefaultChannel;
+use exsolis_common::{BlockPos, BlockType, ChunkCoord, PlayerId, ServerMessage};
+use glam::Vec3;
+
+use crate::Inventory;
+use crate::PlayerMap;
+use crate::chunks::PlayerPosition;
+use crate::chunks::{ChunkRenderState, ChunkWorld};
+
+/// Blocks. A block is 1 world unit, so this is also world units. Generous
+/// on purpose — this exists to catch cheating/desync, not to be a strict
+/// gameplay reach limit; tighten once real hand/camera reach is settled.
+const MAX_REACH: f32 = 8.0;
+
+pub struct InteractionPlugin;
+
+impl Plugin for InteractionPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_message::<PlaceBlockRequested>()
+            .add_message::<BreakBlockRequested>()
+            .add_message::<SelectHotbarRequested>()
+            .add_systems(
+                Update,
+                (
+                    handle_select_hotbar,
+                    (handle_place_block, handle_break_block),
+                    sync_inventories,
+                )
+                    .chain()
+                    .after(crate::events::recive_packets),
+            );
+    }
+}
+
+/// Bridged from `events.rs::recive_packets`, same shape as
+/// `chunks::RenderDistanceRequested`.
+#[derive(Message)]
+pub struct PlaceBlockRequested {
+    pub player_id: PlayerId,
+    pub pos: BlockPos,
+    pub kind: BlockType,
+}
+
+#[derive(Message)]
+pub struct BreakBlockRequested {
+    pub player_id: PlayerId,
+    pub pos: BlockPos,
+}
+
+#[derive(Message)]
+pub struct SelectHotbarRequested {
+    pub player_id: PlayerId,
+    pub index: u8,
+}
+
+fn handle_select_hotbar(
+    mut events: MessageReader<SelectHotbarRequested>,
+    player_map: Res<PlayerMap>,
+    mut inventories: Query<&mut Inventory>,
+) {
+    for ev in events.read() {
+        let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            continue;
+        };
+        let Ok(mut inventory) = inventories.get_mut(entity) else {
+            continue;
+        };
+        inventory.select(ev.index);
+    }
+}
+
+fn world_to_chunk(pos: BlockPos) -> (ChunkCoord, usize) {
+    const S: i32 = exsolis_common::CHUNK_SIZE as i32;
+    let cx = pos.x.div_euclid(S);
+    let cy = pos.y.div_euclid(S);
+    let cz = pos.z.div_euclid(S);
+    let lx = pos.x.rem_euclid(S) as usize;
+    let ly = pos.y.rem_euclid(S) as usize;
+    let lz = pos.z.rem_euclid(S) as usize;
+    let idx = lx
+        + ly * exsolis_common::CHUNK_SIZE
+        + lz * exsolis_common::CHUNK_SIZE * exsolis_common::CHUNK_SIZE;
+    (ChunkCoord::new(cx, cy, cz), idx)
+}
+
+fn within_reach(player_pos: Vec3, target: BlockPos) -> bool {
+    // Center of the target block, not its corner.
+    let center = Vec3::new(
+        target.x as f32 + 0.5,
+        target.y as f32 + 0.5,
+        target.z as f32 + 0.5,
+    );
+    player_pos.distance(center) <= MAX_REACH
+}
+
+/// Applies the mutation and broadcasts `BlockUpdate` to exactly the
+/// players who actually have this chunk loaded (`ChunkRenderState.loaded`)
+/// — sending it to everyone would leak block data outside a player's own
+/// render distance and waste bandwidth on players who can't see it anyway.
+fn apply_and_broadcast(
+    coord: ChunkCoord,
+    idx: usize,
+    new_block: BlockType,
+    pos: BlockPos,
+    world: &mut ChunkWorld,
+    server: &mut RenetServer,
+    loaded_by: &Query<(&crate::Player, &ChunkRenderState)>,
+) -> bool {
+    let Some(existing) = world.ready.get(&coord) else {
+        return false; // chunk not loaded server-side; nothing to mutate
+    };
+    let Some(updated) = existing.set_block(idx, new_block) else {
+        return false; // out-of-range idx or corrupt data; shouldn't happen
+    };
+    world.ready.insert(coord, updated);
+
+    let msg = bincode::serialize(&ServerMessage::BlockUpdate {
+        pos,
+        kind: new_block,
+    })
+    .unwrap();
+    for (player, state) in loaded_by {
+        if state.loaded.contains(&coord) {
+            server.send_message(player.0, DefaultChannel::ReliableOrdered, msg.clone());
+        }
+    }
+    true
+}
+
+fn handle_place_block(
+    mut events: MessageReader<PlaceBlockRequested>,
+    player_map: Res<PlayerMap>,
+    positions: Query<&PlayerPosition>,
+    mut inventories: Query<&mut Inventory>,
+    mut world: ResMut<ChunkWorld>,
+    mut server: ResMut<RenetServer>,
+    loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
+) {
+    for ev in events.read() {
+        let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            continue;
+        };
+        let Ok(player_pos) = positions.get(entity) else {
+            continue;
+        };
+        if !within_reach(player_pos.0, ev.pos) {
+            continue;
+        }
+        let Ok(mut inventory) = inventories.get_mut(entity) else {
+            continue;
+        };
+        // Must actually be holding this item — the client's claimed `kind`
+        // is not trusted on its own, only as "which item, if you have it".
+        let Some(selected) = inventory.selected_slot() else {
+            continue;
+        };
+        if selected.item != ev.kind {
+            continue;
+        }
+
+        let (coord, idx) = world_to_chunk(ev.pos);
+        let Some(target) = world.ready.get(&coord) else {
+            continue;
+        };
+        let Some(unpacked) = target.unpack() else {
+            continue;
+        };
+        if unpacked[idx] != BlockType::Air {
+            continue; // occupied; place fails without consuming the item
+        }
+
+        if apply_and_broadcast(
+            coord,
+            idx,
+            ev.kind,
+            ev.pos,
+            &mut world,
+            &mut server,
+            &loaded_by,
+        ) {
+            let selected_index = inventory.selected_index();
+            inventory.remove_one(selected_index, ev.kind);
+        }
+    }
+}
+
+fn handle_break_block(
+    mut events: MessageReader<BreakBlockRequested>,
+    player_map: Res<PlayerMap>,
+    positions: Query<&PlayerPosition>,
+    mut inventories: Query<&mut Inventory>,
+    mut world: ResMut<ChunkWorld>,
+    mut server: ResMut<RenetServer>,
+    loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
+) {
+    for ev in events.read() {
+        let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            continue;
+        };
+        let Ok(player_pos) = positions.get(entity) else {
+            continue;
+        };
+        if !within_reach(player_pos.0, ev.pos) {
+            continue;
+        }
+
+        let (coord, idx) = world_to_chunk(ev.pos);
+        let Some(target) = world.ready.get(&coord) else {
+            continue;
+        };
+        let Some(unpacked) = target.unpack() else {
+            continue;
+        };
+        let broken = unpacked[idx];
+        if broken == BlockType::Air {
+            continue; // nothing to break
+        }
+
+        if apply_and_broadcast(
+            coord,
+            idx,
+            BlockType::Air,
+            ev.pos,
+            &mut world,
+            &mut server,
+            &loaded_by,
+        ) {
+            if let Ok(mut inventory) = inventories.get_mut(entity) {
+                // Pickup overflow (full hotbar) is silently dropped for
+                // now — there's no ground-item entity to spawn it as yet.
+                inventory.add_item(broken, 1);
+            }
+        }
+    }
+}
+
+/// Pushes `YourInventory` to each player whose inventory changed this tick.
+/// Bevy's change detection (`Changed<Inventory>`) means this only fires on
+/// an actual mutation, not every tick, so it's fine to run unconditionally.
+fn sync_inventories(
+    changed: Query<(&crate::Player, &Inventory), Changed<Inventory>>,
+    mut server: ResMut<RenetServer>,
+) {
+    for (player, inventory) in &changed {
+        let msg = bincode::serialize(&ServerMessage::YourInventory {
+            slots: inventory.to_wire(),
+            selected: inventory.selected_index(),
+        })
+        .unwrap();
+        server.send_message(player.0, DefaultChannel::ReliableOrdered, msg);
+    }
+}

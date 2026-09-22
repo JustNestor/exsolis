@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 mod chunk_blocks;
+pub mod inventory;
+
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 pub const PROTOCOL_ID: u64 = 1;
@@ -166,4 +168,16 @@ pub enum ServerMessage {
         y: f32,
         z: f32,
     },
+    /// The receiving player's own hotbar, sent on ReliableOrdered whenever
+    /// it changes (join, pickup, place/break consuming a stack, hotbar
+    /// select). `slots[i]` is `None` for an empty slot. There is no
+    /// visible UI yet (see inventory.rs on both sides) — this exists so
+    /// the client can know what `kind` to put in its next `PlaceBlock`
+    /// without guessing. Appended last, same reason as `YourPosition`.
+    YourInventory {
+        slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
+        selected: u8,
+    },
 }
+
+pub const HOTBAR_SIZE: usize = 9;

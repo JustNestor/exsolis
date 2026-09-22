@@ -4,7 +4,7 @@ use bevy_log::prelude::*;
 use bevy_renet::{RenetClient, renet::DefaultChannel};
 use exsolis_common::ServerMessage;
 
-use crate::{chunk::Chunk, chunk_registry::ChunkRegistry};
+use crate::{chunk::Chunk, chunk_registry::ChunkRegistry, interaction::ClientInventory};
 
 pub struct StreamingPlugin;
 
@@ -19,10 +19,11 @@ fn receive_chunk_updates(
     mut commands: Commands,
     mut client: ResMut<RenetClient>,
     mut registry: ResMut<ChunkRegistry>,
+    mut inventory: ResMut<ClientInventory>,
     existing: Query<(Entity, &Chunk)>,
 ) {
     while let Some(bytes) = client.receive_message(DefaultChannel::ReliableOrdered) {
-        debug!("reciving {} bytes", bytes.len());
+        // debug!("reciving {} bytes", bytes.len());
         let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
             warn!("bad packet from server, dropping");
             continue;
@@ -46,6 +47,10 @@ fn receive_chunk_updates(
                     commands.entity(entity).despawn();
                     registry.remove(coords);
                 }
+            }
+            ServerMessage::YourInventory { slots, selected } => {
+                inventory.slots = slots;
+                inventory.selected = selected;
             }
             _ => {}
         }

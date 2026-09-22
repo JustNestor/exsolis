@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     net::{SocketAddr, UdpSocket},
+    ops::{Deref, DerefMut},
     time::{Duration, SystemTime},
 };
 
@@ -21,6 +22,7 @@ use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMe
 
 mod chunks;
 mod events;
+mod interaction;
 mod movement;
 mod network;
 
@@ -28,10 +30,28 @@ use chunks::*;
 use events::*;
 use movement::*;
 use network::*;
+
+use crate::interaction::InteractionPlugin;
 // mod level;
 
 #[derive(Component)]
-pub struct Player(PlayerId);
+pub struct Player(pub PlayerId);
+
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct Inventory(pub exsolis_common::inventory::Inventory);
+
+impl Deref for Inventory {
+    type Target = exsolis_common::inventory::Inventory;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Inventory {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[derive(Resource, Debug, Default)]
 pub struct PlayerMap {
@@ -71,6 +91,7 @@ fn main() {
         .add_plugins(EventsPlugin)
         .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)
+        .add_plugins(InteractionPlugin)
         .insert_resource(RenetServer::new(connection_config()))
         .insert_resource(new_transport())
         .init_resource::<PlayerMap>()

@@ -1,8 +1,10 @@
+use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
+
 use super::*;
 use bevy_ecs::message::Message;
 use bevy_renet::renet::SendType::Unreliable;
 use chunks::{PlayerPosition, RenderDistanceRequested};
-use exsolis_common::SPAWN_POS;
+use exsolis_common::{BlockType, SPAWN_POS};
 use glam::{Vec3, Vec4};
 use movement::{PlayerInput, PositionSync};
 
@@ -55,12 +57,25 @@ pub fn on_server_event(
             // chunks.rs::compute_desired_chunks' query matches nothing for
             // them and they never get sent a single chunk — this was the
             // root cause of the blue-screen-with-no-blocks symptom.
+
+            let mut inventory = crate::Inventory::default();
+            for block in [
+                BlockType::Dirt,
+                BlockType::Stone,
+                BlockType::Sand,
+                BlockType::Snow,
+                BlockType::Glass,
+            ] {
+                inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+            }
+
             let entity = commands
                 .spawn((
                     Player(client_id),
                     PlayerPosition(Vec3::from(SPAWN_POS)),
                     PlayerInput::default(),
                     PositionSync::default(),
+                    inventory,
                 ))
                 .id();
             player_map.playerid_to_entity.insert(client_id, entity);
@@ -124,6 +139,25 @@ pub fn recive_packets(
                     commands.write_message(RenderDistanceRequested {
                         player_id: client_id,
                         radius,
+                    });
+                }
+                ClientMessage::PlaceBlock { pos, kind } => {
+                    commands.write_message(PlaceBlockRequested {
+                        player_id: client_id,
+                        pos,
+                        kind,
+                    });
+                }
+                ClientMessage::BreakBlock { pos } => {
+                    commands.write_message(BreakBlockRequested {
+                        player_id: client_id,
+                        pos,
+                    });
+                }
+                ClientMessage::SelectHotbar(index) => {
+                    commands.write_message(SelectHotbarRequested {
+                        player_id: client_id,
+                        index,
                     });
                 }
                 _ => {}

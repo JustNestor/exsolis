@@ -109,6 +109,26 @@ impl ChunkBlocks {
         Some(out)
     }
 
+    /// Replace one block and repack. There's no in-place bit-packed write
+    /// (palette indices are variable-width; growing the palette mid-edit
+    /// would require re-laying out every word), so this unpacks the full
+    /// 32^3 array, writes the one block, and repacks. Cheap enough for
+    /// player-driven edit rates (one call per placed/broken block); would
+    /// need a real mutable representation for bulk/worldgen edits.
+    ///
+    /// `idx` is `x + y*32 + z*32*32` (see the module doc / `pack`'s
+    /// ordering contract). Returns `None` if `idx` is out of range or the
+    /// existing data is malformed (mirrors `unpack`'s error handling,
+    /// since this always unpacks first).
+    pub fn set_block(&self, idx: usize, block: BlockType) -> Option<Self> {
+        if idx >= CHUNK_VOLUME {
+            return None;
+        }
+        let mut blocks = self.unpack()?;
+        blocks[idx] = block;
+        Some(Self::pack(&blocks))
+    }
+
     /// True if the whole chunk is a single block type (e.g. all air).
     pub fn is_uniform(&self) -> bool {
         self.bits_per_block == 0
