@@ -24,6 +24,13 @@ impl Chunk {
         })
     }
 
+    pub fn set(&mut self, x: usize, y: usize, z: usize, kind: BlockType) {
+        if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
+            let idx = Self::index(x, y, z);
+            Arc::make_mut(&mut self.blocks)[idx] = kind;
+        }
+    }
+
     #[inline]
     fn index(x: usize, y: usize, z: usize) -> usize {
         // x-major, matches the server's generate_chunk indexing
