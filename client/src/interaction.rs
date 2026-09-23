@@ -8,14 +8,15 @@ use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
 use bevy_input::mouse::MouseButton;
 use bevy_log::{info, warn};
+use bevy_renet::RenetClient;
+use bevy_renet::renet::DefaultChannel;
 use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
-use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE, ServerMessage};
+use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE};
 use glam::{IVec3, Vec3};
 
 use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
-use crate::net::{GameplaySet, IncomingPacket, NetConnected, OutgoingPacket};
 use crate::player::{FlyCamera, LocalPlayer};
 
 /// Blocks. Purely advisory on the client (affects what gets highlighted /
@@ -75,13 +76,11 @@ impl Plugin for InteractionPlugin {
                 Update,
                 (
                     ensure_targeting_component,
-                    apply_inventory,
                     select_hotbar_by_number_input,
                     update_targeting,
                     handle_break_input,
                     handle_place_input,
-                )
-                    .in_set(GameplaySet),
+                ),
             );
     }
 }
@@ -113,35 +112,17 @@ const DIGIT_KEYS: [KeyCode; HOTBAR_SIZE] = [
     KeyCode::Digit9,
 ];
 
-fn apply_inventory(
-    mut packets: MessageReader<IncomingPacket>,
-    mut inventory: ResMut<ClientInventory>,
-) {
-    for packet in packets.read() {
-        let ServerMessage::YourInventory { slots, selected } = &packet.0 else {
-            continue;
-        };
-        inventory.slots = slots.clone();
-        inventory.selected = *selected;
-    }
-}
-
-fn select_hotbar_by_number_input(
-    keys: Res<ButtonInput<KeyCode>>,
-    connected: Res<NetConnected>,
-    mut outgoing: MessageWriter<OutgoingPacket>,
-) {
+fn select_hotbar_by_number_input(keys: Res<ButtonInput<KeyCode>>, mut client: ResMut<RenetClient>) {
     let Some(index) = DIGIT_KEYS.iter().position(|k| keys.just_pressed(*k)) else {
         return;
     };
-    if !connected.get() {
-        warn!("[SelectHotbar] Key digit press detected, but client is not connected");
+    if !client.is_connected() {
+        warn!("[SelectHotbar] Key digit press detected, but RenetClient is not connected");
         return;
     }
     info!("[SelectHotbar] Sending SelectHotbar({}) packet", index);
-    outgoing.write(OutgoingPacket::reliable(ClientMessage::SelectHotbar(
-        index as u8,
-    )));
+    let msg = bincode::serialize(&ClientMessage::SelectHotbar(index as u8)).unwrap();
+    client.send_message(DefaultChannel::ReliableOrdered, msg);
 }
 
 fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockType> {
@@ -283,8 +264,7 @@ fn handle_break_input(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut cooldown: ResMut<InteractionCooldown>,
-    connected: Res<NetConnected>,
-    mut outgoing: MessageWriter<OutgoingPacket>,
+    mut client: ResMut<RenetClient>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
     if !mouse.pressed(MouseButton::Left) {
@@ -300,8 +280,8 @@ fn handle_break_input(
 
     cooldown.break_timer.reset();
 
-    if !connected.get() {
-        warn!("[BreakBlock] Left click pressed, but client is NOT connected!");
+    if !client.is_connected() {
+        warn!("[BreakBlock] Left click pressed, but RenetClient is NOT connected!");
         return;
     }
 
@@ -324,9 +304,11 @@ fn handle_break_input(
             "[BreakBlock] Sending BreakBlock packet for pos {:?}",
             target.pos
         );
-        outgoing.write(OutgoingPacket::reliable(ClientMessage::BreakBlock {
+        let msg = bincode::serialize(&ClientMessage::BreakBlock {
             pos: BlockPos::new(target.pos.x, target.pos.y, target.pos.z),
-        }));
+        })
+        .unwrap();
+        client.send_message(DefaultChannel::ReliableOrdered, msg);
     }
 }
 
@@ -334,8 +316,7 @@ fn handle_place_input(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut cooldown: ResMut<InteractionCooldown>,
-    connected: Res<NetConnected>,
-    mut outgoing: MessageWriter<OutgoingPacket>,
+    mut client: ResMut<RenetClient>,
     inventory: Res<ClientInventory>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
@@ -352,8 +333,8 @@ fn handle_place_input(
 
     cooldown.place_timer.reset();
 
-    if !connected.get() {
-        warn!("[PlaceBlock] Right click pressed, but client is NOT connected!");
+    if !client.is_connected() {
+        warn!("[PlaceBlock] Right click pressed, but RenetClient is NOT connected!");
         return;
     }
 
@@ -384,9 +365,11 @@ fn handle_place_input(
             "[PlaceBlock] Sending PlaceBlock packet for item {:?} at place_pos {:?}",
             item, target.place_pos
         );
-        outgoing.write(OutgoingPacket::reliable(ClientMessage::PlaceBlock {
+        let msg = bincode::serialize(&ClientMessage::PlaceBlock {
             pos: BlockPos::new(target.place_pos.x, target.place_pos.y, target.place_pos.z),
             kind: item,
-        }));
+        })
+        .unwrap();
+        client.send_message(DefaultChannel::ReliableOrdered, msg);
     }
 }

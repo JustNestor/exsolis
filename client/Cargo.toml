@@ -38,3 +38,4 @@ vulkano-taskgraph.workspace = true
 mimalloc.workspace = true
 rand.workspace = true
 bincode.workspace = true
+offset-allocator = "0.2.0"
