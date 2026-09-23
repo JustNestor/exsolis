@@ -18,7 +18,7 @@ use bevy_ecs::prelude::*;
 use bevy_internal::DefaultPlugins;
 use bevy_log::{LogPlugin, prelude::*};
 use bevy_renet::{
-    RenetClient, RenetClientPlugin, client_connected,
+    RenetClient, RenetClientPlugin,
     netcode::{
         ClientAuthentication, NetcodeClientPlugin, NetcodeClientTransport, NetcodeErrorEvent,
     },
@@ -33,12 +33,14 @@ mod chunk;
 mod chunk_registry;
 mod interaction;
 mod mesh;
+mod net;
 mod player;
 mod render;
 mod streaming;
 mod texture;
 mod vulkan_prelude;
 
+use net::NetPlugin;
 use player::PlayerPlugin;
 use render::*;
 use streaming::StreamingPlugin;
@@ -82,6 +84,7 @@ fn main() {
         .insert_resource(RenetClient::new(connection_config()))
         .insert_resource(new_transport())
         .add_observer(log_netcode_error)
+        .add_plugins(NetPlugin)
         .add_plugins(StreamingPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))
@@ -106,7 +109,7 @@ fn new_transport() -> NetcodeClientTransport {
 
     let authentication = ClientAuthentication::Unsecure {
         client_id,
-        protocol_id: 1,
+        protocol_id: PROTOCOL_ID,
         server_addr,
         user_data: None,
     };

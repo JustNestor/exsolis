@@ -19,18 +19,18 @@ use bevy_ecs::message::MessageReader;
 use bevy_ecs::prelude::*;
 use bevy_input::mouse::{MouseButton, MouseMotion};
 use bevy_input::{ButtonInput, keyboard::KeyCode};
-use bevy_log::info;
-use bevy_renet::RenetClient;
-use bevy_renet::renet::DefaultChannel;
 use bevy_transform::prelude::Transform;
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
-use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
+use exsolis_common::{ClientMessage, PlayerId, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, Vec3};
 
-use crate::streaming::RemotePlayer;
+use crate::net::{GameplaySet, IncomingPacket, NetConnected, OutgoingPacket};
 
 #[derive(Component)]
 pub struct LocalPlayer;
+
+#[derive(Component)]
+pub struct RemotePlayer(pub PlayerId);
 
 /// Latest authoritative position from the server (`None` until the first
 /// snapshot arrives). The local Transform eases toward it.
@@ -96,8 +96,14 @@ impl Plugin for PlayerPlugin {
                 toggle_cursor_grab,
                 fly_camera_look,
                 send_movement_input,
-                (receive_server_position, follow_server_position).chain(),
-            ),
+                (
+                    apply_local_position,
+                    apply_remote_players,
+                    follow_server_position,
+                )
+                    .chain(),
+            )
+                .in_set(GameplaySet),
         );
     }
 }
@@ -183,10 +189,11 @@ fn send_movement_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     query: Query<&Transform, With<LocalPlayer>>,
-    mut client: ResMut<RenetClient>,
+    connected: Res<NetConnected>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     mut sync: Local<InputSyncState>,
 ) {
-    if !client.is_connected() {
+    if !connected.get() {
         // A (re)connection gets a fresh server-side player with zero input,
         // so reset our baseline and resend whatever is held once connected.
         *sync = InputSyncState::default();
@@ -242,47 +249,82 @@ fn send_movement_input(
         }
     }
 
-    let msg = bincode::serialize(&ClientMessage::Move {
+    outgoing.write(OutgoingPacket::reliable(ClientMessage::Move {
         x: direction.x,
         y: direction.y,
         z: direction.z,
-    })
-    .unwrap();
-    client.send_message(DefaultChannel::ReliableOrdered, msg);
+    }));
     sync.last_sent = direction;
     sync.last_sent_at = Some(now);
 }
 
-/// Drains authoritative position snapshots. Nothing else reads the
-/// Unreliable server->client channel (chunks use ReliableOrdered, read in
-/// streaming.rs), so this can't steal anyone else's messages.
-fn receive_server_position(
-    mut client: ResMut<RenetClient>,
+/// Applies the local player's authoritative snapshot. Independent of
+/// remote-player packets so a missing LocalPlayer entity can't drop them.
+fn apply_local_position(
+    mut packets: MessageReader<IncomingPacket>,
     mut query: Query<(&mut Transform, &mut ServerTarget), With<LocalPlayer>>,
-    mut remote: Query<(&RemotePlayer, &mut ServerTarget), Without<LocalPlayer>>,
 ) {
     let Ok((mut transform, mut target)) = query.single_mut() else {
         return;
     };
 
-    while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
-        let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
+    for packet in packets.read() {
+        let ServerMessage::YourPosition { x, y, z } = &packet.0 else {
             continue;
         };
-        match msg {
-            ServerMessage::YourPosition { x, y, z } => {
-                let pos = Vec3::new(x, y, z);
-                if target.0.is_none() {
-                    transform.translation = pos;
+        let pos = Vec3::new(*x, *y, *z);
+        if target.0.is_none() {
+            transform.translation = pos;
+        }
+        target.0 = Some(pos);
+    }
+}
+
+/// Join / leave / moved for everyone who isn't the local player.
+fn apply_remote_players(
+    mut commands: Commands,
+    mut packets: MessageReader<IncomingPacket>,
+    remotes: Query<(Entity, &RemotePlayer)>,
+    mut targets: Query<&mut ServerTarget, Without<LocalPlayer>>,
+) {
+    for packet in packets.read() {
+        match &packet.0 {
+            ServerMessage::PlayerJoined(id) => {
+                let exists = remotes.iter().any(|(_, p)| p.0 == *id);
+                if !exists {
+                    commands.spawn((
+                        RemotePlayer(*id),
+                        Transform::from_translation(Vec3::from(SPAWN_POS)),
+                        ServerTarget(Some(Vec3::from(SPAWN_POS))),
+                    ));
                 }
-                target.0 = Some(pos);
+            }
+            ServerMessage::PlayerLeft(id) => {
+                for (entity, p) in &remotes {
+                    if p.0 == *id {
+                        commands.entity(entity).despawn();
+                    }
+                }
             }
             ServerMessage::PlayerMoved { player_id, x, y, z } => {
-                let pos = Vec3::new(x, y, z);
-                for (p, mut t) in &mut remote {
-                    if p.0 == player_id {
-                        t.0 = Some(pos);
+                let pos = Vec3::new(*x, *y, *z);
+                let mut found = false;
+                for (entity, p) in &remotes {
+                    if p.0 == *player_id {
+                        if let Ok(mut target) = targets.get_mut(entity) {
+                            target.0 = Some(pos);
+                        }
+                        found = true;
                     }
+                }
+                // Unreliable Moved can beat reliable Joined. Spawn in place
+                // rather than dropping the snapshot and flashing SPAWN_POS.
+                if !found {
+                    commands.spawn((
+                        RemotePlayer(*player_id),
+                        Transform::from_translation(pos),
+                        ServerTarget(Some(pos)),
+                    ));
                 }
             }
             _ => {}
@@ -290,7 +332,7 @@ fn receive_server_position(
     }
 }
 
-/// Eases the camera toward the last server position (frame-rate independent).
+/// Eases every entity with a server target (local camera + remotes).
 fn follow_server_position(
     mut query: Query<(&mut Transform, &ServerTarget)>,
     mut last_frame: Local<Option<Instant>>,

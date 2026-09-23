@@ -950,9 +950,9 @@ fn render_player_heads(
     mut render_state: ResMut<RenderState>,
     players: Query<
         (Entity, &Transform, Option<&LastHeadPosition>),
-        (With<crate::streaming::RemotePlayer>, Changed<Transform>),
+        (With<crate::player::RemotePlayer>, Changed<Transform>),
     >,
-    mut removed: RemovedComponents<crate::streaming::RemotePlayer>,
+    mut removed: RemovedComponents<crate::player::RemotePlayer>,
 ) {
     let Some(textures) = textures else {
         return;
