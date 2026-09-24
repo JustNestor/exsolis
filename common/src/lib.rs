@@ -117,16 +117,41 @@ pub enum EntityKind {
     Player,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+/// NOTE: no longer `Copy` — `UiAction` owns `String`s. Anything that copied a
+/// `ClientMessage` implicitly now needs `.clone()` (or a move).
+#[non_exhaustive]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Move { x: f32, y: f32, z: f32 },
-    PlaceBlock { pos: BlockPos, kind: BlockType },
-    BreakBlock { pos: BlockPos },
+    Move {
+        x: f32,
+        y: f32,
+        z: f32,
+    },
+    PlaceBlock {
+        pos: BlockPos,
+        kind: BlockType,
+    },
+    BreakBlock {
+        pos: BlockPos,
+    },
     SelectHotbar(u8),
     ToggleInventory,
     SetRenderDistance(u8),
+    /// A UI interaction. `ui_id` is the screen the server mounted with
+    /// `UiShow`, `element_id` the widget's `id` attribute (or an auto
+    /// path like `#0.2.1` when it had none), `action` the raw `on-click`
+    /// string (`"namespace:action"`), `data` the widget's optional `data`
+    /// attribute. The server MUST treat all four as untrusted input.
+    /// Appended last so existing variant indices don't shift.
+    UiAction {
+        ui_id: String,
+        element_id: String,
+        action: String,
+        data: Option<String>,
+    },
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
     PlayerJoined(PlayerId),
@@ -178,6 +203,28 @@ pub enum ServerMessage {
         slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
         selected: u8,
     },
+    /// Mount (or atomically replace) the named UI screen. `xml` is the SDUI
+    /// document (see client `ui::parse`). ReliableOrdered. If the client
+    /// fails to parse it, the previously mounted screen (if any) is kept.
+    UiShow {
+        id: String,
+        xml: String,
+    },
+    /// Unmount the named UI screen. Unknown ids are ignored. ReliableOrdered.
+    UiHide {
+        id: String,
+    },
 }
 
 pub const HOTBAR_SIZE: usize = 9;
+
+// ---- SDUI limits, shared so server-side validation matches the client ----
+
+/// Max size of one `UiShow.xml` payload.
+pub const UI_MAX_XML_BYTES: usize = 64 * 1024;
+/// Max length of `ui_id` / `element_id`.
+pub const UI_MAX_ID_LEN: usize = 64;
+/// Max length of `UiAction.action` and `UiAction.data`.
+pub const UI_MAX_ACTION_LEN: usize = 256;
+/// Max UI screens mounted at the same time on one client.
+pub const UI_MAX_OPEN: usize = 32;

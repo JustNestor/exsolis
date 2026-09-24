@@ -25,6 +25,12 @@ bevy_a11y.workspace = true
 bevy_diagnostic.workspace = true
 bevy_renet.workspace = true
 bevy_internal.workspace = true
+roxmltree.workspace = true
+bevy_color.workspace = true
+bevy_text.workspace = true
+bevy_picking.workspace = true
+bevy_ui.workspace = true
+bevy_ui_widgets.workspace = true
 
 
 glam.workspace = true
@@ -38,4 +44,5 @@ vulkano-taskgraph.workspace = true
 mimalloc.workspace = true
 rand.workspace = true
 bincode.workspace = true
-offset-allocator = "0.2.0"
+offset-allocator.workspace = true
+# taffy = "0.14.0"

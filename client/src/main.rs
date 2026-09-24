@@ -33,16 +33,20 @@ mod chunk;
 mod chunk_registry;
 mod interaction;
 mod mesh;
+mod net;
 mod player;
 mod render;
 mod streaming;
 mod texture;
+mod ui;
 mod vulkan_prelude;
 
 use player::PlayerPlugin;
 use render::*;
 use streaming::StreamingPlugin;
 use vulkan_prelude::*;
+
+use crate::net::NetPlugin;
 
 pub fn connection_config() -> ConnectionConfig {
     let mut config = ConnectionConfig::default();
@@ -82,6 +86,8 @@ fn main() {
         .insert_resource(RenetClient::new(connection_config()))
         .insert_resource(new_transport())
         .add_observer(log_netcode_error)
+        .add_plugins(NetPlugin)
+        .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))
