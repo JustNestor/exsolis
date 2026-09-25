@@ -21,6 +21,7 @@ use crate::net::{GameplaySet, IncomingPacket, NetConnected};
 
 pub mod events;
 pub mod parse;
+pub mod render_bridge;
 pub mod spawn;
 pub mod style;
 
@@ -99,8 +100,10 @@ impl Plugin for UiPlugin {
                 handle_ui_packets.in_set(GameplaySet),
                 hide_on_disconnect,
                 events::update_hover_styles,
-            ),
-        );
+            )
+
+        ).add_plugins(render_bridge::UiRenderBridgePlugin) // if called from render/mod.rs's plugin, adjust path
+        ;
     }
 }
 

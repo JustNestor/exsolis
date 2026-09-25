@@ -1698,6 +1698,7 @@ dependencies = [
  "bevy_color",
  "bevy_diagnostic",
  "bevy_ecs",
+ "bevy_image",
  "bevy_input",
  "bevy_internal",
  "bevy_log",

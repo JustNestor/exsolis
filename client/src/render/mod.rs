@@ -11,6 +11,7 @@ mod allocator;
 mod avatars;
 mod gpu;
 mod meshing;
+pub mod ui_pass;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
