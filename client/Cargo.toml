@@ -31,6 +31,8 @@ bevy_text.workspace = true
 bevy_picking.workspace = true
 bevy_image.workspace = true
 bevy_ui.workspace = true
+bevy_camera.workspace = true
+wgpu-types.workspace = true
 bevy_ui_widgets.workspace = true
 
 
@@ -46,5 +48,5 @@ mimalloc.workspace = true
 rand.workspace = true
 bincode.workspace = true
 offset-allocator.workspace = true
-wgpu-types = "29.0.4"
+
 # taffy = "0.14.0"

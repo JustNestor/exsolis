@@ -70,7 +70,12 @@ pub fn connection_config() -> ConnectionConfig {
 fn main() {
     App::new()
         .add_plugins((
-            WindowPlugin {
+            // AccessibilityPlugin,
+            // LogPlugin::default(),
+            // AssetPlugin::default(),
+            // ImagePlugin::default(),
+            // bevy_ui::UiPlugin,
+            DefaultPlugins.set(WindowPlugin {
                 primary_window: Some(Window {
                     present_mode: bevy_window::PresentMode::Mailbox,
                     title: "Exsolis".to_string(),
@@ -78,14 +83,9 @@ fn main() {
                     ..Default::default()
                 }),
                 ..Default::default()
-            },
-            AccessibilityPlugin,
-            LogPlugin::default(),
-            AssetPlugin::default(),
-            ImagePlugin::default(),
-            DefaultPlugins,
+            }),
         ))
-        .add_plugins(bevy_winit::WinitPlugin::default())
+        // .add_plugins(bevy_winit::WinitPlugin::default())
         .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
         .insert_resource(RenetClient::new(connection_config()))
         .insert_resource(new_transport())

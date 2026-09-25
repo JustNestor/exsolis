@@ -3,9 +3,9 @@ name = "exsolis_server"
 version = "0.1.0"
 edition = "2024"
 
-[lib]
-name = "exsolis_server"
-path = "src/lib.rs"
+# [lib]
+# name = "exsolis_server"
+# path = "src/lib.rs"
 
 [[bin]]
 name = "exsolis_server_bin"

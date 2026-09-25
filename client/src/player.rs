@@ -15,6 +15,7 @@
 use std::time::{Duration, Instant};
 
 use bevy_app::prelude::*;
+use bevy_camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo, Viewport};
 use bevy_ecs::message::MessageReader;
 use bevy_ecs::prelude::*;
 use bevy_input::mouse::{MouseButton, MouseMotion};
@@ -23,9 +24,10 @@ use bevy_log::info;
 use bevy_renet::RenetClient;
 use bevy_renet::renet::DefaultChannel;
 use bevy_transform::prelude::Transform;
-use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
+use bevy_ui::IsDefaultUiCamera;
+use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
-use glam::{EulerRot, Quat, Vec3};
+use glam::{EulerRot, Quat, UVec2, Vec3};
 
 use crate::streaming::RemotePlayer;
 
@@ -96,6 +98,8 @@ impl Plugin for PlayerPlugin {
                 toggle_cursor_grab,
                 fly_camera_look,
                 send_movement_input,
+                sync_ui_layout_camera,
+                // debug_ui_camera,
                 (receive_server_position, follow_server_position).chain(),
             ),
         );
@@ -109,6 +113,62 @@ fn spawn_local_player(mut commands: Commands) {
         Transform::from_translation(Vec3::from(SPAWN_POS)),
         ServerTarget::default(),
     ));
+
+    commands.spawn((
+        Camera2d,
+        // UiLayoutCamera,
+        IsDefaultUiCamera,
+        Camera {
+            // Keep it from fighting anything else if you add more cameras later.
+            order: 100,
+            // computed: ComputedCameraValues {
+            //     target_info: Some(RenderTargetInfo {
+            //         physical_size: UVec2::new(100, 100),
+            //         scale_factor: 10.,
+            //     }),
+            //     ..Default::default()
+            // },
+            viewport: Some(Viewport {
+                physical_position: UVec2::ZERO,
+                physical_size: UVec2::new(100, 100), // updated every frame below
+                depth: 0.0..1.0,
+            }),
+            ..Default::default()
+        },
+    ));
+}
+fn sync_ui_layout_camera(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<&mut Camera>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
+    };
+    let w = window.resolution.physical_width().max(1);
+    let h = window.resolution.physical_height().max(1);
+
+    for mut camera in &mut cameras {
+        if let Some(ref mut vp) = camera.viewport {
+            vp.physical_size = UVec2::new(w, h);
+            vp.physical_position = UVec2::ZERO;
+        } else {
+            camera.viewport = Some(Viewport {
+                physical_position: UVec2::ZERO,
+                physical_size: UVec2::new(w, h),
+                depth: 0.0..1.0,
+            });
+        }
+    }
+}
+
+fn debug_ui_camera(cameras: Query<&Camera>) {
+    for c in &cameras {
+        info!(
+            "physical_viewport_size={:?} logical={:?}",
+            c.physical_viewport_size(),
+            c.logical_viewport_size()
+        );
+    }
 }
 
 /// Unlike the single-player version, this has no inventory-open check —

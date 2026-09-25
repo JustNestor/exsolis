@@ -37,6 +37,8 @@ use bevy_image::Image;
 use bevy_log::info;
 use bevy_ui::prelude::*;
 use bevy_ui::{BorderColor, CalculatedClip, ComputedNode, Outline, UiGlobalTransform};
+use bevy_window::{PrimaryWindow, Window};
+use glam::Vec2;
 // NOTE on API history in this file (checked against docs.rs/bevy_ui/0.19.1):
 // `ComputedNodeTarget` doesn't exist. `OverflowClipMargin` exists but is an
 // *input* (the margin the person configures on `Node`), not a `Component`
@@ -337,11 +339,11 @@ fn extract_ui(
         walk(root, &nodes, &registry, to_linear, &mut instances);
     }
 
-    // bevy_log::info!(
-    //     "UI extract: {} instances (gen {})",
-    //     instances.len(),
-    //     draw_list.generation
-    // );
+    bevy_log::info!(
+        "UI extract: {} instances (gen {})",
+        instances.len(),
+        draw_list.generation
+    );
     // Cheap content check avoids the GPU wait+upload in `ui_pass::sync`
     // on frames where nothing changed (static menus, idle HUD).
     if instances.len() != draw_list.instances.len() || instances != draw_list.instances {
@@ -471,7 +473,8 @@ impl Plugin for UiRenderBridgePlugin {
                 (
                     sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
                     extract_ui,
-                    // debug_ui_layout,
+                    // force_ui_geometry,
+                    debug_ui_layout,
                 )
                     .chain()
                     .after(bevy_ui::UiSystems::PostLayout),
@@ -480,19 +483,50 @@ impl Plugin for UiRenderBridgePlugin {
 }
 
 fn debug_ui_layout(
-    roots: Query<Entity, With<UiRoot>>,
-    nodes: Query<(&ComputedNode, &UiGlobalTransform, Option<&BackgroundColor>)>,
+    q: Query<
+        (
+            Entity,
+            &ComputedNode,
+            &UiGlobalTransform,
+            Option<&BackgroundColor>,
+        ),
+        With<UiElement>,
+    >,
 ) {
-    for root in &roots {
-        let Ok((c, t, bg)) = nodes.get(root) else {
-            bevy_log::warn!("UiRoot {root:?} missing ComputedNode/UiGlobalTransform");
-            continue;
-        };
+    for (e, c, t, bg) in &q {
         bevy_log::info!(
-            "UiRoot size={:?} translation={:?} bg={:?}",
+            "ui node {e:?} size={:?} translation={:?} bg={:?}",
             c.size(),
             t.translation,
             bg.map(|b| b.0)
         );
+    }
+}
+
+fn force_ui_geometry(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    roots: Query<Entity, With<UiRoot>>,
+    mut nodes: Query<(
+        &Node,
+        &mut ComputedNode,
+        &mut UiGlobalTransform,
+        Option<&Children>,
+        Option<&BackgroundColor>,
+    )>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let screen = Vec2::new(
+        window.resolution.physical_width() as f32,
+        window.resolution.physical_height() as f32,
+    );
+
+    for root in &roots {
+        // Root = full window, centered content handled by flex-like walk
+        if let Ok((_, mut computed, mut transform, children, _)) = nodes.get_mut(root) {
+            computed.size = screen;
+            *transform = UiGlobalTransform::from_scale(Vec2::new(screen.x * 0.5, screen.y * 0.5));
+            // then walk children with a tiny layout if needed
+            let _ = children;
+        }
     }
 }
