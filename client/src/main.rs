@@ -14,7 +14,9 @@ use std::{
 
 use bevy_a11y::AccessibilityPlugin;
 use bevy_app::prelude::*;
+use bevy_asset::AssetPlugin;
 use bevy_ecs::prelude::*;
+use bevy_image::ImagePlugin;
 use bevy_internal::DefaultPlugins;
 use bevy_log::{LogPlugin, prelude::*};
 use bevy_renet::{
@@ -79,6 +81,8 @@ fn main() {
             },
             AccessibilityPlugin,
             LogPlugin::default(),
+            AssetPlugin::default(),
+            ImagePlugin::default(),
             DefaultPlugins,
         ))
         .add_plugins(bevy_winit::WinitPlugin::default())

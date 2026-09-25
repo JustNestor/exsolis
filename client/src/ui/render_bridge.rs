@@ -34,6 +34,7 @@ use bevy_asset::{AssetEvent, AssetId, Assets};
 use bevy_color::{Alpha, Color};
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
+use bevy_log::info;
 use bevy_ui::prelude::*;
 use bevy_ui::{BorderColor, CalculatedClip, ComputedNode, Outline, UiGlobalTransform};
 // NOTE on API history in this file (checked against docs.rs/bevy_ui/0.19.1):
@@ -462,7 +463,10 @@ impl Plugin for UiRenderBridgePlugin {
             .init_resource::<UiDrawList>()
             .add_systems(
                 PostUpdate,
-                (sync_glyph_atlases, extract_ui)
+                (
+                    sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
+                    extract_ui,
+                )
                     .chain()
                     .after(bevy_ui::UiSystems::PostLayout),
             );

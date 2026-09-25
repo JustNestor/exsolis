@@ -19,6 +19,8 @@ use exsolis_common::{ServerMessage, UI_MAX_ID_LEN, UI_MAX_OPEN};
 
 use crate::net::{GameplaySet, IncomingPacket, NetConnected};
 
+#[cfg(debug_assertions)]
+pub mod dev_reload;
 pub mod events;
 pub mod parse;
 pub mod render_bridge;
@@ -94,16 +96,22 @@ pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<UiManager>().add_systems(
-            Update,
-            (
-                handle_ui_packets.in_set(GameplaySet),
-                hide_on_disconnect,
-                events::update_hover_styles,
+        app.init_resource::<UiManager>()
+            .add_systems(
+                Update,
+                (
+                    handle_ui_packets.in_set(GameplaySet),
+                    hide_on_disconnect,
+                    events::update_hover_styles,
+                ),
             )
+            .add_plugins(render_bridge::UiRenderBridgePlugin);
 
-        ).add_plugins(render_bridge::UiRenderBridgePlugin) // if called from render/mod.rs's plugin, adjust path
-        ;
+        // Debug-only local XML loader — see dev_reload.rs. Compiled out of
+        // release builds entirely (not just inactive), so there's no risk
+        // of it shipping or of assets/xml/ being expected at runtime.
+        #[cfg(debug_assertions)]
+        app.add_plugins(dev_reload::UiDevReloadPlugin);
     }
 }
 
