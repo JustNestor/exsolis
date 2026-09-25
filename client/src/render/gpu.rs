@@ -52,6 +52,7 @@ use crate::{
 };
 
 use super::allocator::{GpuMeshAllocation, MeshBufferAllocator};
+use super::ui_pass::{self, UiDrawList, UiPassGpu};
 
 // 32^3 chunks pack more geometry per chunk than the old 16x16x256 columns
 // did on average once boundary culling removes most internal faces, and
@@ -62,6 +63,9 @@ pub(super) const MAX_INDICES: u64 = 60_000_000;
 
 pub(super) struct RenderStateShared {
     pub pipeline: Option<Arc<GraphicsPipeline>>,
+    /// UI quads (boxes + glyphs). Drawn after world/avatars in the same
+    /// subpass with alpha blending and depth test/write disabled.
+    pub ui_pipeline: Option<Arc<GraphicsPipeline>>,
     /// Chunk meshes only. Avatars share one [`avatar`] slice drawn with
     /// per-player model matrices.
     pub allocations: HashMap<Entity, GpuMeshAllocation>,
@@ -76,11 +80,15 @@ pub struct FrameData {
     pub sampler_id: SamplerId,
     /// One model matrix per remote player. Mesh is local-space in [`avatar`].
     pub avatar_models: Vec<Mat4>,
+    /// UI instance buffer + live count (synced from `UiDrawList` each frame).
+    pub ui_buffer_id: Id<Buffer>,
+    pub ui_count: u32,
 }
 
 struct ChunkRenderTask {
     vertex_buffer_id: Id<Buffer>,
     index_buffer_id: Id<Buffer>,
+    ui_buffer_id: Id<Buffer>,
     virtual_swapchain_id: Id<Swapchain>,
     virtual_depth_id: Id<Image>,
     shared: Arc<RwLock<RenderStateShared>>,
@@ -162,6 +170,19 @@ impl Task for ChunkRenderTask {
             }
         }
 
+        // UI pass: same subpass, after world geometry. Alpha-blended, no
+        // depth test/write — see `ui_pass::create_pipeline`.
+        if let Some(ui_pipeline) = shared.ui_pipeline.as_ref() {
+            ui_pass::record_draw(
+                cbf,
+                ui_pipeline,
+                world.ui_buffer_id,
+                world.ui_count,
+                [world.viewport.extent[0], world.viewport.extent[1]],
+                world.sampler_id,
+            );
+        }
+
         Ok(())
     }
 }
@@ -176,6 +197,7 @@ pub struct RenderState {
     pub(super) task_graph: Mutex<ExecutableTaskGraph<FrameData>>,
     pub(super) shared: Arc<RwLock<RenderStateShared>>,
     pub(super) allocator: MeshBufferAllocator,
+    pub(super) ui_gpu: UiPassGpu,
 }
 
 pub(super) struct PendingWrite<T> {
@@ -306,8 +328,13 @@ pub(super) fn setup_renderer(
         )
         .unwrap();
 
+    // UI instance buffer must exist before the task graph is built so we
+    // can declare VERTEX_ATTRIBUTE_READ access on the node.
+    let ui_gpu = UiPassGpu::new(&vk);
+
     let shared = Arc::new(RwLock::new(RenderStateShared {
         pipeline: None,
+        ui_pipeline: None,
         allocations: HashMap::new(),
         avatar: None,
     }));
@@ -328,6 +355,7 @@ pub(super) fn setup_renderer(
     let task = ChunkRenderTask {
         vertex_buffer_id,
         index_buffer_id,
+        ui_buffer_id: ui_gpu.buffer_id,
         virtual_swapchain_id,
         virtual_depth_id,
         shared: Arc::clone(&shared),
@@ -356,6 +384,7 @@ pub(super) fn setup_renderer(
         )
         .buffer_access(index_buffer_id, AccessTypes::INDEX_READ)
         .buffer_access(vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
+        .buffer_access(ui_gpu.buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .build();
 
     let task_graph = unsafe {
@@ -421,6 +450,10 @@ pub(super) fn setup_renderer(
 
     shared.write().unwrap().pipeline = Some(pipeline);
 
+    // UI pipeline shares the same subpass; alpha blend, no depth.
+    let ui_pipeline = ui_pass::create_pipeline(&vk, &subpass);
+    shared.write().unwrap().ui_pipeline = Some(ui_pipeline);
+
     commands.insert_resource(RenderState {
         vertex_buffer_id,
         index_buffer_id,
@@ -430,12 +463,14 @@ pub(super) fn setup_renderer(
         task_graph: Mutex::new(task_graph),
         shared,
         allocator: MeshBufferAllocator::new(),
+        ui_gpu,
     });
 }
 
 pub(super) fn render_frame(
     mut vk: ResMut<VulkanContext>,
     mut render_state: ResMut<RenderState>,
+    ui_list: Option<Res<UiDrawList>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
     remotes: Query<&Transform, With<RemotePlayer>>,
@@ -491,11 +526,20 @@ pub(super) fn render_frame(
         .map(|t| Mat4::from_translation(t.translation))
         .collect();
 
+    // Upload UI instances only when `UiDrawList.generation` changed.
+    if let Some(list) = ui_list.as_deref() {
+        ui_pass::sync(&vk, &mut render_state.ui_gpu, list);
+    }
+    let ui_count = render_state.ui_gpu.count;
+    let ui_buffer_id = render_state.ui_gpu.buffer_id;
+
     let frame = FrameData {
         view_proj,
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
         avatar_models,
+        ui_buffer_id,
+        ui_count,
     };
 
     vk.resources.flight(vk.flight_id).wait(None).unwrap();

@@ -337,6 +337,11 @@ fn extract_ui(
         walk(root, &nodes, &registry, to_linear, &mut instances);
     }
 
+    // bevy_log::info!(
+    //     "UI extract: {} instances (gen {})",
+    //     instances.len(),
+    //     draw_list.generation
+    // );
     // Cheap content check avoids the GPU wait+upload in `ui_pass::sync`
     // on frames where nothing changed (static menus, idle HUD).
     if instances.len() != draw_list.instances.len() || instances != draw_list.instances {
@@ -466,9 +471,28 @@ impl Plugin for UiRenderBridgePlugin {
                 (
                     sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
                     extract_ui,
+                    // debug_ui_layout,
                 )
                     .chain()
                     .after(bevy_ui::UiSystems::PostLayout),
             );
+    }
+}
+
+fn debug_ui_layout(
+    roots: Query<Entity, With<UiRoot>>,
+    nodes: Query<(&ComputedNode, &UiGlobalTransform, Option<&BackgroundColor>)>,
+) {
+    for root in &roots {
+        let Ok((c, t, bg)) = nodes.get(root) else {
+            bevy_log::warn!("UiRoot {root:?} missing ComputedNode/UiGlobalTransform");
+            continue;
+        };
+        bevy_log::info!(
+            "UiRoot size={:?} translation={:?} bg={:?}",
+            c.size(),
+            t.translation,
+            bg.map(|b| b.0)
+        );
     }
 }
