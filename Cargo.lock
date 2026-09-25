@@ -1725,6 +1725,7 @@ dependencies = [
  "vulkano-macros",
  "vulkano-shaders",
  "vulkano-taskgraph",
+ "wgpu-types",
  "winit",
 ]
 

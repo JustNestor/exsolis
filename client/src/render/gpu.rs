@@ -358,7 +358,7 @@ pub(super) fn setup_renderer(
         .buffer_access(vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .build();
 
-    let mut task_graph = unsafe {
+    let task_graph = unsafe {
         task_graph
             .compile(&CompileInfo {
                 queues: &[&vk.queue],
@@ -369,7 +369,7 @@ pub(super) fn setup_renderer(
             .unwrap()
     };
 
-    let mut node = task_graph.task_nodes().next().unwrap();
+    let node = task_graph.task_nodes().next().unwrap();
     let subpass = node.subpass().unwrap().clone();
 
     let vs = unsafe { vs::load(&vk.device).unwrap().entry_point("main").unwrap() };

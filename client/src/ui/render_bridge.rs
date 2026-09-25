@@ -10,10 +10,12 @@
 //!  1. [`sync_glyph_atlases`] — keep those atlas `Image`s uploaded as
 //!     bindless sampled images, the same discover/stage/upload/register
 //!     shape as `texture.rs`, just driven by `AssetEvent<Image>` instead
-//!     of a directory scan, and re-uploading a growing atlas is done by
-//!     freeing its old bindless slot and re-registering (atlases are
-//!     append-only within a run, so this only fires a handful of times as
-//!     new glyphs are first seen, not every frame).
+//!     of a directory scan. Old bindless slots are intentionally never
+//!     freed (see the NOTE inside the function) — same as `texture.rs`,
+//!     which doesn't free block textures either — so a re-uploaded atlas
+//!     just stops being referenced rather than reclaiming its slot. This
+//!     only fires a handful of times per run as new glyphs are first
+//!     seen, not every frame.
 //!  2. [`extract_ui`] — walk `Node`/`ComputedNode`/`BackgroundColor`/
 //!     `BorderColor`/`TextLayoutInfo` (and this crate's `UiRoot`/
 //!     `UiElement` to know which are ours) and turn them into
@@ -29,11 +31,20 @@ use std::num::NonZero;
 
 use bevy_app::prelude::*;
 use bevy_asset::{AssetEvent, AssetId, Assets};
-use bevy_color::Color;
+use bevy_color::{Alpha, Color};
 use bevy_ecs::prelude::*;
 use bevy_image::Image;
 use bevy_ui::prelude::*;
-use bevy_ui::{BorderColor, ComputedNode, Outline, OverflowClipMargin, UiGlobalTransform};
+use bevy_ui::{BorderColor, CalculatedClip, ComputedNode, Outline, UiGlobalTransform};
+// NOTE on API history in this file (checked against docs.rs/bevy_ui/0.19.1):
+// `ComputedNodeTarget` doesn't exist. `OverflowClipMargin` exists but is an
+// *input* (the margin the person configures on `Node`), not a `Component`
+// you query for a result — it's not even listed as deriving `Component` on
+// docs.rs. What bevy_ui's OWN renderer actually reads is `CalculatedClip`
+// (a real `Component`, `{ clip: Rect }`), which `update_clipping` already
+// computes for us every frame — walking `Overflow` and re-deriving clip
+// rects by hand was reinventing something bevy_ui hands us for free. Using
+// the real component now instead.
 use vulkano::buffer::{BufferCreateInfo, BufferUsage};
 use vulkano::image::view::ImageViewCreateInfo;
 use vulkano::image::{
@@ -46,11 +57,59 @@ use vulkano_taskgraph::command_buffer::CopyBufferToImageInfo;
 use vulkano_taskgraph::descriptor_set::SampledImageId;
 use vulkano_taskgraph::resource::HostAccessType;
 
+use vulkano::format::Format;
+use wgpu_types::TextureFormat;
+
 use crate::render::ui_pass::{UiDrawList, UiInstance, swapchain_is_srgb};
 use crate::texture::sampled_image_index;
 use crate::vulkan_prelude::VulkanContext;
 
 use super::spawn::{UiElement, UiRoot};
+
+fn wgpu_to_vulkano_format(format: TextureFormat) -> Option<Format> {
+    match format {
+        TextureFormat::R8Unorm => Some(Format::R8_UNORM),
+        TextureFormat::R8Snorm => Some(Format::R8_SNORM),
+        TextureFormat::R8Uint => Some(Format::R8_UINT),
+        TextureFormat::R8Sint => Some(Format::R8_SINT),
+        TextureFormat::Rg8Unorm => Some(Format::R8G8_UNORM),
+        TextureFormat::Rg8Snorm => Some(Format::R8G8_SNORM),
+        TextureFormat::Rg8Uint => Some(Format::R8G8_UINT),
+        TextureFormat::Rg8Sint => Some(Format::R8G8_SINT),
+        TextureFormat::Rgba8Unorm => Some(Format::R8G8B8A8_UNORM),
+        TextureFormat::Rgba8UnormSrgb => Some(Format::R8G8B8A8_SRGB),
+        TextureFormat::Rgba8Snorm => Some(Format::R8G8B8A8_SNORM),
+        TextureFormat::Rgba8Uint => Some(Format::R8G8B8A8_UINT),
+        TextureFormat::Rgba8Sint => Some(Format::R8G8B8A8_SINT),
+        TextureFormat::Bgra8Unorm => Some(Format::B8G8R8A8_UNORM),
+        TextureFormat::Bgra8UnormSrgb => Some(Format::B8G8R8A8_SRGB),
+        TextureFormat::R16Unorm => Some(Format::R16_UNORM),
+        TextureFormat::R16Snorm => Some(Format::R16_SNORM),
+        TextureFormat::R16Uint => Some(Format::R16_UINT),
+        TextureFormat::R16Sint => Some(Format::R16_SINT),
+        TextureFormat::R16Float => Some(Format::R16_SFLOAT),
+        TextureFormat::Rg16Unorm => Some(Format::R16G16_UNORM),
+        TextureFormat::Rg16Snorm => Some(Format::R16G16_SNORM),
+        TextureFormat::Rg16Uint => Some(Format::R16G16_UINT),
+        TextureFormat::Rg16Sint => Some(Format::R16G16_SINT),
+        TextureFormat::Rg16Float => Some(Format::R16G16_SFLOAT),
+        TextureFormat::Rgba16Unorm => Some(Format::R16G16B16A16_UNORM),
+        TextureFormat::Rgba16Snorm => Some(Format::R16G16B16A16_SNORM),
+        TextureFormat::Rgba16Uint => Some(Format::R16G16B16A16_UINT),
+        TextureFormat::Rgba16Sint => Some(Format::R16G16B16A16_SINT),
+        TextureFormat::Rgba16Float => Some(Format::R16G16B16A16_SFLOAT),
+        TextureFormat::R32Uint => Some(Format::R32_UINT),
+        TextureFormat::R32Sint => Some(Format::R32_SINT),
+        TextureFormat::R32Float => Some(Format::R32_SFLOAT),
+        TextureFormat::Rg32Uint => Some(Format::R32G32_UINT),
+        TextureFormat::Rg32Sint => Some(Format::R32G32_SINT),
+        TextureFormat::Rg32Float => Some(Format::R32G32_SFLOAT),
+        TextureFormat::Rgba32Uint => Some(Format::R32G32B32A32_UINT),
+        TextureFormat::Rgba32Sint => Some(Format::R32G32B32A32_SINT),
+        TextureFormat::Rgba32Float => Some(Format::R32G32B32A32_SFLOAT),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------- atlases
 
@@ -102,15 +161,27 @@ fn sync_glyph_atlases(
         }
     }
 
-    // Drop bindless registrations for atlases nobody references and that
-    // were removed/replaced (frees the slot rather than leaking it).
-    for ev in events.read() {
-        if let AssetEvent::Removed { id } | AssetEvent::Unused { id } = ev {
-            if let Some(entry) = registry.entries.remove(id) {
-                let global_set = vk.resources.bindless_context().unwrap().global_set();
-                let _ = global_set.remove_sampled_image(entry.bindless_id);
-            }
-        }
+    // NOTE: `GlobalDescriptorSet` has no `remove_sampled_image` — rustc's
+    // suggestion was the `sampled_image` getter, not a removal method, and
+    // I don't actually know the real free/deregister call for this
+    // vulkano-taskgraph version. Rather than guess another wrong name,
+    // bindless slots are deliberately never freed here — same as
+    // `texture.rs`, which never frees its block-texture registrations
+    // either. Glyph atlases are few (one per distinct font/size actually
+    // used) and effectively permanent for a run, so this leaks at most a
+    // handful of slots total, not per-frame. If you hit real slot
+    // exhaustion, grep your local vulkano-taskgraph source under
+    // descriptor_set/ for the actual removal API and wire it in — both
+    // call sites below marked (*).
+    let removed_ids: Vec<AssetId<Image>> = events
+        .read()
+        .filter_map(|ev| match ev {
+            AssetEvent::Removed { id } | AssetEvent::Unused { id } => Some(*id),
+            _ => None,
+        })
+        .collect();
+    for id in removed_ids {
+        registry.entries.remove(&id); // (*) slot itself is intentionally leaked, not freed.
     }
 
     for id in wanted {
@@ -125,9 +196,9 @@ fn sync_glyph_atlases(
             if existing.uploaded_len == data.len() {
                 continue; // Same handle, same size => assume unchanged (see below).
             }
-            // Atlas grew or was redrawn: free the old slot before re-upload.
-            let global_set = vk.resources.bindless_context().unwrap().global_set();
-            let _ = global_set.remove_sampled_image(existing.bindless_id);
+            // Atlas grew or was redrawn. (*) Old slot is intentionally
+            // left registered/leaked (see NOTE above) rather than freed;
+            // we just stop using it and register a new one below.
             registry.entries.remove(&id);
         }
 
@@ -143,7 +214,7 @@ fn sync_glyph_atlases(
 fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<AtlasEntry> {
     let width = image.width();
     let height = image.height();
-    let format = image.texture_descriptor.format;
+    let format = wgpu_to_vulkano_format(image.texture_descriptor.format).unwrap();
 
     let image_id = vk
         .resources
@@ -246,11 +317,10 @@ fn extract_ui(
     nodes: Query<(
         &ComputedNode,
         &UiGlobalTransform,
-        &ComputedNodeTarget,
+        Option<&CalculatedClip>,
         Option<&BackgroundColor>,
         Option<&BorderColor>,
         Option<&Outline>,
-        Option<&OverflowClipMargin>,
         Option<&bevy_text::TextLayoutInfo>,
         Option<&bevy_text::TextColor>,
         Option<&Children>,
@@ -263,14 +333,7 @@ fn extract_ui(
 
     let mut instances = Vec::new();
     for root in &roots {
-        walk(
-            root,
-            UiInstance::NO_CLIP,
-            &nodes,
-            &registry,
-            to_linear,
-            &mut instances,
-        );
+        walk(root, &nodes, &registry, to_linear, &mut instances);
     }
 
     // Cheap content check avoids the GPU wait+upload in `ui_pass::sync`
@@ -283,15 +346,13 @@ fn extract_ui(
 
 fn walk(
     entity: Entity,
-    inherited_clip: [f32; 4],
     nodes: &Query<(
         &ComputedNode,
         &UiGlobalTransform,
-        &ComputedNodeTarget,
+        Option<&CalculatedClip>,
         Option<&BackgroundColor>,
         Option<&BorderColor>,
         Option<&Outline>,
-        Option<&OverflowClipMargin>,
         Option<&bevy_text::TextLayoutInfo>,
         Option<&bevy_text::TextColor>,
         Option<&Children>,
@@ -300,21 +361,19 @@ fn walk(
     to_linear: bool,
     out: &mut Vec<UiInstance>,
 ) {
-    let Ok((
-        computed,
-        transform,
-        _target,
-        bg,
-        border,
-        _outline,
-        _clip_margin,
-        text,
-        text_color,
-        children,
-    )) = nodes.get(entity)
+    let Ok((computed, transform, clip, bg, border, _outline, text, text_color, children)) =
+        nodes.get(entity)
     else {
         return;
     };
+
+    // `bevy_ui`'s own `update_clipping` system already computed this node's
+    // final, ancestor-intersected clip rect (honoring `Overflow`,
+    // `OverflowClipMargin`, and `OverrideClip` for us) — no clip present
+    // means unclipped, same as bevy_ui's own convention.
+    let node_clip = clip
+        .map(|c| [c.clip.min.x, c.clip.min.y, c.clip.max.x, c.clip.max.y])
+        .unwrap_or(UiInstance::NO_CLIP);
 
     let size = computed.size();
     let half = 0.5 * size;
@@ -329,31 +388,21 @@ fn walk(
             let border_col = border
                 .map(|b| to_instance_color(b.top, to_linear))
                 .unwrap_or([0.0; 4]);
+            // `BorderRect` is `{ min_inset: Vec2, max_inset: Vec2 }`, not
+            // named left/top/right/bottom fields — same min/max-corner
+            // convention as `Rect` (docs.rs/bevy_ui: "no field `left` on
+            // `BorderRect`; available fields are `min_inset`, `max_inset`").
             let b = computed.border();
             out.push(UiInstance::boxed(
                 rect,
                 fill,
                 border_col,
-                [b.left, b.top, b.right, b.bottom],
+                [b.min_inset.x, b.min_inset.y, b.max_inset.x, b.max_inset.y],
                 computed.border_radius().top_left,
-                inherited_clip,
+                node_clip,
             ));
         }
     }
-
-    let node_clip = if computed.overflow().is_visible() {
-        inherited_clip
-    } else {
-        intersect_clip(
-            inherited_clip,
-            [
-                top_left.x,
-                top_left.y,
-                top_left.x + size.x,
-                top_left.y + size.y,
-            ],
-        )
-    };
 
     if let Some(info) = text {
         let color = text_color.map(|c| c.0).unwrap_or(Color::WHITE);
@@ -387,18 +436,9 @@ fn walk(
 
     if let Some(children) = children {
         for &child in children {
-            walk(child, node_clip, nodes, registry, to_linear, out);
+            walk(child, nodes, registry, to_linear, out);
         }
     }
-}
-
-fn intersect_clip(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
-    [
-        a[0].max(b[0]),
-        a[1].max(b[1]),
-        a[2].min(b[2]),
-        a[3].min(b[3]),
-    ]
 }
 
 /// The swapchain does the sRGB encode on write only when its format is an

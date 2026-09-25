@@ -125,7 +125,7 @@ pub fn setup_vulkan(
         })
         .expect("no suitable physical device found");
 
-    let (device, mut queues) = Device::new(
+    let (device, queues) = Device::new(
         &physical_device,
         &DeviceCreateInfo {
             enabled_extensions: &device_extensions,
