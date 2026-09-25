@@ -186,6 +186,11 @@ fn sync_glyph_atlases(
     for id in removed_ids {
         registry.entries.remove(&id); // (*) slot itself is intentionally leaked, not freed.
     }
+    // bevy_log::info!(
+    //     "glyph sync: {} TextLayoutInfo, {} wanted atlases",
+    //     text_query.iter().count(),
+    //     wanted.len()
+    // );
 
     for id in wanted {
         let Some(image) = images.get(id) else {
@@ -218,6 +223,8 @@ fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<
     let width = image.width();
     let height = image.height();
     let format = wgpu_to_vulkano_format(image.texture_descriptor.format).unwrap();
+
+    vk.resources.flight(vk.flight_id).wait(None).unwrap();
 
     let image_id = vk
         .resources
@@ -272,9 +279,10 @@ fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<
             [],
             [],
         )
+        .map_err(|e| bevy_log::warn!("atlas img: {e}"))
         .ok()?;
     }
-
+    // vk.resources.flight(vk.flight_id).wait(None).unwrap();
     let global_set = vk.resources.bindless_context().unwrap().global_set();
     let bindless_id = global_set
         .create_sampled_image(
@@ -339,11 +347,33 @@ fn extract_ui(
         walk(root, &nodes, &registry, to_linear, &mut instances);
     }
 
-    bevy_log::info!(
-        "UI extract: {} instances (gen {})",
-        instances.len(),
-        draw_list.generation
-    );
+    // bevy_log::info!(
+    //     "UI extract: {} instances (gen {})",
+    //     instances.len(),
+    //     draw_list.generation
+    // );
+
+    // bevy_log::info!(
+    //     "text: node={:?} info_size={:?} computed={:?} tt={:?} first5={:?}",
+    //     entity,
+    //     info.size,
+    //     computed.size(),
+    //     transform.translation,
+    //     info.glyphs
+    //         .iter()
+    //         .take(5)
+    //         .map(|g| (g.position, g.atlas_info.rect))
+    //         .collect::<Vec<_>>(),
+    // );
+
+    // bevy_log::info!(
+    //     "label {:?}: {} glyphs, size {:?}, tt {:?}",
+    //     entity,
+    //     info.glyphs.len(),
+    //     info.size,
+    //     transform.translation
+    // );
+
     // Cheap content check avoids the GPU wait+upload in `ui_pass::sync`
     // on frames where nothing changed (static menus, idle HUD).
     if instances.len() != draw_list.instances.len() || instances != draw_list.instances {
@@ -412,19 +442,23 @@ fn walk(
         }
     }
 
+    let node_size = computed.size();
+    let node_top_left = transform.translation - 0.5 * node_size;
+
     if let Some(info) = text {
         let color = text_color.map(|c| c.0).unwrap_or(Color::WHITE);
         let color = to_instance_color(color, to_linear);
-        // `TextLayoutInfo::glyphs` positions are relative to the text
-        // block's own top-left, exactly like `bevy_ui`'s own glyph
-        // extraction consumes them.
-        let text_top_left = transform.translation - 0.5 * info.size;
+
         for glyph in &info.glyphs {
             let Some(entry) = registry.entries.get(&glyph.atlas_info.texture) else {
-                continue; // Not uploaded yet; picked up again next frame.
+                continue;
             };
             let atlas = &glyph.atlas_info;
-            let px = text_top_left + glyph.position;
+            let glyph_size = Vec2::new(atlas.rect.width(), atlas.rect.height());
+
+            // position is already the center, relative to node top-left
+            let glyph_top_left = node_top_left + glyph.position - 0.5 * glyph_size;
+
             let uv_rect = [
                 atlas.rect.min.x,
                 atlas.rect.min.y,
@@ -432,7 +466,12 @@ fn walk(
                 atlas.rect.max.y,
             ];
             out.push(UiInstance::glyph(
-                [px.x, px.y, atlas.rect.width(), atlas.rect.height()],
+                [
+                    glyph_top_left.x,
+                    glyph_top_left.y,
+                    glyph_size.x,
+                    glyph_size.y,
+                ],
                 uv_rect,
                 color,
                 entry.size,
@@ -474,7 +513,7 @@ impl Plugin for UiRenderBridgePlugin {
                     sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
                     extract_ui,
                     // force_ui_geometry,
-                    debug_ui_layout,
+                    // debug_ui_layout,
                 )
                     .chain()
                     .after(bevy_ui::UiSystems::PostLayout),
