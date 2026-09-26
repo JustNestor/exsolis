@@ -1,3 +1,5 @@
+use crate::net::{self, OutgoingPacket};
+
 use super::*;
 use chunks::PlayerPosition;
 use glam::Vec3;
@@ -30,8 +32,12 @@ impl Plugin for MovementPlugin {
         app.add_systems(
             Update,
             (
-                apply_player_input.after(recive_packets),
-                send_position_updates.after(apply_player_input),
+                apply_player_input
+                    .after(events::dispatch_incoming)
+                    .in_set(net::GameplaySet),
+                send_position_updates
+                    .after(apply_player_input)
+                    .in_set(net::GameplaySet),
             ),
         );
     }
@@ -48,9 +54,10 @@ fn apply_player_input(
         }
     }
 }
+
 fn send_position_updates(
-    mut server: ResMut<RenetServer>,
     mut query: Query<(&Player, &PlayerPosition, &mut PositionSync)>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
     for (player, pos, mut sync) in &mut query {
         if pos.0 != sync.last_sent {
@@ -63,22 +70,24 @@ fn send_position_updates(
         sync.repeats_left -= 1;
 
         // Authoritative position update to owner
-        let msg = bincode::serialize(&ServerMessage::YourPosition {
-            x: pos.0.x,
-            y: pos.0.y,
-            z: pos.0.z,
-        })
-        .unwrap();
-        server.send_message(player.0, DefaultChannel::Unreliable, msg);
+        outgoing.write(OutgoingPacket::to_unreliable(
+            player.0,
+            ServerMessage::YourPosition {
+                x: pos.0.x,
+                y: pos.0.y,
+                z: pos.0.z,
+            },
+        ));
 
         // Broadcast move update to all other connected peers
-        let move_msg = bincode::serialize(&ServerMessage::PlayerMoved {
-            player_id: player.0,
-            x: pos.0.x,
-            y: pos.0.y,
-            z: pos.0.z,
-        })
-        .unwrap();
-        server.broadcast_message_except(player.0, DefaultChannel::Unreliable, move_msg);
+        outgoing.write(OutgoingPacket::broadcast_except_unreliable(
+            player.0,
+            ServerMessage::PlayerMoved {
+                player_id: player.0,
+                x: pos.0.x,
+                y: pos.0.y,
+                z: pos.0.z,
+            },
+        ));
     }
 }

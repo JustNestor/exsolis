@@ -24,6 +24,7 @@ mod chunks;
 mod events;
 mod interaction;
 mod movement;
+mod net;
 mod network;
 
 use chunks::*;
@@ -32,6 +33,7 @@ use movement::*;
 use network::*;
 
 use crate::interaction::InteractionPlugin;
+use crate::net::NetPlugin;
 // mod level;
 
 #[derive(Component)]
@@ -88,6 +90,7 @@ fn main() {
             LogPlugin::default(),
         ))
         .add_plugins((RenetServerPlugin, NetcodeServerPlugin))
+        .add_plugins(NetPlugin)
         .add_plugins(EventsPlugin)
         .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)

@@ -2,9 +2,11 @@
 //!
 //! `PlaceBlock`/`BreakBlock`/`SelectHotbar` arrive on the client->server
 //! ReliableOrdered channel (same as `Move`), get bridged out of
-//! `events.rs::recive_packets` as `Message`s (same pattern `chunks.rs`
+//! `events.rs::dispatch_incoming` as `Message`s (same pattern `chunks.rs`
 //! uses for `RenderDistanceRequested`), and are handled here so this file
-//! doesn't need to know about packet framing.
+//! doesn't need to know about packet framing. Outbound traffic goes
+//! through `net::OutgoingPacket`, flushed centrally by `net.rs` — nothing
+//! here touches `RenetServer` directly.
 //!
 //! Everything the client claims is treated as a request, not a fact:
 //! - the target chunk must actually be loaded server-side (`ChunkWorld`);
@@ -17,8 +19,6 @@ use bevy_app::prelude::*;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
-use bevy_renet::RenetServer;
-use bevy_renet::renet::DefaultChannel;
 use exsolis_common::{BlockPos, BlockType, ChunkCoord, PlayerId, ServerMessage};
 use glam::Vec3;
 
@@ -26,6 +26,7 @@ use crate::Inventory;
 use crate::PlayerMap;
 use crate::chunks::PlayerPosition;
 use crate::chunks::{ChunkRenderState, ChunkWorld};
+use crate::net::{self, OutgoingPacket};
 
 /// Blocks. A block is 1 world unit, so this is also world units. Generous
 /// on purpose — this exists to catch cheating/desync, not to be a strict
@@ -47,12 +48,13 @@ impl Plugin for InteractionPlugin {
                     sync_inventories,
                 )
                     .chain()
-                    .after(crate::events::recive_packets),
+                    .after(crate::events::dispatch_incoming)
+                    .in_set(net::GameplaySet),
             );
     }
 }
 
-/// Bridged from `events.rs::recive_packets`, same shape as
+/// Bridged from `events.rs::dispatch_incoming`, same shape as
 /// `chunks::RenderDistanceRequested`.
 #[derive(Message)]
 pub struct PlaceBlockRequested {
@@ -122,17 +124,18 @@ fn within_reach(player_pos: Vec3, target: BlockPos) -> (bool, f32) {
     (dist <= MAX_REACH, dist)
 }
 
-/// Applies the mutation and broadcasts `BlockUpdate` to exactly the
-/// players who actually have this chunk loaded (`ChunkRenderState.loaded`)
-/// — sending it to everyone would leak block data outside a player's own
-/// render distance and waste bandwidth on players who can't see it anyway.
+/// Applies the mutation and queues a `BlockUpdate` `OutgoingPacket` to
+/// exactly the players who actually have this chunk loaded
+/// (`ChunkRenderState.loaded`) — sending it to everyone would leak block
+/// data outside a player's own render distance and waste bandwidth on
+/// players who can't see it anyway.
 fn apply_and_broadcast(
     coord: ChunkCoord,
     idx: usize,
     new_block: BlockType,
     pos: BlockPos,
     world: &mut ChunkWorld,
-    server: &mut RenetServer,
+    outgoing: &mut MessageWriter<OutgoingPacket>,
     loaded_by: &Query<(&crate::Player, &ChunkRenderState)>,
 ) -> bool {
     let Some(existing) = world.ready.get(&coord) else {
@@ -151,14 +154,15 @@ fn apply_and_broadcast(
     };
     world.ready.insert(coord, updated);
 
-    let msg = bincode::serialize(&ServerMessage::BlockUpdate {
-        pos,
-        kind: new_block,
-    })
-    .unwrap();
     for (player, state) in loaded_by {
         if state.loaded.contains(&coord) {
-            server.send_message(player.0, DefaultChannel::ReliableOrdered, msg.clone());
+            outgoing.write(OutgoingPacket::to(
+                player.0,
+                ServerMessage::BlockUpdate {
+                    pos,
+                    kind: new_block,
+                },
+            ));
         }
     }
     true
@@ -170,7 +174,7 @@ fn handle_place_block(
     positions: Query<&PlayerPosition>,
     mut inventories: Query<&mut Inventory>,
     mut world: ResMut<ChunkWorld>,
-    mut server: ResMut<RenetServer>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
 ) {
     for ev in events.read() {
@@ -242,7 +246,7 @@ fn handle_place_block(
             ev.kind,
             ev.pos,
             &mut world,
-            &mut server,
+            &mut outgoing,
             &loaded_by,
         ) {
             warn!(
@@ -262,7 +266,7 @@ fn handle_break_block(
     positions: Query<&PlayerPosition>,
     mut inventories: Query<&mut Inventory>,
     mut world: ResMut<ChunkWorld>,
-    mut server: ResMut<RenetServer>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
 ) {
     for ev in events.read() {
@@ -313,7 +317,7 @@ fn handle_break_block(
             BlockType::Air,
             ev.pos,
             &mut world,
-            &mut server,
+            &mut outgoing,
             &loaded_by,
         ) {
             warn!(
@@ -326,19 +330,21 @@ fn handle_break_block(
     }
 }
 
-/// Pushes `YourInventory` to each player whose inventory changed this tick.
-/// Bevy's change detection (`Changed<Inventory>`) means this only fires on
-/// an actual mutation, not every tick, so it's fine to run unconditionally.
+/// Queues `YourInventory` for each player whose inventory changed this
+/// tick. Bevy's change detection (`Changed<Inventory>`) means this only
+/// fires on an actual mutation, not every tick, so it's fine to run
+/// unconditionally.
 fn sync_inventories(
     changed: Query<(&crate::Player, &Inventory), Changed<Inventory>>,
-    mut server: ResMut<RenetServer>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
     for (player, inventory) in &changed {
-        let msg = bincode::serialize(&ServerMessage::YourInventory {
-            slots: inventory.to_wire(),
-            selected: inventory.selected_index(),
-        })
-        .unwrap();
-        server.send_message(player.0, DefaultChannel::ReliableOrdered, msg);
+        outgoing.write(OutgoingPacket::to(
+            player.0,
+            ServerMessage::YourInventory {
+                slots: inventory.to_wire(),
+                selected: inventory.selected_index(),
+            },
+        ));
     }
 }

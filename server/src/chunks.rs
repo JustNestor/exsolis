@@ -1,4 +1,7 @@
 use super::*;
+use crate::net::{self, OutgoingPacket, SendTarget};
+use bevy_renet::RenetServer;
+use bevy_renet::renet::DefaultChannel;
 use bevy_tasks::futures_lite::future;
 use bevy_tasks::{AsyncComputeTaskPool, Task};
 use exsolis_common::{ChunkBlocks, ChunkCoord};
@@ -51,7 +54,8 @@ impl Plugin for ChunksPlugin {
                     stream_chunks_to_players,
                     unload_out_of_range_chunks,
                 )
-                    .chain(),
+                    .chain()
+                    .in_set(net::GameplaySet),
             );
     }
 }
@@ -102,9 +106,7 @@ pub struct GenerationTasks {
 }
 
 /// Route SetRenderDistance packets into each player's ChunkRenderState.
-/// Wire this into recive_packets' match in events.rs (see note below), or, as here,
-/// run it as its own pass over a queue. For a minimal integration this listens
-/// directly by re-reading messages tagged with the player id.
+/// Bridged in from `events.rs::dispatch_incoming` as `RenderDistanceRequested`.
 fn handle_render_distance_packets(
     mut query: Query<(&Player, &mut ChunkRenderState)>,
     mut events: MessageReader<RenderDistanceRequested>,
@@ -118,7 +120,8 @@ fn handle_render_distance_packets(
     }
 }
 
-/// Message bridged in from events.rs::recive_packets when a ClientMessage::SetRenderDistance arrives.
+/// Message bridged in from events.rs::dispatch_incoming when a
+/// ClientMessage::SetRenderDistance arrives.
 #[derive(Message)]
 pub struct RenderDistanceRequested {
     pub player_id: PlayerId,
@@ -213,10 +216,14 @@ fn poll_generation_tasks(mut world: ResMut<ChunkWorld>, mut tasks: ResMut<Genera
 
 const RESERVE_BYTES: usize = 512 * 1024; // keep headroom for other reliable traffic
 
+/// Reads `RenetServer` only to check `channel_available_memory` (a
+/// capacity query, not a send/receive) — the actual send goes through
+/// `OutgoingPacket` like everywhere else, flushed centrally by `net.rs`.
 fn stream_chunks_to_players(
     mut query: Query<(&Player, &mut ChunkRenderState)>,
     world: Res<ChunkWorld>,
-    mut server: ResMut<RenetServer>,
+    server: Res<RenetServer>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
     for (player, mut state) in &mut query {
         let center = state.current_chunk;
@@ -242,17 +249,31 @@ fn stream_chunks_to_players(
             }
 
             let blocks = world.ready[&coord].clone();
-            let msg = bincode::serialize(&ServerMessage::ChunkData { coord, blocks }).unwrap();
+            let bytes = match bincode::serialize(&ServerMessage::ChunkData { coord, blocks }) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("failed to serialize ChunkData for {coord:?}: {e}");
+                    continue;
+                }
+            };
 
             let available =
                 server.channel_available_memory(player.0, DefaultChannel::ReliableOrdered);
-            if available < msg.len() + RESERVE_BYTES {
+            if (available as usize) < bytes.len() + RESERVE_BYTES {
                 break; // channel is full; resume next tick once acks free space
             }
 
-            debug!("chunk {coord:?}: {} bytes", msg.len());
+            debug!("chunk {coord:?}: {} bytes", bytes.len());
 
-            server.send_message(player.0, DefaultChannel::ReliableOrdered, msg);
+            // Already serialized above to check its length against the
+            // channel's remaining capacity — pass the bytes straight
+            // through instead of paying to serialize the same message
+            // again in net::flush_outgoing.
+            outgoing.write(OutgoingPacket::raw(
+                SendTarget::One(player.0),
+                DefaultChannel::ReliableOrdered,
+                bytes,
+            ));
             state.loaded.insert(coord);
             sent += 1;
         }
@@ -263,7 +284,7 @@ fn stream_chunks_to_players(
 /// (e.g. after they moved or lowered their render distance).
 fn unload_out_of_range_chunks(
     mut query: Query<(&Player, &mut ChunkRenderState)>,
-    mut server: ResMut<RenetServer>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
     for (player, mut state) in &mut query {
         let to_unload: Vec<ChunkCoord> = state
@@ -274,8 +295,10 @@ fn unload_out_of_range_chunks(
             .collect();
 
         for coord in to_unload {
-            let msg = bincode::serialize(&ServerMessage::ChunkUnload { coords: coord }).unwrap();
-            server.send_message(player.0, DefaultChannel::ReliableOrdered, msg);
+            outgoing.write(OutgoingPacket::to(
+                player.0,
+                ServerMessage::ChunkUnload { coords: coord },
+            ));
             state.loaded.remove(&coord);
         }
     }
@@ -323,7 +346,7 @@ fn generate_chunk(coord: ChunkCoord) -> ChunkBlocks {
     ChunkBlocks::pack(&blocks)
 }
 
-/// Written by events.rs::recive_packets from ClientMessage::Move, and
+/// Written by events.rs::dispatch_incoming from ClientMessage::Move, and
 /// inserted at spawn time in events.rs::on_server_event so every
 /// connected player has one from the start (see PlayerJoined handling).
 #[derive(Component, Debug, Clone, Copy)]
