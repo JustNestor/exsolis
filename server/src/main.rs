@@ -28,6 +28,7 @@ mod net;
 mod network;
 mod scripting;
 mod ui;
+mod ui_template;
 
 use chunks::*;
 use events::*;

@@ -1,4 +1,3 @@
-//! Lua modding layer (mlua, LuaJIT).
 //!
 //! Scope, deliberately kept small for v1:
 //!   - one long-lived `Lua` VM, ticked once per `Update`
@@ -368,6 +367,29 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
                     path.display()
                 ))
             })
+        })?,
+    )?;
+
+    // --- api.render_xml(filename|template, data?) → expanded XML string --
+    // Loads `assets/xml/{filename}.xml` (same path rules as load_xml) and
+    // expands `{{path}}` / `v-if` / `v-for` against `data` (a plain table).
+    // Result is client-ready XML for `api.send(..., "ui_show", id, xml)`.
+    // If the first argument starts with `<`, it is treated as an inline
+    // template string instead of a file name.
+    api.set(
+        "render_xml",
+        lua.create_function(|_, (src, data): (String, Option<mlua::Value>)| {
+            let data = match data {
+                Some(v) => crate::ui_template::data_from_lua(&v)?,
+                None => crate::ui_template::DataValue::Nil,
+            };
+            let xml = if src.trim_start().starts_with('<') {
+                crate::ui_template::render(&src, &data)
+            } else {
+                crate::ui_template::render_file(&src, &data)
+            }
+            .map_err(|e| mlua::Error::RuntimeError(format!("render_xml: {e}")))?;
+            Ok(xml)
         })?,
     )?;
 

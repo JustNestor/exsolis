@@ -31,8 +31,7 @@ opensimplex2.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 bincode.workspace = true
-
-
+roxmltree.workspace = true
 mlua.workspace = true
 
 mimalloc = { workspace = true, optional = true }

@@ -1,0 +1,27 @@
+
+<div id="inv" modal="true" layout="column" anchor="center"
+     bg="#222c" padding="12" gap="8">
+  <label font-size="18" color="#fff">{{title}}</label>
+  <div layout="row" wrap="true" gap="6">
+    <div v-for="s in slots"
+         id="slot_{{s.index}}"
+         droppable="true"
+         drag-group="inv"
+         bg="#333a"
+         width="48"
+         height="48"
+         align="center"
+         justify="center">
+      <div v-if="s.item"
+           id="item_{{s.index}}"
+           draggable="true"
+           drag-group="inv"
+           data="{{s.index}}"
+           bg="#a83"
+           width="40"
+           height="40">
+        {{s.item.id}} x{{s.item.count}}
+      </div>
+    </div>
+  </div>
+</div>
