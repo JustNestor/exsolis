@@ -26,6 +26,7 @@ mod interaction;
 mod movement;
 mod net;
 mod network;
+mod scripting;
 
 use chunks::*;
 use events::*;
@@ -34,6 +35,7 @@ use network::*;
 
 use crate::interaction::InteractionPlugin;
 use crate::net::NetPlugin;
+use crate::scripting::ScriptingPlugin;
 // mod level;
 
 #[derive(Component)]
@@ -95,6 +97,7 @@ fn main() {
         .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)
         .add_plugins(InteractionPlugin)
+        .add_plugins(ScriptingPlugin)
         .insert_resource(RenetServer::new(connection_config()))
         .insert_resource(new_transport())
         .init_resource::<PlayerMap>()

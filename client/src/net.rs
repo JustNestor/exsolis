@@ -10,7 +10,7 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_log::warn;
+use bevy_log::{debug, warn};
 use bevy_renet::RenetClient;
 use bevy_renet::renet::DefaultChannel;
 use exsolis_common::{ClientMessage, ServerMessage};
@@ -98,6 +98,7 @@ fn drain_incoming(mut client: ResMut<RenetClient>, mut incoming: MessageWriter<I
         while let Some(bytes) = client.receive_message(channel) {
             match bincode::deserialize::<ServerMessage>(&bytes) {
                 Ok(msg) => {
+                    debug!("incoming packet {:?}", msg);
                     incoming.write(IncomingPacket(msg));
                 }
                 Err(_) => {
