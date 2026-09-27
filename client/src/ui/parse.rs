@@ -115,6 +115,11 @@ const STYLE_ATTRS: &[&str] = &[
     "font-size",
     "hover-bg",
     "pressed-bg",
+    // drag & drop (see drag.rs)
+    "draggable",
+    "droppable",
+    "drag-group",
+    "drag-ghost-bg",
 ];
 
 pub fn parse_ui(xml: &str) -> Result<ParsedUi, ParseError> {

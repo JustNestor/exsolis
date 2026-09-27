@@ -149,6 +149,25 @@ pub enum ClientMessage {
         action: String,
         data: Option<String>,
     },
+    /// A widget marked `draggable="true"` was dropped on a widget marked
+    /// `droppable="true"` within the same `ui_id`, and their `drag-group`s
+    /// matched (or neither specified one). Both element ids are whatever
+    /// `UiAction.element_id` would be for that widget (explicit `id`, or
+    /// the auto structural path). Like `UiAction`, the server MUST treat
+    /// `source_id`/`target_id`/`data` as untrusted: the client only
+    /// reports geometry, it never moves inventory items itself. Appended
+    /// last so existing variant indices don't shift.
+    UiDrag {
+        ui_id: String,
+        source_id: String,
+        target_id: String,
+        /// The dragged widget's `data` attribute, forwarded verbatim —
+        /// same convention as `UiClickAction.data` — so the server doesn't
+        /// have to re-derive "what was in that slot" from `source_id`
+        /// alone if the UI encodes it directly (e.g. `data="7"` for a
+        /// hotbar index).
+        data: Option<String>,
+    },
 }
 
 #[non_exhaustive]
@@ -228,3 +247,6 @@ pub const UI_MAX_ID_LEN: usize = 64;
 pub const UI_MAX_ACTION_LEN: usize = 256;
 /// Max UI screens mounted at the same time on one client.
 pub const UI_MAX_OPEN: usize = 32;
+/// Max length of `UiDrag.source_id` / `target_id` — reuses the id budget
+/// since both are `UiAction.element_id`-shaped.
+pub const UI_DRAG_MAX_ID_LEN: usize = UI_MAX_ID_LEN;

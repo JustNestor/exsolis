@@ -18,6 +18,9 @@ use bevy_text::{TextColor, TextFont};
 use bevy_ui::prelude::*;
 use bevy_ui::{GlobalZIndex, Interaction};
 
+use super::drag::{
+    DragGroup, Draggable, Droppable, on_drag_drop, on_drag_end, on_drag_move, on_drag_start,
+};
 use super::events::on_ui_click;
 use super::parse::{ParsedUi, WidgetDef, WidgetKind};
 use super::style::{self, ResolvedStyle};
@@ -111,6 +114,7 @@ fn spawn_widget(
         font_size,
         hover_bg,
         pressed_bg,
+        drag,
     } = style::resolve(def.kind, &def.attrs, warnings);
 
     let inh = Inherited {
@@ -172,6 +176,34 @@ fn spawn_widget(
         // so clicking a label *inside* a button triggers the button.
         e.observe(on_ui_click);
     }
+
+    // Drag source: any widget with `draggable="true"`, regardless of kind
+    // (a div slot, a label, a button — inventory slots are usually plain
+    // divs with a background icon, not buttons).
+    if drag.draggable {
+        e.insert((
+            Draggable {
+                data: def.data.clone(),
+                ghost_bg: drag.ghost_bg.or(bg),
+            },
+            DragGroup(drag.group.clone()),
+        ));
+        e.observe(on_drag_start);
+        e.observe(on_drag_move);
+        e.observe(on_drag_end);
+    }
+    // Drop target: separate flag so a widget can be *both* (e.g. reordering
+    // a hotbar — every slot is drag source and drop target at once).
+    if drag.droppable {
+        e.insert(Droppable);
+        // Only insert DragGroup once; draggable+droppable widgets already
+        // have it from the block above.
+        if !drag.draggable {
+            e.insert(DragGroup(drag.group.clone()));
+        }
+        e.observe(on_drag_drop);
+    }
+
     let id = e.id();
 
     let kids: Vec<Entity> = def

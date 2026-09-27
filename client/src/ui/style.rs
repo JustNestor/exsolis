@@ -137,6 +137,20 @@ pub struct ResolvedStyle {
     pub font_size: Option<f32>,
     pub hover_bg: Option<Color>,
     pub pressed_bg: Option<Color>,
+    pub drag: DragConfig,
+}
+
+/// Drag/drop knobs for one widget. `None`/empty group means "matches any
+/// group" on both sides, so simple single-purpose UIs (one inventory, one
+/// set of slots) don't need `drag-group` at all.
+#[derive(Debug, Clone, Default)]
+pub struct DragConfig {
+    pub draggable: bool,
+    pub droppable: bool,
+    pub group: Option<String>,
+    /// Background of the floating ghost while this widget is being
+    /// dragged. Falls back to the widget's own `bg` (dimmed) when unset.
+    pub ghost_bg: Option<Color>,
 }
 
 fn get<T>(
@@ -283,6 +297,12 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
         ),
         hover_bg: get("hover-bg", parse_color, attrs, warnings),
         pressed_bg: get("pressed-bg", parse_color, attrs, warnings),
+        drag: DragConfig {
+            draggable: get("draggable", parse_bool, attrs, warnings).unwrap_or(false),
+            droppable: get("droppable", parse_bool, attrs, warnings).unwrap_or(false),
+            group: attrs.get("drag-group").cloned(),
+            ghost_bg: get("drag-ghost-bg", parse_color, attrs, warnings),
+        },
     }
 }
 

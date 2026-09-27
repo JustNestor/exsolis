@@ -21,6 +21,7 @@ use crate::net::{GameplaySet, IncomingPacket, NetConnected};
 
 #[cfg(debug_assertions)]
 pub mod dev_reload;
+pub mod drag;
 pub mod events;
 pub mod parse;
 pub mod render_bridge;
@@ -105,7 +106,8 @@ impl Plugin for UiPlugin {
                     events::update_hover_styles,
                 ),
             )
-            .add_plugins(render_bridge::UiRenderBridgePlugin);
+            .add_plugins(render_bridge::UiRenderBridgePlugin)
+            .add_plugins(drag::UiDragPlugin);
 
         // Debug-only local XML loader — see dev_reload.rs. Compiled out of
         // release builds entirely (not just inactive), so there's no risk
