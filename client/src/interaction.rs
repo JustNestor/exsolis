@@ -3,13 +3,12 @@
 //! `PlaceBlock`/`BreakBlock` requests on click or continuous press.
 
 use bevy_app::prelude::*;
+use bevy_ecs::message::MessageWriter;
 use bevy_ecs::prelude::*;
 use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
 use bevy_input::mouse::MouseButton;
 use bevy_log::{info, warn};
-use bevy_renet::RenetClient;
-use bevy_renet::renet::DefaultChannel;
 use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
 use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE};
@@ -17,15 +16,12 @@ use glam::{IVec3, Vec3};
 
 use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
+use crate::net::{GameplaySet, NetConnected, OutgoingPacket};
 use crate::player::{FlyCamera, LocalPlayer};
 
-/// Blocks. Purely advisory on the client (affects what gets highlighted /
-/// what a click tries to do); the server's own `MAX_REACH` is what
-/// actually matters.
 const REACH: f32 = 8.0;
 const RAYCAST_STEP_LIMIT: i32 = 64;
 
-/// Cooldown resource to prevent per-frame network packet spam when holding action buttons.
 #[derive(Resource)]
 pub struct InteractionCooldown {
     pub break_timer: Timer,
@@ -41,8 +37,6 @@ impl Default for InteractionCooldown {
     }
 }
 
-/// What the player is currently aiming at, if anything: the targeted
-/// block, and the empty cell just before it along the ray.
 #[derive(Component, Default)]
 pub struct BlockTargeting {
     pub target: Option<TargetedBlock>,
@@ -80,13 +74,12 @@ impl Plugin for InteractionPlugin {
                     update_targeting,
                     handle_break_input,
                     handle_place_input,
-                ),
+                )
+                    .in_set(GameplaySet),
             );
     }
 }
 
-/// Ensures `BlockTargeting` is automatically inserted whenever a `LocalPlayer`
-/// is spawned (fixing issues if `LocalPlayer` spawns after `Startup`).
 fn ensure_targeting_component(
     mut commands: Commands,
     query: Query<Entity, (With<LocalPlayer>, Without<BlockTargeting>)>,
@@ -112,17 +105,22 @@ const DIGIT_KEYS: [KeyCode; HOTBAR_SIZE] = [
     KeyCode::Digit9,
 ];
 
-fn select_hotbar_by_number_input(keys: Res<ButtonInput<KeyCode>>, mut client: ResMut<RenetClient>) {
+fn select_hotbar_by_number_input(
+    keys: Res<ButtonInput<KeyCode>>,
+    connected: Res<NetConnected>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
+) {
     let Some(index) = DIGIT_KEYS.iter().position(|k| keys.just_pressed(*k)) else {
         return;
     };
-    if !client.is_connected() {
-        warn!("[SelectHotbar] Key digit press detected, but RenetClient is not connected");
+    if !connected.get() {
+        warn!("[SelectHotbar] Key digit press detected, but not connected");
         return;
     }
     info!("[SelectHotbar] Sending SelectHotbar({}) packet", index);
-    let msg = bincode::serialize(&ClientMessage::SelectHotbar(index as u8)).unwrap();
-    client.send_message(DefaultChannel::ReliableOrdered, msg);
+    outgoing.write(OutgoingPacket::reliable(ClientMessage::SelectHotbar(
+        index as u8,
+    )));
 }
 
 fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockType> {
@@ -132,7 +130,6 @@ fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) ->
         world.z.div_euclid(CHUNK_SIZE_I32),
     );
     let Some(entity) = registry.entity_at(coord) else {
-        // Chunk is not registered in ChunkRegistry
         return None;
     };
     let Ok(chunk) = chunks.get(entity) else {
@@ -264,7 +261,8 @@ fn handle_break_input(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut cooldown: ResMut<InteractionCooldown>,
-    mut client: ResMut<RenetClient>,
+    connected: Res<NetConnected>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
     if !mouse.pressed(MouseButton::Left) {
@@ -280,8 +278,8 @@ fn handle_break_input(
 
     cooldown.break_timer.reset();
 
-    if !client.is_connected() {
-        warn!("[BreakBlock] Left click pressed, but RenetClient is NOT connected!");
+    if !connected.get() {
+        warn!("[BreakBlock] Left click pressed, but not connected!");
         return;
     }
 
@@ -304,11 +302,9 @@ fn handle_break_input(
             "[BreakBlock] Sending BreakBlock packet for pos {:?}",
             target.pos
         );
-        let msg = bincode::serialize(&ClientMessage::BreakBlock {
+        outgoing.write(OutgoingPacket::reliable(ClientMessage::BreakBlock {
             pos: BlockPos::new(target.pos.x, target.pos.y, target.pos.z),
-        })
-        .unwrap();
-        client.send_message(DefaultChannel::ReliableOrdered, msg);
+        }));
     }
 }
 
@@ -316,7 +312,8 @@ fn handle_place_input(
     time: Res<Time>,
     mouse: Res<ButtonInput<MouseButton>>,
     mut cooldown: ResMut<InteractionCooldown>,
-    mut client: ResMut<RenetClient>,
+    connected: Res<NetConnected>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     inventory: Res<ClientInventory>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
@@ -333,8 +330,8 @@ fn handle_place_input(
 
     cooldown.place_timer.reset();
 
-    if !client.is_connected() {
-        warn!("[PlaceBlock] Right click pressed, but RenetClient is NOT connected!");
+    if !connected.get() {
+        warn!("[PlaceBlock] Right click pressed, but not connected!");
         return;
     }
 
@@ -365,11 +362,9 @@ fn handle_place_input(
             "[PlaceBlock] Sending PlaceBlock packet for item {:?} at place_pos {:?}",
             item, target.place_pos
         );
-        let msg = bincode::serialize(&ClientMessage::PlaceBlock {
+        outgoing.write(OutgoingPacket::reliable(ClientMessage::PlaceBlock {
             pos: BlockPos::new(target.place_pos.x, target.place_pos.y, target.place_pos.z),
             kind: item,
-        })
-        .unwrap();
-        client.send_message(DefaultChannel::ReliableOrdered, msg);
+        }));
     }
 }

@@ -15,20 +15,19 @@
 use std::time::{Duration, Instant};
 
 use bevy_app::prelude::*;
-use bevy_camera::{Camera, Camera2d, ComputedCameraValues, RenderTargetInfo, Viewport};
-use bevy_ecs::message::MessageReader;
+use bevy_camera::{Camera, Camera2d, Viewport};
+use bevy_ecs::message::{MessageReader, MessageWriter};
 use bevy_ecs::prelude::*;
 use bevy_input::mouse::{MouseButton, MouseMotion};
 use bevy_input::{ButtonInput, keyboard::KeyCode};
 use bevy_log::info;
-use bevy_renet::RenetClient;
-use bevy_renet::renet::DefaultChannel;
 use bevy_transform::prelude::Transform;
 use bevy_ui::IsDefaultUiCamera;
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, UVec2, Vec3};
 
+use crate::net::{GameplaySet, IncomingPacket, NetConnected, OutgoingPacket};
 use crate::streaming::RemotePlayer;
 
 #[derive(Component)]
@@ -73,12 +72,6 @@ impl FlyCamera {
         transform.translation + Vec3::Y * self.eye_height
     }
 
-    /// World -> clip matrix for the renderer. Vulkan's NDC has +Y pointing
-    /// DOWN, but `glam::Mat4::perspective_rh` produces OpenGL-style +Y up,
-    /// so Y is flipped here; without it the whole world renders upside-down.
-    /// (That flip also reverses triangle winding as the rasterizer sees it,
-    /// which is why the pipeline in render.rs uses `FrontFace::Clockwise`
-    /// for the clockwise-from-outside faces produced by mesh.rs.)
     pub fn view_projection(&self, transform: &Transform, aspect: f32) -> glam::Mat4 {
         let eye = self.eye_position(transform);
         let forward = transform.rotation * Vec3::NEG_Z;
@@ -99,9 +92,9 @@ impl Plugin for PlayerPlugin {
                 fly_camera_look,
                 send_movement_input,
                 sync_ui_layout_camera,
-                // debug_ui_camera,
                 (receive_server_position, follow_server_position).chain(),
-            ),
+            )
+                .in_set(GameplaySet),
         );
     }
 }
@@ -116,27 +109,19 @@ fn spawn_local_player(mut commands: Commands) {
 
     commands.spawn((
         Camera2d,
-        // UiLayoutCamera,
         IsDefaultUiCamera,
         Camera {
-            // Keep it from fighting anything else if you add more cameras later.
             order: 100,
-            // computed: ComputedCameraValues {
-            //     target_info: Some(RenderTargetInfo {
-            //         physical_size: UVec2::new(100, 100),
-            //         scale_factor: 10.,
-            //     }),
-            //     ..Default::default()
-            // },
             viewport: Some(Viewport {
                 physical_position: UVec2::ZERO,
-                physical_size: UVec2::new(100, 100), // updated every frame below
+                physical_size: UVec2::new(100, 100),
                 depth: 0.0..1.0,
             }),
             ..Default::default()
         },
     ));
 }
+
 fn sync_ui_layout_camera(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut cameras: Query<&mut Camera>,
@@ -161,19 +146,6 @@ fn sync_ui_layout_camera(
     }
 }
 
-fn debug_ui_camera(cameras: Query<&Camera>) {
-    for c in &cameras {
-        info!(
-            "physical_viewport_size={:?} logical={:?}",
-            c.physical_viewport_size(),
-            c.logical_viewport_size()
-        );
-    }
-}
-
-/// Unlike the single-player version, this has no inventory-open check —
-/// there's no inventory UI on the client yet. Add that guard back in
-/// once one exists, or clicking to grab the cursor will fight with it.
 fn toggle_cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
@@ -220,35 +192,21 @@ fn fly_camera_look(
     }
 }
 
-/// What we last told the server, so we only send when something changed.
 #[derive(Default)]
 struct InputSyncState {
     last_sent: Vec3,
     last_sent_at: Option<Instant>,
 }
 
-/// Samples WASD (+ Space up / Ctrl down) into a world-space direction and
-/// sends it to the server only when it changes.
-///
-/// - Sent over ReliableOrdered: since we don't resend, a lost "stop" packet
-///   would otherwise leave the server moving the player forever.
-/// - Throttled to the server tick rate: turning while walking changes the
-///   direction every frame, but the server only integrates at TICK_RATE, so
-///   anything faster is wasted. A change blocked by the throttle isn't lost;
-///   it's compared against `last_sent` again next frame and goes out as soon
-///   as the interval elapses.
-/// - Releasing the cursor counts as "stop", otherwise Esc while holding W
-///   would keep the player running.
 fn send_movement_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
     query: Query<&Transform, With<LocalPlayer>>,
-    mut client: ResMut<RenetClient>,
+    connected: Res<NetConnected>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
     mut sync: Local<InputSyncState>,
 ) {
-    if !client.is_connected() {
-        // A (re)connection gets a fresh server-side player with zero input,
-        // so reset our baseline and resend whatever is held once connected.
+    if !connected.get() {
         *sync = InputSyncState::default();
         return;
     }
@@ -302,22 +260,17 @@ fn send_movement_input(
         }
     }
 
-    let msg = bincode::serialize(&ClientMessage::Move {
+    outgoing.write(OutgoingPacket::reliable(ClientMessage::Move {
         x: direction.x,
         y: direction.y,
         z: direction.z,
-    })
-    .unwrap();
-    client.send_message(DefaultChannel::ReliableOrdered, msg);
+    }));
     sync.last_sent = direction;
     sync.last_sent_at = Some(now);
 }
 
-/// Drains authoritative position snapshots. Nothing else reads the
-/// Unreliable server->client channel (chunks use ReliableOrdered, read in
-/// streaming.rs), so this can't steal anyone else's messages.
 fn receive_server_position(
-    mut client: ResMut<RenetClient>,
+    mut incoming: MessageReader<IncomingPacket>,
     mut query: Query<(&mut Transform, &mut ServerTarget), With<LocalPlayer>>,
     mut remote: Query<(&RemotePlayer, &mut ServerTarget), Without<LocalPlayer>>,
 ) {
@@ -325,11 +278,8 @@ fn receive_server_position(
         return;
     };
 
-    while let Some(bytes) = client.receive_message(DefaultChannel::Unreliable) {
-        let Ok(msg) = bincode::deserialize::<ServerMessage>(&bytes) else {
-            continue;
-        };
-        match msg {
+    for packet in incoming.read() {
+        match packet.0 {
             ServerMessage::YourPosition { x, y, z } => {
                 let pos = Vec3::new(x, y, z);
                 if target.0.is_none() {
@@ -350,7 +300,6 @@ fn receive_server_position(
     }
 }
 
-/// Eases the camera toward the last server position (frame-rate independent).
 fn follow_server_position(
     mut query: Query<(&mut Transform, &ServerTarget)>,
     mut last_frame: Local<Option<Instant>>,
