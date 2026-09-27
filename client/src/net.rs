@@ -98,7 +98,10 @@ fn drain_incoming(mut client: ResMut<RenetClient>, mut incoming: MessageWriter<I
         while let Some(bytes) = client.receive_message(channel) {
             match bincode::deserialize::<ServerMessage>(&bytes) {
                 Ok(msg) => {
-                    debug!("incoming packet {:?}", msg);
+                    if let ServerMessage::ChunkData { .. } = msg {
+                    } else {
+                        debug!("incoming packet {:?}", msg);
+                    }
                     incoming.write(IncomingPacket(msg));
                 }
                 Err(_) => {

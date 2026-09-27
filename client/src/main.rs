@@ -35,6 +35,7 @@ mod block_textures;
 mod chunk;
 mod chunk_registry;
 mod interaction;
+mod keybinds;
 mod mesh;
 mod net;
 mod player;
@@ -96,6 +97,7 @@ fn main() {
         .add_plugins(StreamingPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))
+        .add_plugins(keybinds::KeybindPlugin)
         .add_systems(
             Update,
             setup_vulkan.run_if(not(resource_exists::<VulkanContext>)),

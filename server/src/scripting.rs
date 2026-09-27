@@ -46,7 +46,7 @@ use bevy_ecs::prelude::*;
 use bevy_log::{error, info, warn};
 use mlua::{Lua, MultiValue, Table, Value};
 
-use exsolis_common::{BlockPos, BlockType, PlayerId, ServerMessage};
+use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId, ServerMessage};
 
 use crate::Player;
 use crate::chunks::{ChunkWorld, PlayerPosition};
@@ -73,6 +73,7 @@ impl Plugin for ScriptingPlugin {
                     forward_select_hotbar,
                     forward_ui_action,
                     forward_ui_drag,
+                    forward_keybind_action,
                 )
                     // `ui::dispatch_ui_packets` is what actually produces
                     // `UiActionRequested`/`UiDragRequested`, not
@@ -95,6 +96,7 @@ impl Plugin for ScriptingPlugin {
                     .after(forward_ui_action)
                     .after(forward_ui_drag),
             )
+            .add_message::<KeybindActionRequested>()
             // FIX: `drain_script_requests` writes `OutgoingPacket` (mod
             // `api.send`/`broadcast`/`UiShow`/`UiHide` all go through it),
             // but was only ordered `.after(run_on_tick)` — never anchored
@@ -159,6 +161,12 @@ enum ScriptRequest {
     SetBlock {
         pos: BlockPos,
         block: BlockType,
+    },
+    RegisterKeybind {
+        id: String,
+        default_key: String,
+        description: String,
+        category: String,
     },
 }
 
@@ -337,6 +345,29 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
                     player_id,
                     kind,
                     args: rest,
+                });
+                Ok(())
+            })?,
+        )?;
+    }
+
+    {
+        let outbox = outbox.clone();
+        api.set(
+            "register_keybind",
+            lua.create_function(move |_, config: mlua::Table| {
+                let id: String = config.get("id")?;
+                let default_key: String = config.get("key")?;
+                let description: String = config.get("description").unwrap_or_default();
+                let category: String = config
+                    .get("category")
+                    .unwrap_or_else(|_| "Mods".to_string());
+
+                outbox.borrow_mut().push(ScriptRequest::RegisterKeybind {
+                    id,
+                    default_key,
+                    description,
+                    category,
                 });
                 Ok(())
             })?,
@@ -665,6 +696,28 @@ fn forward_ui_drag(mut events: MessageReader<UiDragRequested>, runtime: NonSend<
     }
 }
 
+#[derive(Message)]
+pub struct KeybindActionRequested {
+    pub player_id: PlayerId,
+    pub id: String,
+    pub state: KeybindState,
+}
+
+fn forward_keybind_action(
+    mut events: MessageReader<KeybindActionRequested>,
+    runtime: NonSend<ScriptRuntime>,
+) {
+    for ev in events.read() {
+        let Ok(t) = runtime.lua.create_table() else {
+            continue;
+        };
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
+        let _ = t.set("id", ev.id.as_str());
+        let _ = t.set("pressed", matches!(ev.state, KeybindState::Pressed));
+        runtime.dispatch("keybind", t);
+    }
+}
+
 /// Runs one tick of scripting: installs the pull-style read helpers
 /// (`get_player_pos`, `get_block`, `list_players`) as *scoped* globals —
 /// borrowed from this system's own `Query`/`Res` params for the
@@ -788,6 +841,19 @@ pub(crate) fn drain_script_requests(
                     }
                     Err(e) => warn!("scripting: api.broadcast: {e}"),
                 }
+            }
+            ScriptRequest::RegisterKeybind {
+                id,
+                default_key,
+                description,
+                category,
+            } => {
+                outgoing.write(OutgoingPacket::broadcast(ServerMessage::RegisterKeybind {
+                    id,
+                    default_key,
+                    description,
+                    category,
+                }));
             }
             ScriptRequest::SetBlock { pos, block } => {
                 set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by);

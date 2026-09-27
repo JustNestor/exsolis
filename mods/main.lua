@@ -40,7 +40,15 @@ end)
 
 api.on("place_block", function(ev)
     api.send(ev.player_id, "ui_hide", "inv")
+    api.register_keybind({id = "inv:close", key = "KeyE"})
 end)
+
+api.on("keybind", function(ev)
+    if ev.id == "inv:close" then
+        api.send(ev.player_id, "ui_hide", "inv")
+    end
+end
+)
 
 api.on("ui_drag", function(ev)
     if ev.ui_id ~= "inv" then return end

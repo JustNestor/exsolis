@@ -1,5 +1,6 @@
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::{IncomingPacket, OutgoingPacket};
+use crate::scripting::KeybindActionRequested;
 
 use super::*;
 use bevy_ecs::message::Message;
@@ -172,6 +173,13 @@ pub fn dispatch_incoming(
                 commands.write_message(SelectHotbarRequested {
                     player_id: client_id,
                     index: *index,
+                });
+            }
+            ClientMessage::KeybindAction { id, state } => {
+                commands.write_message(KeybindActionRequested {
+                    id: id.clone(),
+                    state: *state,
+                    player_id: client_id,
                 });
             }
             _ => {}

@@ -163,6 +163,10 @@ pub enum ClientMessage {
         target_id: String,
         data: Option<String>,
     },
+    KeybindAction {
+        id: String, // "namespace:action"
+        state: KeybindState,
+    },
 }
 
 #[non_exhaustive]
@@ -228,6 +232,21 @@ pub enum ServerMessage {
     UiHide {
         id: String,
     },
+    RegisterKeybind {
+        id: String,          // e.g. "mymod:cast_spell"
+        default_key: String, // e.g. "KeyF", "Space", "KeyE"
+        description: String, // e.g. "Cast Primary Ability"
+        category: String,    // e.g. "Combat"
+    },
+    UnregisterKeybind {
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeybindState {
+    Pressed,
+    Released,
 }
 
 pub const HOTBAR_SIZE: usize = 9;
