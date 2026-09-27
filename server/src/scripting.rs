@@ -382,12 +382,37 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
     Ok(())
 }
 
+/// `PlayerId` is `u64`, and standard Lua numbers are `f64` (53 bits of
+/// exact integer precision) — a real client id like
+/// `4174018466291290165` needs 63 bits and silently rounds to the
+/// nearest representable double the instant it becomes a Lua number,
+/// coming back out as a DIFFERENT id that's a few hundred off (this is
+/// exactly what produced "Tried to send a message to invalid client
+/// ...112" for an id ending in ...165: the double couldn't hold it).
+/// So `PlayerId` crosses the boundary as a decimal *string* instead,
+/// both directions — `player_id_to_lua` here, and the string branch in
+/// `pop_player_id` below. Never put a `PlayerId` into a Lua table or
+/// function argument as a bare integer/number again; always route it
+/// through this pair.
+fn player_id_to_lua(id: PlayerId) -> String {
+    id.to_string()
+}
+
 fn pop_player_id(it: &mut impl Iterator<Item = Value>) -> mlua::Result<PlayerId> {
     match it.next() {
+        Some(Value::String(s)) => {
+            let s = s.to_str()?;
+            s.parse::<PlayerId>()
+                .map_err(|_| mlua::Error::RuntimeError(format!("'{s}' is not a valid player_id")))
+        }
+        // Tolerated for convenience (e.g. a mod hardcoding a small test
+        // id), but anything beyond 2^53 silently lost precision before
+        // it ever reached us — there's no way to recover it here, so
+        // this path only works for small ids. Prefer the string form.
         Some(Value::Integer(i)) => Ok(i as PlayerId),
         Some(Value::Number(n)) => Ok(n as PlayerId),
         other => Err(mlua::Error::RuntimeError(format!(
-            "expected player_id (integer), got {other:?}"
+            "expected player_id (string, e.g. from ev.player_id), got {other:?}"
         ))),
     }
 }
@@ -473,7 +498,7 @@ fn forward_place_block(
         let Ok(t) = runtime.lua.create_table() else {
             continue;
         };
-        let _ = t.set("player_id", ev.player_id);
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
@@ -490,7 +515,7 @@ fn forward_break_block(
         let Ok(t) = runtime.lua.create_table() else {
             continue;
         };
-        let _ = t.set("player_id", ev.player_id);
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
@@ -506,7 +531,7 @@ fn forward_select_hotbar(
         let Ok(t) = runtime.lua.create_table() else {
             continue;
         };
-        let _ = t.set("player_id", ev.player_id);
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
         let _ = t.set("index", ev.index);
         runtime.dispatch("select_hotbar", t);
     }
@@ -543,8 +568,11 @@ fn run_on_tick(
     let result = runtime.lua.scope(|scope| {
         let api: Table = runtime.lua.globals().get("api")?;
 
-        let get_player_pos =
-            scope.create_function(|lua, player_id: u64| match positions.get(&player_id) {
+        let get_player_pos = scope.create_function(|lua, player_id: String| {
+            let Ok(player_id) = player_id.parse::<PlayerId>() else {
+                return Ok(Value::Nil);
+            };
+            match positions.get(&player_id) {
                 Some((x, y, z)) => {
                     let t = lua.create_table()?;
                     t.set("x", *x)?;
@@ -553,13 +581,16 @@ fn run_on_tick(
                     Ok(Value::Table(t))
                 }
                 None => Ok(Value::Nil),
-            })?;
+            }
+        })?;
         api.set("get_player_pos", get_player_pos)?;
 
+        // Same precision issue as everywhere else PlayerId crosses into
+        // Lua: each id goes out as a decimal string, not a number.
         let list_players = scope.create_function(|lua, ()| {
             let t = lua.create_table()?;
             for (i, id) in positions.keys().enumerate() {
-                t.raw_set(i + 1, *id)?;
+                t.raw_set(i + 1, player_id_to_lua(*id))?;
             }
             Ok(t)
         })?;
