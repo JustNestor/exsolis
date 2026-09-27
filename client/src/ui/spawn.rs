@@ -48,7 +48,8 @@ pub struct UiElement {
 /// From `on-click` / `data`.
 #[derive(Component, Debug, Clone)]
 pub struct UiClickAction {
-    pub action: String,
+    pub primary: Option<String>,
+    pub secondary: Option<String>,
     pub data: Option<String>,
 }
 
@@ -183,13 +184,12 @@ fn spawn_widget(
         // versions this is `BorderColor(c)`.
         e.insert(BorderColor::all(c));
     }
-    if let Some(action) = &def.on_click {
+    if def.on_click.is_some() || def.on_secondary_click.is_some() {
         e.insert(UiClickAction {
-            action: action.clone(),
+            primary: def.on_click.clone(),
+            secondary: def.on_secondary_click.clone(),
             data: def.data.clone(),
         });
-        // Per-entity observer: runs when the click bubbles up to this widget,
-        // so clicking a label *inside* a button triggers the button.
         e.observe(on_ui_click);
     }
     if let Some(action) = &def.on_pointer_enter {

@@ -26,39 +26,44 @@ pub fn on_ui_click(
     mut click: On<Pointer<Click>>,
     targets: Query<(&UiElement, &UiClickAction)>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
     mut out: MessageWriter<OutgoingPacket>,
     mut ui: ResMut<UiManager>,
     mut commands: Commands,
 ) {
-    info!("click");
-
     if let Ok(cursor) = windows.single() {
         if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
             return;
         }
     }
 
-    info!("click 2");
-
-    // ASSUMPTION: `event_target()` is the entity this observer is attached
-    // to (the widget), not the original picked child. Adjust if 0.19 renamed it.
     let Ok((el, act)) = targets.get(click.event_target()) else {
         return;
     };
-    if click.event().button != PointerButton::Primary {
+
+    let action = match click.event().button {
+        PointerButton::Primary => act.primary.as_deref(),
+        PointerButton::Secondary => act.secondary.as_deref(),
+        _ => None,
+    };
+
+    let Some(action) = action else {
         return;
-    }
+    };
+
     click.propagate(false);
 
-    if act.action == CLIENT_CLOSE {
+    if action == CLIENT_CLOSE {
         ui.hide(&mut commands, &el.ui_id);
         return;
     }
-    if act.action.len() > UI_MAX_ACTION_LEN
-        || act
-            .data
-            .as_ref()
-            .is_some_and(|d| d.len() > UI_MAX_ACTION_LEN)
+
+    // Embeds key modifiers (shift, ctrl, alt, etc.) and active mouse button
+    let data = build_action_data(act.data.as_deref(), &keyboard, &mouse);
+
+    if action.len() > UI_MAX_ACTION_LEN
+        || data.as_ref().is_some_and(|d| d.len() > UI_MAX_ACTION_LEN)
     {
         bevy_log::warn!("ui `{}`: action/data too long, not sent", el.ui_id);
         return;
@@ -67,8 +72,8 @@ pub fn on_ui_click(
     out.write(OutgoingPacket::reliable(ClientMessage::UiAction {
         ui_id: el.ui_id.clone(),
         element_id: el.element_id.clone(),
-        action: act.action.clone(),
-        data: act.data.clone(),
+        action: action.to_owned(),
+        data,
     }));
 }
 

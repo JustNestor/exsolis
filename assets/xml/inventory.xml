@@ -1,8 +1,7 @@
-
 <div id="inv" modal="true" layout="column" anchor="center"
      bg="#222c" padding="12" gap="8">
   <label font-size="18" color="#fff">{{title}}</label>
-  <div layout="row" wrap="true" gap="6">
+  <div layout="grid" cols="9" rows="4" gap="6">
     <div v-for="s in slots"
          id="slot_{{s.index}}"
          droppable="true"

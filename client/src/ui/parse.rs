@@ -40,6 +40,7 @@ pub struct WidgetDef {
     pub id: Option<String>,
     /// `on-click="namespace:action"`.
     pub on_click: Option<String>,
+    pub on_secondary_click: Option<String>,
     pub on_pointer_enter: Option<String>,
     /// `on-pointer-leave="namespace:action"` or `on-pointer-left="namespace:action"`.
     pub on_pointer_leave: Option<String>,
@@ -87,6 +88,9 @@ impl std::error::Error for ParseError {}
 const STYLE_ATTRS: &[&str] = &[
     // layout
     "layout",
+    "cols",
+    "rows",
+    "grid-flow",
     "gap",
     "padding",
     "margin",
@@ -118,7 +122,7 @@ const STYLE_ATTRS: &[&str] = &[
     "font-size",
     "hover-bg",
     "pressed-bg",
-    // drag & drop (see drag.rs)
+    // drag & drop
     "draggable",
     "droppable",
     "drag-group",
@@ -166,6 +170,7 @@ fn convert(
         kind,
         id: None,
         on_click: None,
+        on_secondary_click: None,
         data: None,
         attrs: Attrs::new(),
         text: None,
@@ -179,6 +184,9 @@ fn convert(
         match name {
             "id" => def.id = Some(value.to_owned()),
             "on-click" => def.on_click = Some(value.to_owned()),
+            "on-secondary-click" | "on-right-click" => {
+                def.on_secondary_click = Some(value.to_owned());
+            }
             "data" => def.data = Some(value.to_owned()),
             "on-pointer-enter" => def.on_pointer_enter = Some(value.to_owned()),
             "on-pointer-leave" => {
@@ -223,6 +231,7 @@ fn convert(
                     children: Vec::new(),
                     on_pointer_enter: None,
                     on_pointer_leave: None,
+                    on_secondary_click: None,
                 });
             }
         }

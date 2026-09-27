@@ -193,8 +193,34 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
     //     v
     // };
 
-    if let Some(v) = get("layout", parse_direction, attrs, warnings) {
-        node.flex_direction = v;
+    if let Some(v) = get(
+        "layout",
+        |s| match s.trim() {
+            "column" => Some((Display::Flex, FlexDirection::Column)),
+            "row" => Some((Display::Flex, FlexDirection::Row)),
+            "column-reverse" => Some((Display::Flex, FlexDirection::ColumnReverse)),
+            "row-reverse" => Some((Display::Flex, FlexDirection::RowReverse)),
+            "grid" => Some((Display::Grid, FlexDirection::Row)),
+            _ => None,
+        },
+        attrs,
+        warnings,
+    ) {
+        node.display = v.0;
+        node.flex_direction = v.1;
+    }
+
+    if let Some(cols) = get("cols", parse_grid_tracks, attrs, warnings) {
+        node.display = Display::Grid;
+        node.grid_template_columns = cols;
+    }
+    if let Some(rows) = get("rows", parse_grid_tracks, attrs, warnings) {
+        node.display = Display::Grid;
+        node.grid_template_rows = rows;
+    }
+    if let Some(flow) = get("grid-flow", parse_grid_flow, attrs, warnings) {
+        node.display = Display::Grid;
+        node.grid_auto_flow = flow;
     }
     if let Some(v) = get("gap", parse_val, attrs, warnings) {
         node.row_gap = v;
@@ -375,5 +401,56 @@ mod tests {
         );
         assert_eq!(parse_color("#12"), None);
         assert_eq!(parse_color("red"), None);
+    }
+}
+
+fn parse_grid_flow(s: &str) -> Option<GridAutoFlow> {
+    Some(match s.trim() {
+        "row" => GridAutoFlow::Row,
+        "column" => GridAutoFlow::Column,
+        "row-dense" => GridAutoFlow::RowDense,
+        "column-dense" => GridAutoFlow::ColumnDense,
+        _ => return None,
+    })
+}
+
+fn parse_grid_tracks(s: &str) -> Option<Vec<RepeatedGridTrack>> {
+    let s = s.trim();
+    // Integer shortcut: `cols="4"` -> 4 equal flexible columns
+    if let Ok(count) = s.parse::<u16>() {
+        if count > 0 {
+            return Some(vec![RepeatedGridTrack::flex(count, 1.0)]);
+        }
+    }
+
+    // Explicit space-separated track list: `cols="100px 1fr auto"`
+    let tracks: Vec<GridTrack> = s
+        .split_whitespace()
+        .map(|part| {
+            if part == "auto" {
+                Some(GridTrack::auto())
+            } else if let Some(n) = part.strip_suffix("fr") {
+                n.parse::<f32>().ok().map(GridTrack::flex)
+            } else if let Some(val) = parse_val(part) {
+                match val {
+                    Val::Px(px) => Some(GridTrack::px(px)),
+                    Val::Percent(p) => Some(GridTrack::percent(p)),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        })
+        .collect::<Option<_>>()?;
+
+    if tracks.is_empty() {
+        None
+    } else {
+        Some(
+            tracks
+                .into_iter()
+                .map(|t| RepeatedGridTrack::repeat_many(1, vec![t]))
+                .collect(),
+        )
     }
 }
