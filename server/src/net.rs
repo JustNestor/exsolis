@@ -171,7 +171,15 @@ fn drain_incoming(mut server: ResMut<RenetServer>, mut incoming: MessageWriter<I
     }
 }
 
-fn flush_outgoing(mut server: ResMut<RenetServer>, mut outgoing: MessageReader<OutgoingPacket>) {
+// `pub(crate)` (was private) so other plugins can anchor a system
+// `.before(flush_outgoing)` explicitly when they write `OutgoingPacket`
+// from a system that isn't itself inside `NetSet::Send` — see
+// `scripting.rs::ScriptingPlugin` for why `drain_script_requests` needs
+// this.
+pub(crate) fn flush_outgoing(
+    mut server: ResMut<RenetServer>,
+    mut outgoing: MessageReader<OutgoingPacket>,
+) {
     for packet in outgoing.read() {
         let bytes = match &packet.payload {
             Payload::Bytes(bytes) => bytes.clone(),

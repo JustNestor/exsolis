@@ -161,11 +161,6 @@ pub enum ClientMessage {
         ui_id: String,
         source_id: String,
         target_id: String,
-        /// The dragged widget's `data` attribute, forwarded verbatim —
-        /// same convention as `UiClickAction.data` — so the server doesn't
-        /// have to re-derive "what was in that slot" from `source_id`
-        /// alone if the UI encodes it directly (e.g. `data="7"` for a
-        /// hotbar index).
         data: Option<String>,
     },
 }

@@ -25,3 +25,17 @@
   </label>
 
 </div> -->
+
+<div id="dragtest" modal="true" layout="row" anchor="center" bg="#222c" padding="12" gap="12">
+  <div id="slotA" droppable="true" drag-group="test" bg="#333a" width="64" height="64" align="center" justify="center">
+    <div id="itemA" draggable="true" drag-group="test" data="A" bg="#a83" drag-ghost-bg="#fc5" width="48" height="48">
+      A
+    </div>
+  </div>
+
+  <div id="slotB" droppable="true" drag-group="test" bg="#333a" width="64" height="64" align="center" justify="center">
+  </div>
+
+  <div id="slotC" droppable="true" drag-group="test" bg="#333a" width="64" height="64" align="center" justify="center">
+  </div>
+</div>

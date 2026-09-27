@@ -116,7 +116,7 @@ fn flush_outgoing(mut client: ResMut<RenetClient>, mut outgoing: MessageReader<O
             // Still consume so a reconnect doesn't flush stale break/move packets.
             continue;
         }
-
+        debug!("outgoing packet {:?}", packet.msg);
         match bincode::serialize(&packet.msg) {
             Ok(bytes) => client.send_message(packet.channel, bytes),
             Err(e) => warn!("failed to serialize client packet: {e}"),

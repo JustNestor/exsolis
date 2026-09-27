@@ -1,16 +1,4 @@
 // src/player.rs — client-side camera + input.
-//
-// The server is authoritative over position. This module:
-//   - FlyCamera + look + cursor grab: purely local (rotation is instant).
-//   - Movement input: WASD/space/ctrl are sampled into a direction vector
-//     and sent to the server as ClientMessage::Move ONLY WHEN IT CHANGES
-//     (throttled to the server tick rate). The server keeps applying the
-//     last direction every tick, so holding a key costs zero packets.
-//   - Movement result: the server sends its authoritative position back
-//     (ServerMessage::YourPosition); the camera's Transform eases toward it.
-//     There is no client-side prediction yet, so movement has about one
-//     round trip plus one server tick of latency. If that starts to feel
-//     bad, add prediction with input sequence numbers + reconciliation.
 
 use std::time::{Duration, Instant};
 
@@ -22,13 +10,14 @@ use bevy_input::mouse::{MouseButton, MouseMotion};
 use bevy_input::{ButtonInput, keyboard::KeyCode};
 use bevy_log::info;
 use bevy_transform::prelude::Transform;
-use bevy_ui::IsDefaultUiCamera;
+use bevy_ui::{Interaction, IsDefaultUiCamera};
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, UVec2, Vec3};
 
 use crate::net::{GameplaySet, IncomingPacket, NetConnected, OutgoingPacket};
 use crate::streaming::RemotePlayer;
+use crate::ui::UiManager;
 
 #[derive(Component)]
 pub struct LocalPlayer;
@@ -149,18 +138,34 @@ fn sync_ui_layout_camera(
 fn toggle_cursor_grab(
     mouse: Res<ButtonInput<MouseButton>>,
     keys: Res<ButtonInput<KeyCode>>,
+    ui_manager: Res<UiManager>,
+    ui_interactions: Query<&Interaction>,
     mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
 ) {
     let Ok(mut cursor) = windows.single_mut() else {
         return;
     };
 
+    if ui_manager.captures_input() {
+        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
+            cursor.grab_mode = CursorGrabMode::None;
+            cursor.visible = true;
+        }
+        return;
+    }
+
     if keys.just_pressed(KeyCode::Escape) {
         cursor.grab_mode = CursorGrabMode::None;
         cursor.visible = true;
     } else if mouse.just_pressed(MouseButton::Left) && cursor.grab_mode == CursorGrabMode::None {
-        cursor.grab_mode = CursorGrabMode::Locked;
-        cursor.visible = false;
+        let clicked_on_ui = ui_interactions
+            .iter()
+            .any(|interaction| *interaction != Interaction::None);
+
+        if !clicked_on_ui {
+            cursor.grab_mode = CursorGrabMode::Locked;
+            cursor.visible = false;
+        }
     }
 }
 

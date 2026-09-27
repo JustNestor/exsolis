@@ -39,6 +39,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use bevy_app::prelude::*;
@@ -52,6 +53,7 @@ use crate::Player;
 use crate::chunks::{ChunkWorld, PlayerPosition};
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::OutgoingPacket;
+use crate::ui::{UiActionRequested, UiDragRequested};
 
 // ---------------------------------------------------------------------
 // Public plugin
@@ -70,12 +72,47 @@ impl Plugin for ScriptingPlugin {
                     forward_place_block,
                     forward_break_block,
                     forward_select_hotbar,
+                    forward_ui_action,
+                    forward_ui_drag,
                 )
+                    // `ui::dispatch_ui_packets` is what actually produces
+                    // `UiActionRequested`/`UiDragRequested`, not
+                    // `events::dispatch_incoming` directly — see
+                    // `ui.rs::UiPlugin` for why UI validation is its own
+                    // system rather than another match arm in
+                    // `dispatch_incoming`. Ordering after the latter is
+                    // still correct (both run in `GameplaySet`, and
+                    // `dispatch_ui_packets` is also `in_set(GameplaySet)`,
+                    // just not guaranteed to run strictly before this
+                    // tuple by that alone) — pin directly to it instead.
                     .after(crate::events::dispatch_incoming)
+                    .after(crate::ui::dispatch_ui_packets)
                     .before(run_on_tick),
             )
-            .add_systems(Update, run_on_tick.after(forward_select_hotbar))
-            .add_systems(Update, drain_script_requests.after(run_on_tick));
+            .add_systems(
+                Update,
+                run_on_tick
+                    .after(forward_select_hotbar)
+                    .after(forward_ui_action)
+                    .after(forward_ui_drag),
+            )
+            // FIX: `drain_script_requests` writes `OutgoingPacket` (mod
+            // `api.send`/`broadcast`/`UiShow`/`UiHide` all go through it),
+            // but was only ordered `.after(run_on_tick)` — never anchored
+            // to `net::GameplaySet`/`net::NetSet::Send`. `configure_sets`
+            // in `net.rs` only chains `Receive -> GameplaySet -> Send`;
+            // a system that's merely transitively downstream of something
+            // *in* `GameplaySet` isn't guaranteed by that chain to run
+            // before `NetSet::Send`'s `flush_outgoing`. In practice this
+            // usually worked because Bevy tends to schedule transitively-
+            // ordered systems together, but "usually" isn't a scheduling
+            // guarantee — `.before(net::flush_outgoing)` makes it one.
+            .add_systems(
+                Update,
+                drain_script_requests
+                    .after(run_on_tick)
+                    .before(crate::net::flush_outgoing),
+            );
     }
 }
 
@@ -307,6 +344,33 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         )?;
     }
 
+    api.set(
+        "load_xml",
+        lua.create_function(|_, filename: String| {
+            let rel = std::path::Path::new(&filename);
+            if rel
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(mlua::Error::RuntimeError(
+                    "load_xml: parent directory navigation ('..') is not allowed".to_string(),
+                ));
+            }
+
+            let mut path = PathBuf::from("assets/xml").join(rel);
+            if path.extension().is_none() {
+                path.set_extension("xml");
+            }
+
+            std::fs::read_to_string(&path).map_err(|e| {
+                mlua::Error::RuntimeError(format!(
+                    "load_xml: failed to read '{}': {e}",
+                    path.display()
+                ))
+            })
+        })?,
+    )?;
+
     // --- api.broadcast(kind, ...) : queue a message to every player ----
     {
         let outbox = outbox.clone();
@@ -537,6 +601,48 @@ fn forward_select_hotbar(
     }
 }
 
+/// Forwards a validated `UiActionRequested` (see `ui.rs` for what
+/// "validated" means here — length/screen-open checks only, nothing
+/// about what the action *means*) to `on("ui_action", fn(ev) ... end)`.
+/// `ev.data` is `nil` when the widget had no `data` attribute — Lua's
+/// natural way to spell "absent", so no separate `has_data` flag is
+/// needed the way a fixed-shape wire struct might want one.
+fn forward_ui_action(
+    mut events: MessageReader<UiActionRequested>,
+    runtime: NonSend<ScriptRuntime>,
+) {
+    for ev in events.read() {
+        let Ok(t) = runtime.lua.create_table() else {
+            continue;
+        };
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
+        let _ = t.set("ui_id", ev.ui_id.as_str());
+        let _ = t.set("element_id", ev.element_id.as_str());
+        let _ = t.set("action", ev.action.as_str());
+        let _ = t.set("data", ev.data.as_deref());
+        runtime.dispatch("ui_action", t);
+    }
+}
+
+/// Forwards a validated `UiDragRequested` to `on("ui_drag", fn(ev) ...
+/// end)`. Field names deliberately match the client XML vocabulary
+/// (`source_id`/`target_id`, not e.g. `from`/`to`) so a mod author
+/// reading both the UI markup and the Lua handler isn't translating
+/// between two naming schemes for the same concept.
+fn forward_ui_drag(mut events: MessageReader<UiDragRequested>, runtime: NonSend<ScriptRuntime>) {
+    for ev in events.read() {
+        let Ok(t) = runtime.lua.create_table() else {
+            continue;
+        };
+        let _ = t.set("player_id", player_id_to_lua(ev.player_id));
+        let _ = t.set("ui_id", ev.ui_id.as_str());
+        let _ = t.set("source_id", ev.source_id.as_str());
+        let _ = t.set("target_id", ev.target_id.as_str());
+        let _ = t.set("data", ev.data.as_deref());
+        runtime.dispatch("ui_drag", t);
+    }
+}
+
 /// Runs one tick of scripting: installs the pull-style read helpers
 /// (`get_player_pos`, `get_block`, `list_players`) as *scoped* globals —
 /// borrowed from this system's own `Query`/`Res` params for the
@@ -626,7 +732,13 @@ fn run_on_tick(
 /// keeping it in one system means a future rewrite of the Lua bridge
 /// only has to keep producing this same `ScriptRequest` shape, not
 /// understand gameplay itself.
-fn drain_script_requests(
+// `pub(crate)` (was private) so `ui.rs::track_open_screens` can order
+// itself `.after(drain_script_requests)` explicitly — see the comment on
+// that ordering in `ui.rs::UiPlugin::build` for why: this system's own
+// placement in the schedule is only transitively `.after(run_on_tick)`,
+// not anchored to `GameplaySet`/`NetSet::Send`, so anything downstream
+// that needs to run strictly after it has to reference it by name.
+pub(crate) fn drain_script_requests(
     runtime: NonSend<ScriptRuntime>,
     mut world: ResMut<ChunkWorld>,
     mut outgoing: MessageWriter<OutgoingPacket>,
