@@ -18,6 +18,8 @@ use bevy_text::{TextColor, TextFont};
 use bevy_ui::prelude::*;
 use bevy_ui::{GlobalZIndex, Interaction};
 
+use crate::ui::events::{on_ui_pointer_enter, on_ui_pointer_leave};
+
 use super::drag::{
     DragGroup, Draggable, Droppable, on_drag_drop, on_drag_end, on_drag_move, on_drag_start,
 };
@@ -46,6 +48,19 @@ pub struct UiElement {
 /// From `on-click` / `data`.
 #[derive(Component, Debug, Clone)]
 pub struct UiClickAction {
+    pub action: String,
+    pub data: Option<String>,
+}
+
+#[derive(Component, Debug, Clone)]
+pub struct UiPointerEnterAction {
+    pub action: String,
+    pub data: Option<String>,
+}
+
+/// From `on-pointer-leave` (or `on-pointer-left`) / `data`.
+#[derive(Component, Debug, Clone)]
+pub struct UiPointerLeaveAction {
     pub action: String,
     pub data: Option<String>,
 }
@@ -176,6 +191,20 @@ fn spawn_widget(
         // Per-entity observer: runs when the click bubbles up to this widget,
         // so clicking a label *inside* a button triggers the button.
         e.observe(on_ui_click);
+    }
+    if let Some(action) = &def.on_pointer_enter {
+        e.insert(UiPointerEnterAction {
+            action: action.clone(),
+            data: def.data.clone(),
+        });
+        e.observe(on_ui_pointer_enter);
+    }
+    if let Some(action) = &def.on_pointer_leave {
+        e.insert(UiPointerLeaveAction {
+            action: action.clone(),
+            data: def.data.clone(),
+        });
+        e.observe(on_ui_pointer_leave);
     }
 
     // Drag source: any widget with `draggable="true"`, regardless of kind

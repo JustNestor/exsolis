@@ -40,6 +40,9 @@ pub struct WidgetDef {
     pub id: Option<String>,
     /// `on-click="namespace:action"`.
     pub on_click: Option<String>,
+    pub on_pointer_enter: Option<String>,
+    /// `on-pointer-leave="namespace:action"` or `on-pointer-left="namespace:action"`.
+    pub on_pointer_leave: Option<String>,
     /// `data="..."`, forwarded verbatim in `UiAction.data`.
     pub data: Option<String>,
     /// Layout/style attributes, interpreted later by `style.rs`.
@@ -167,6 +170,8 @@ fn convert(
         attrs: Attrs::new(),
         text: None,
         children: Vec::new(),
+        on_pointer_enter: None,
+        on_pointer_leave: None,
     };
 
     for a in node.attributes() {
@@ -175,6 +180,10 @@ fn convert(
             "id" => def.id = Some(value.to_owned()),
             "on-click" => def.on_click = Some(value.to_owned()),
             "data" => def.data = Some(value.to_owned()),
+            "on-pointer-enter" => def.on_pointer_enter = Some(value.to_owned()),
+            "on-pointer-leave" => {
+                def.on_pointer_leave = Some(value.to_owned());
+            }
             n if STYLE_ATTRS.contains(&n) => {
                 def.attrs.insert(n.to_owned(), value.to_owned());
             }
@@ -212,6 +221,8 @@ fn convert(
                     attrs: Attrs::new(),
                     text: Some(t),
                     children: Vec::new(),
+                    on_pointer_enter: None,
+                    on_pointer_leave: None,
                 });
             }
         }
