@@ -1,6 +1,7 @@
 //! UI input -> `OutgoingPacket(UiAction)`.
 
 use bevy_ecs::prelude::*;
+use bevy_log::info;
 use bevy_picking::prelude::*;
 use bevy_ui::Interaction;
 use bevy_ui::prelude::*;
@@ -24,11 +25,15 @@ pub fn on_ui_click(
     mut ui: ResMut<UiManager>,
     mut commands: Commands,
 ) {
+    info!("click");
+
     if let Ok(cursor) = windows.single() {
         if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
             return;
         }
     }
+
+    info!("click 2");
 
     // ASSUMPTION: `event_target()` is the entity this observer is attached
     // to (the widget), not the original picked child. Adjust if 0.19 renamed it.

@@ -20,11 +20,11 @@ bevy_input_focus = "0.19"
 bevy_window = "0.19"
 bevy_winit = "0.19"
 bevy_a11y = "0.19"
-bevy_ui = "0.19"
+# bevy_ui = "0.19"
 roxmltree = "0.20"
 bevy_color = "0.19"
 bevy_text = {version = "0.19", features = ["default_font"]}
-bevy_picking = "0.19"
+bevy_ui = { version = "0.19", features = ["bevy_picking", "ghost_nodes"] }
 bevy_ui_widgets = "0.19"
 bevy_image = "0.19"
 wgpu-types = "29.0.4"
@@ -62,6 +62,7 @@ bevy_internal = { version = "0.19", features = [
     "bevy_input_focus"
 ] }
 mimalloc = "0.1.52"
+bevy_picking ="0.19"
 
 
 # [workspace.dependencies.bevy_mod_scripting]

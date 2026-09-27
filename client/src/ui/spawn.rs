@@ -145,6 +145,7 @@ fn spawn_widget(
                     ..Default::default()
                 },
                 TextColor(inh.color),
+                Pickable::IGNORE,
             ));
         }
         WidgetKind::Button => {

@@ -19,6 +19,7 @@ use bevy_ecs::prelude::*;
 use bevy_image::ImagePlugin;
 use bevy_internal::DefaultPlugins;
 use bevy_log::{LogPlugin, prelude::*};
+use bevy_picking::events::{Click, Pointer};
 use bevy_renet::{
     RenetClient, RenetClientPlugin, client_connected,
     netcode::{

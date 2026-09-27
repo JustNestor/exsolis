@@ -6,9 +6,9 @@
 <!-- <div id="dev_panel" anchor="center" layout="column" gap="8" padding="16"
      bg="#222831ee" border="2" border-color="#ffffff55" radius="8" modal="true">
 
-  <label font-size="22" color="#ffffff">SDUI dev panel</label>
+     <label font-size="22" color="#ffffff">SDUI dev panel</label> -->
 
-  <div layout="row" gap="6">
+  <!-- <div layout="row" gap="6">
     <button id="ping" on-click="dev:ping" bg="#3a6ea5" hover-bg="#4d84c2"
             pressed-bg="#2c527d" padding="6 12" radius="4">
       <label color="#ffffff">Ping</label>
@@ -26,11 +26,12 @@
 
 </div> -->
 
-<div id="dragtest" modal="true" layout="row" anchor="center" bg="#222c" padding="12" gap="12">
+<div id="dragtest" modal="true"  layout="row" anchor="center" bg="#222c" padding="12" gap="12">
   <div id="slotA" droppable="true" drag-group="test" bg="#333a" width="64" height="64" align="center" justify="center">
     <div id="itemA" draggable="true" drag-group="test" data="A" bg="#a83" drag-ghost-bg="#fc5" width="48" height="48">
-      A
+
     </div>
+
   </div>
 
   <div id="slotB" droppable="true" drag-group="test" bg="#333a" width="64" height="64" align="center" justify="center">
