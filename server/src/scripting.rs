@@ -50,9 +50,13 @@ use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId,
 
 use crate::Player;
 use crate::chunks::{ChunkWorld, PlayerPosition};
+use crate::events::{PlayerJoined, PlayerLeaved};
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::OutgoingPacket;
 use crate::ui::{UiActionRequested, UiDragRequested};
+
+use std::fs;
+use std::time::SystemTime;
 
 // ---------------------------------------------------------------------
 // Public plugin
@@ -68,10 +72,13 @@ impl Plugin for ScriptingPlugin {
             .add_systems(
                 Update,
                 (
+                    reload_mods_system,
                     forward_place_block,
                     forward_break_block,
                     forward_select_hotbar,
                     forward_ui_action,
+                    forward_player_join,
+                    forward_player_leave,
                     forward_ui_drag,
                     forward_keybind_action,
                 )
@@ -135,6 +142,7 @@ pub struct ScriptRuntime {
     /// by `drain_script_requests`, right after the VM runs, so nothing
     /// mutates the ECS from inside a Lua call.
     outbox: Rc<RefCell<Vec<ScriptRequest>>>,
+    mod_timestamps: RefCell<HashMap<PathBuf, SystemTime>>,
 }
 
 /// One request a mod made this tick, translated into ECS terms by
@@ -228,9 +236,112 @@ impl ScriptRuntime {
         install_api(&lua, outbox.clone())?;
         load_mods(&lua)?;
 
-        Ok(Self { lua, outbox })
+        Ok(Self {
+            lua,
+            outbox,
+            mod_timestamps: Default::default(),
+        })
     }
 
+    pub fn check_and_reload_mods(&self) {
+        if self.should_reload() {
+            info!("scripting: detected mod changes or new mods, hot-reloading...");
+            if let Err(e) = self.reload_mods() {
+                error!("scripting: error hot-reloading mods: {e}");
+            }
+        }
+    }
+
+    fn should_reload(&self) -> bool {
+        let dir = Path::new(MODS_DIR);
+        if !dir.is_dir() {
+            return !self.mod_timestamps.borrow().is_empty();
+        }
+
+        let Ok(entries) = fs::read_dir(dir) else {
+            return false;
+        };
+
+        let current_timestamps = self.mod_timestamps.borrow();
+        let mut found_count = 0;
+
+        for entry in entries.filter_map(|e| e.ok()) {
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "lua") {
+                found_count += 1;
+                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
+
+                match (current_timestamps.get(&path), mtime) {
+                    (Some(old_mtime), Some(new_mtime)) => {
+                        if new_mtime > *old_mtime {
+                            return true; // Файл модифіковано
+                        }
+                    }
+                    (None, Some(_)) => return true, // Новий файл додано
+                    _ => {}
+                }
+            }
+        }
+
+        // Якщо якийсь файл видалили з папки
+        if found_count != current_timestamps.len() {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn reload_mods(&self) -> mlua::Result<()> {
+        let dir = Path::new(MODS_DIR);
+        if !dir.is_dir() {
+            warn!("scripting: no '{MODS_DIR}' directory found, no mods loaded");
+            self.mod_timestamps.borrow_mut().clear();
+            return Ok(());
+        }
+
+        // Очищаємо обробники подій перед повторним виконанням модів
+        let globals = self.lua.globals();
+        globals.set("__handlers", self.lua.create_table()?)?;
+        globals.set("__tick_handlers", self.lua.create_table()?)?;
+
+        let mut paths = Vec::new();
+        let mut new_timestamps = HashMap::new();
+
+        if let Ok(entries) = fs::read_dir(dir) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "lua") {
+                    let mtime = entry
+                        .metadata()
+                        .and_then(|m| m.modified())
+                        .unwrap_or(SystemTime::UNIX_EPOCH);
+                    new_timestamps.insert(path.clone(), mtime);
+                    paths.push(path);
+                }
+            }
+        }
+
+        paths.sort();
+
+        for path in paths {
+            let src = match fs::read_to_string(&path) {
+                Ok(src) => src,
+                Err(e) => {
+                    error!("scripting: failed to read {}: {e}", path.display());
+                    continue;
+                }
+            };
+            let name = path.display().to_string();
+            if let Err(e) = self.lua.load(&src).set_name(&name).exec() {
+                error!("scripting: failed to load {name}: {e}");
+            } else {
+                info!("[mod] loaded {}", name);
+            }
+        }
+
+        *self.mod_timestamps.borrow_mut() = new_timestamps;
+        Ok(())
+    }
     /// Calls every Lua handler registered for `event`, in registration
     /// order, with `table` as the sole argument. Errors from an
     /// individual mod are logged and do not stop other handlers or the
@@ -575,6 +686,26 @@ fn load_mods(lua: &Lua) -> mlua::Result<()> {
         info!("[mod] loading {}", name);
     }
     Ok(())
+}
+
+fn forward_player_join(mut events: MessageReader<PlayerJoined>, runtime: NonSend<ScriptRuntime>) {
+    for ev in events.read() {
+        let Ok(t) = runtime.lua.create_table() else {
+            continue;
+        };
+        let _ = t.set("player_id", player_id_to_lua(ev.0));
+        runtime.dispatch("player_join", t);
+    }
+}
+
+fn forward_player_leave(mut events: MessageReader<PlayerLeaved>, runtime: NonSend<ScriptRuntime>) {
+    for ev in events.read() {
+        let Ok(t) = runtime.lua.create_table() else {
+            continue;
+        };
+        let _ = t.set("player_id", player_id_to_lua(ev.0));
+        runtime.dispatch("player_leave", t);
+    }
 }
 
 /// Converts a world position to `(ChunkCoord, index-into-chunk)`. Shared
@@ -961,4 +1092,8 @@ fn set_block_and_broadcast(
             ));
         }
     }
+}
+
+fn reload_mods_system(runtime: NonSend<ScriptRuntime>) {
+    runtime.check_and_reload_mods();
 }
