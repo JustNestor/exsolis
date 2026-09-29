@@ -175,6 +175,11 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
             ..Default::default()
         },
         WidgetKind::Label => Node::default(),
+        // Icons keep their size inside flex rows/columns.
+        WidgetKind::Image => Node {
+            flex_shrink: 0.0,
+            ..Default::default()
+        },
         WidgetKind::Button => Node {
             flex_direction: FlexDirection::Row,
             align_items: AlignItems::Center,

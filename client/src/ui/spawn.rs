@@ -24,6 +24,7 @@ use super::drag::{
     DragGroup, Draggable, Droppable, on_drag_drop, on_drag_end, on_drag_move, on_drag_start,
 };
 use super::events::on_ui_click;
+use super::img_assets;
 use super::parse::{ParsedUi, WidgetDef, WidgetKind};
 use super::style::{self, ResolvedStyle};
 
@@ -72,6 +73,13 @@ pub struct UiHoverStyle {
     pub normal: Color,
     pub hover: Color,
     pub pressed: Color,
+}
+
+/// On `<img>` widgets whose file was found: which `assets/ui/` file to draw.
+/// `render_bridge` uploads it to the GPU once per distinct `src`.
+#[derive(Component, Debug, Clone)]
+pub struct UiImageSrc {
+    pub src: String,
 }
 
 #[derive(Clone, Copy)]
@@ -123,7 +131,7 @@ fn spawn_widget(
     warnings: &mut Vec<String>,
 ) -> Entity {
     let ResolvedStyle {
-        node,
+        mut node,
         bg,
         border_color,
         color,
@@ -136,6 +144,35 @@ fn spawn_widget(
     let inh = Inherited {
         color: color.unwrap_or(inherited.color),
         font_size: font_size.unwrap_or(inherited.font_size),
+    };
+
+    // `<img>`: size is resolved before spawning (`node` is moved into the
+    // spawn below). Unreadable file => `image_src` is None and the widget
+    // falls back to its `alt` text.
+    let image_src: Option<&str> = if def.kind == WidgetKind::Image {
+        match def.src.as_deref().map(|s| (s, img_assets::probe_size(s))) {
+            Some((s, Some((w, h)))) => {
+                let (w, h) = (w as f32, h as f32);
+                node.aspect_ratio = Some(w / h);
+                if node.width == Val::Auto && node.height == Val::Auto {
+                    node.width = Val::Px(w);
+                    node.height = Val::Px(h);
+                } else {
+                    // Don't let `align: stretch` fight the aspect ratio.
+                    node.align_self = AlignSelf::FlexStart;
+                }
+                Some(s)
+            }
+            _ => {
+                warnings.push(format!(
+                    "<img>: cannot load {:?} from assets/ui; showing alt text",
+                    def.src
+                ));
+                None
+            }
+        }
+    } else {
+        None
     };
 
     // Auto ids are structural paths ("#0.1.2"): stable as long as the XML
@@ -163,6 +200,36 @@ fn spawn_widget(
                 TextColor(inh.color),
                 Pickable::IGNORE,
             ));
+        }
+        WidgetKind::Image => {
+            // Non-interactive icons let pointer events fall through to the
+            // parent (slot, button, ...), same as labels do.
+            let interactive = def.on_click.is_some()
+                || def.on_secondary_click.is_some()
+                || def.on_pointer_enter.is_some()
+                || def.on_pointer_leave.is_some()
+                || drag.draggable
+                || drag.droppable;
+            if !interactive {
+                e.insert(Pickable::IGNORE);
+            }
+            match image_src {
+                Some(src) => {
+                    e.insert(UiImageSrc {
+                        src: src.to_owned(),
+                    });
+                }
+                None => {
+                    e.insert((
+                        Text::new(def.alt.clone().unwrap_or_default()),
+                        TextFont {
+                            font_size: inh.font_size.into(),
+                            ..Default::default()
+                        },
+                        TextColor(inh.color),
+                    ));
+                }
+            }
         }
         WidgetKind::Button => {
             // `Button` requires `Interaction`, which drives hover styling.

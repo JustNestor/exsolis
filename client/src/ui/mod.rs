@@ -28,6 +28,8 @@ pub mod render_bridge;
 pub mod spawn;
 pub mod style;
 
+pub mod img_assets;
+
 pub use spawn::UiRoot;
 
 /// Tracks which named screens are mounted.

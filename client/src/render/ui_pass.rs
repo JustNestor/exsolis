@@ -15,6 +15,8 @@
 //!   * KIND_GLYPH samples one glyph rect out of a `bevy_text` font atlas
 //!     (uploaded bindless by `ui::render_bridge::sync_glyph_atlases`) —
 //!     this pass does no text shaping or rasterization of its own.
+//!   * KIND_IMAGE samples a whole `<img>` texture (uploaded bindless by
+//!     `ui::render_bridge::sync_ui_images`), tinted, with rounded corners.
 //!
 //! Instance attribute NAMES in the shader must equal the Rust field names
 //! (vulkano maps them by name, same as `ChunkVertex` in mesh.rs).
@@ -61,6 +63,7 @@ pub const MAX_UI_INSTANCES: usize = 16_384;
 
 pub const KIND_BOX: u32 = 0;
 pub const KIND_GLYPH: u32 = 1;
+pub const KIND_IMAGE: u32 = 2;
 
 /// One screen-space quad. All coordinates are PHYSICAL pixels, origin top-left
 /// — same space `ComputedNode`/`UiGlobalTransform` report in.
@@ -141,6 +144,28 @@ impl UiInstance {
             atlas_size,
             clip_rect,
             kind: KIND_GLYPH,
+            tex_id,
+            ..Default::default()
+        }
+    }
+
+    /// A whole texture stretched over `rect`. `tint` multiplies the texel
+    /// color (white = untouched); `radius` rounds the corners.
+    pub fn image(
+        rect: [f32; 4],
+        tex_id: u32,
+        tint: [f32; 4],
+        radius: f32,
+        clip_rect: [f32; 4],
+    ) -> Self {
+        Self {
+            rect,
+            uvs: [0.0, 0.0, 1.0, 1.0],
+            fill: tint,
+            atlas_size: [1.0, 1.0],
+            radius,
+            clip_rect,
+            kind: KIND_IMAGE,
             tex_id,
             ..Default::default()
         }
@@ -424,6 +449,15 @@ pub mod fs {
                 SampledImageId g = SampledImageId(v_tex, 256);
                 vec4 s = texture(vko_sampler2D(g, pc.sampler_id), v_uv);
                 c = vec4(v_fill.rgb, v_fill.a * s.a);
+            } else if (v_kind == 2u) {
+                // <img>: full RGBA texel * tint, rounded-corner mask.
+                SampledImageId g = SampledImageId(v_tex, 256);
+                vec4 s = texture(vko_sampler2D(g, pc.sampler_id), v_uv);
+                vec2 half_size = v_half_radius.xy;
+                float r = min(v_half_radius.z, min(half_size.x, half_size.y));
+                float d_outer = sd_round_box(v_local, half_size, r);
+                c = s * v_fill;
+                c.a *= clamp(0.5 - d_outer, 0.0, 1.0);
             } else {
                 vec2 half_size = v_half_radius.xy;
                 float r = min(v_half_radius.z, min(half_size.x, half_size.y));

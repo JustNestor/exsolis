@@ -63,6 +63,8 @@ bevy_internal = { version = "0.19", features = [
 ] }
 mimalloc = "0.1.52"
 bevy_picking ="0.19"
+naga = {version="30.0.1", features = ["spv-out", "wgsl-in"]}
+zrip = "0.8.11"
 
 
 # [workspace.dependencies.bevy_mod_scripting]

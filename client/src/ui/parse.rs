@@ -10,6 +10,10 @@
 //! </div>
 //! ```
 //!
+//! `<img src="icons/sword.png" alt="Sword" width="32" height="32"/>` draws a
+//! PNG/JPEG from `assets/ui/`. `src` must be a relative path inside that
+//! folder (no `..`, no absolute paths); `alt` is shown if the file can't load.
+//!
 //! Strictness policy: structural problems (bad XML, unknown element, too
 //! big, too deep) are hard errors — the screen isn't mounted. Attribute
 //! problems (typos, unknown attributes) are *warnings* — the widget still
@@ -31,6 +35,7 @@ pub enum WidgetKind {
     Div,
     Label,
     Button,
+    Image,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +51,10 @@ pub struct WidgetDef {
     pub on_pointer_leave: Option<String>,
     /// `data="..."`, forwarded verbatim in `UiAction.data`.
     pub data: Option<String>,
+    /// `<img src="...">`, relative to `assets/ui/`. Validated by [`is_valid_img_src`].
+    pub src: Option<String>,
+    /// `<img alt="...">`, shown when the image can't be loaded.
+    pub alt: Option<String>,
     /// Layout/style attributes, interpreted later by `style.rs`.
     pub attrs: Attrs,
     /// Label text (whitespace-collapsed). `None` for non-labels.
@@ -158,6 +167,7 @@ fn convert(
         "div" => WidgetKind::Div,
         "label" => WidgetKind::Label,
         "button" => WidgetKind::Button,
+        "img" => WidgetKind::Image,
         other => {
             return Err(ParseError::UnknownElement {
                 tag: other.to_owned(),
@@ -177,6 +187,8 @@ fn convert(
         children: Vec::new(),
         on_pointer_enter: None,
         on_pointer_leave: None,
+        src: None,
+        alt: None,
     };
 
     for a in node.attributes() {
@@ -188,6 +200,8 @@ fn convert(
                 def.on_secondary_click = Some(value.to_owned());
             }
             "data" => def.data = Some(value.to_owned()),
+            "src" => def.src = Some(value.to_owned()),
+            "alt" => def.alt = Some(value.to_owned()),
             "on-pointer-enter" => def.on_pointer_enter = Some(value.to_owned()),
             "on-pointer-leave" => {
                 def.on_pointer_leave = Some(value.to_owned());
@@ -197,6 +211,27 @@ fn convert(
             }
             other => warnings.push(format!("<{tag}>: unknown attribute `{other}`")),
         }
+    }
+
+    if kind != WidgetKind::Image && (def.src.is_some() || def.alt.is_some()) {
+        warnings.push(format!("<{tag}>: `src`/`alt` only apply to <img>"));
+        def.src = None;
+        def.alt = None;
+    }
+
+    if kind == WidgetKind::Image {
+        // An image is a leaf, like a label.
+        if node.children().any(|c| c.is_element()) {
+            warnings.push("<img>: child elements are ignored".into());
+        }
+        match def.src.take() {
+            Some(s) if is_valid_img_src(&s) => def.src = Some(s),
+            Some(s) => warnings.push(format!(
+                "<img>: invalid `src` {s:?} (needs a relative .png/.jpg/.jpeg path inside assets/ui)"
+            )),
+            None => warnings.push("<img>: missing `src`".into()),
+        }
+        return Ok(def);
     }
 
     if kind == WidgetKind::Label {
@@ -232,11 +267,38 @@ fn convert(
                     on_pointer_enter: None,
                     on_pointer_leave: None,
                     on_secondary_click: None,
+                    src: None,
+                    alt: None,
                 });
             }
         }
     }
     Ok(def)
+}
+
+/// `src` comes from the server, so it is sandboxed to `assets/ui/`: only
+/// `[A-Za-z0-9_-./]`, no absolute paths, no empty/hidden/`..` segments, and
+/// only formats we decode (png, jpg, jpeg).
+pub fn is_valid_img_src(src: &str) -> bool {
+    if src.is_empty() || src.len() > 128 {
+        return false;
+    }
+    if !src
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
+    {
+        return false;
+    }
+    if src
+        .split('/')
+        .any(|seg| seg.is_empty() || seg.starts_with('.'))
+    {
+        return false;
+    }
+    match src.rsplit_once('.') {
+        Some((_, ext)) => matches!(ext.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"),
+        None => false,
+    }
 }
 
 fn collapse_ws(s: &str) -> String {
@@ -268,6 +330,37 @@ mod tests {
         assert_eq!(b.data.as_deref(), Some("7"));
         assert_eq!(b.children[0].text.as_deref(), Some("Go now"));
         assert_eq!(r.children[1].text.as_deref(), Some("Hi there"));
+    }
+
+    #[test]
+    fn parses_img() {
+        let ui = parse_ui(r#"<div><img src="icons/a.png" alt="A" width="8"/></div>"#).unwrap();
+        assert!(ui.warnings.is_empty());
+        let i = &ui.root.children[0];
+        assert_eq!(i.kind, WidgetKind::Image);
+        assert_eq!(i.src.as_deref(), Some("icons/a.png"));
+        assert_eq!(i.alt.as_deref(), Some("A"));
+        assert_eq!(i.attrs["width"], "8");
+    }
+
+    #[test]
+    fn img_src_is_sandboxed() {
+        for bad in [
+            "../x.png",
+            "/etc/x.png",
+            "a//b.png",
+            "a\\b.png",
+            ".hidden.png",
+            "x.gif",
+            "png",
+            "",
+        ] {
+            assert!(!is_valid_img_src(bad), "{bad}");
+        }
+        assert!(is_valid_img_src("a/b_c-1.PNG"));
+        let ui = parse_ui(r#"<img src="../x.png"/>"#).unwrap();
+        assert_eq!(ui.warnings.len(), 1);
+        assert!(ui.root.src.is_none());
     }
 
     #[test]

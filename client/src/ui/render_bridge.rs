@@ -26,7 +26,7 @@
 //! (where `ComputedNode`/`UiGlobalTransform`/`TextLayoutInfo` are finalized
 //! for this frame) — see `UiRenderBridgePlugin`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZero;
 
 use bevy_app::prelude::*;
@@ -67,7 +67,8 @@ use crate::render::ui_pass::{UiDrawList, UiInstance, swapchain_is_srgb};
 use crate::texture::sampled_image_index;
 use crate::vulkan_prelude::VulkanContext;
 
-use super::spawn::{UiElement, UiRoot};
+use super::img_assets;
+use super::spawn::{UiElement, UiImageSrc, UiRoot};
 
 fn wgpu_to_vulkano_format(format: TextureFormat) -> Option<Format> {
     match format {
@@ -223,7 +224,24 @@ fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<
     let width = image.width();
     let height = image.height();
     let format = wgpu_to_vulkano_format(image.texture_descriptor.format).unwrap();
+    let bindless_id = upload_pixels(vk, width, height, format, data)?;
+    Some(AtlasEntry {
+        bindless_id,
+        tex_id: sampled_image_index(bindless_id),
+        size: [width as f32, height as f32],
+        uploaded_len: data.len(),
+    })
+}
 
+/// Stage -> copy -> register one tightly packed 2D image (no mips) as a
+/// bindless sampled image. Shared by glyph atlases and `<img>` textures.
+fn upload_pixels(
+    vk: &VulkanContext,
+    width: u32,
+    height: u32,
+    format: Format,
+    data: &[u8],
+) -> Option<SampledImageId> {
     vk.resources.flight(vk.flight_id).wait(None).unwrap();
 
     let image_id = vk
@@ -302,12 +320,85 @@ fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<
         )
         .ok()?;
 
-    Some(AtlasEntry {
-        bindless_id,
-        tex_id: sampled_image_index(bindless_id),
-        size: [width as f32, height as f32],
-        uploaded_len: data.len(),
-    })
+    Some(bindless_id)
+}
+
+// ------------------------------------------------------------------- images
+
+/// Distinct `<img>` uploads allowed per frame (each waits on the frame in
+/// flight, so a screen with many new icons trickles in instead of stalling).
+const MAX_IMAGE_UPLOADS_PER_FRAME: usize = 4;
+
+struct UiImageEntry {
+    #[allow(dead_code)]
+    bindless_id: SampledImageId,
+    tex_id: u32,
+}
+
+/// `src` (relative to `assets/ui/`) -> bindless registration. Like the
+/// glyph atlases, slots are never freed (icons are few and long-lived).
+/// `failed` stops a bad file from being re-decoded every frame.
+#[derive(Resource, Default)]
+struct UiImageRegistry {
+    entries: HashMap<String, UiImageEntry>,
+    failed: HashSet<String>,
+}
+
+/// Decode + upload any `<img>` file that a mounted widget references and
+/// that isn't registered yet. Runs before `extract_ui` in the same frame, so
+/// a freshly shown screen draws its icons immediately.
+fn sync_ui_images(
+    vk: Option<Res<VulkanContext>>,
+    mut registry: ResMut<UiImageRegistry>,
+    wanted: Query<&UiImageSrc>,
+) {
+    let Some(vk) = vk else {
+        return;
+    };
+    // sRGB swapchain: sample through an _SRGB view (hardware decodes to
+    // linear, swapchain re-encodes). Otherwise sample raw bytes as-is,
+    // which are already sRGB-encoded — same rule as `to_instance_color`.
+    let format = if swapchain_is_srgb(&vk) {
+        Format::R8G8B8A8_SRGB
+    } else {
+        Format::R8G8B8A8_UNORM
+    };
+
+    let mut budget = MAX_IMAGE_UPLOADS_PER_FRAME;
+    for item in &wanted {
+        let src = &item.src;
+        if registry.entries.contains_key(src) || registry.failed.contains(src) {
+            continue;
+        }
+        if budget == 0 {
+            break;
+        }
+        budget -= 1;
+
+        let decoded = match img_assets::decode(src) {
+            Ok(d) => d,
+            Err(e) => {
+                bevy_log::warn!("ui img `{src}`: {e}");
+                registry.failed.insert(src.clone());
+                continue;
+            }
+        };
+        match upload_pixels(&vk, decoded.width, decoded.height, format, &decoded.rgba) {
+            Some(bindless_id) => {
+                registry.entries.insert(
+                    src.clone(),
+                    UiImageEntry {
+                        bindless_id,
+                        tex_id: sampled_image_index(bindless_id),
+                    },
+                );
+            }
+            None => {
+                bevy_log::warn!("ui img `{src}`: GPU upload failed");
+                registry.failed.insert(src.clone());
+            }
+        }
+    }
 }
 
 // ------------------------------------------------------------------ extract
@@ -323,6 +414,7 @@ fn upload_atlas_image(vk: &VulkanContext, image: &Image, data: &[u8]) -> Option<
 fn extract_ui(
     vk: Option<Res<VulkanContext>>,
     registry: Res<GlyphAtlasRegistry>,
+    images: Res<UiImageRegistry>,
     mut draw_list: ResMut<UiDrawList>,
     roots: Query<Entity, With<UiRoot>>,
     nodes: Query<(
@@ -335,6 +427,7 @@ fn extract_ui(
         Option<&bevy_text::TextLayoutInfo>,
         Option<&bevy_text::TextColor>,
         Option<&Children>,
+        Option<&UiImageSrc>,
     )>,
 ) {
     let Some(vk) = vk else {
@@ -344,7 +437,7 @@ fn extract_ui(
 
     let mut instances = Vec::new();
     for root in &roots {
-        walk(root, &nodes, &registry, to_linear, &mut instances);
+        walk(root, &nodes, &registry, &images, to_linear, &mut instances);
     }
 
     // bevy_log::info!(
@@ -394,12 +487,14 @@ fn walk(
         Option<&bevy_text::TextLayoutInfo>,
         Option<&bevy_text::TextColor>,
         Option<&Children>,
+        Option<&UiImageSrc>,
     )>,
     registry: &GlyphAtlasRegistry,
+    images: &UiImageRegistry,
     to_linear: bool,
     out: &mut Vec<UiInstance>,
 ) {
-    let Ok((computed, transform, clip, bg, border, _outline, text, text_color, children)) =
+    let Ok((computed, transform, clip, bg, border, _outline, text, text_color, children, image)) =
         nodes.get(entity)
     else {
         return;
@@ -436,6 +531,26 @@ fn walk(
                 fill,
                 border_col,
                 [b.min_inset.x, b.min_inset.y, b.max_inset.x, b.max_inset.y],
+                computed.border_radius().top_left,
+                node_clip,
+            ));
+        }
+    }
+
+    if let Some(src) = image {
+        if let Some(entry) = images.entries.get(&src.src) {
+            // Inset by the border so a `border` on the <img> stays visible.
+            let b = computed.border();
+            let img_rect = [
+                rect[0] + b.min_inset.x,
+                rect[1] + b.min_inset.y,
+                (size.x - b.min_inset.x - b.max_inset.x).max(0.0),
+                (size.y - b.min_inset.y - b.max_inset.y).max(0.0),
+            ];
+            out.push(UiInstance::image(
+                img_rect,
+                entry.tex_id,
+                to_instance_color(Color::WHITE, to_linear),
                 computed.border_radius().top_left,
                 node_clip,
             ));
@@ -483,7 +598,7 @@ fn walk(
 
     if let Some(children) = children {
         for &child in children {
-            walk(child, nodes, registry, to_linear, out);
+            walk(child, nodes, registry, images, to_linear, out);
         }
     }
 }
@@ -506,11 +621,13 @@ pub struct UiRenderBridgePlugin;
 impl Plugin for UiRenderBridgePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<GlyphAtlasRegistry>()
+            .init_resource::<UiImageRegistry>()
             .init_resource::<UiDrawList>()
             .add_systems(
                 PostUpdate,
                 (
                     sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
+                    sync_ui_images,
                     extract_ui,
                     // force_ui_geometry,
                     // debug_ui_layout,

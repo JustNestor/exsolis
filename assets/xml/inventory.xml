@@ -22,5 +22,14 @@
         {{s.item.id}} x{{s.item.count}}
       </div>
     </div>
+    <!-- <div v-for="s in slots2"
+         id="slot_{{s.index}}"
+         droppable="true"
+         drag-group="inv"
+         bg="#333a"
+         width="48"
+         height="152"
+         align="center"
+         justify="center"></div> -->
   </div>
 </div>
