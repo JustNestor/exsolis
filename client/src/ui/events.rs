@@ -1,10 +1,10 @@
-//! UI input -> `OutgoingPacket(UiAction)`.
+//! UI input -> `OutgoingPacket(UiAction)` for server screens, or
+//! `LocalUiAction` for client-owned (`clientui:`) screens.
 
 use bevy_ecs::prelude::*;
 use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
 use bevy_input::mouse::MouseButton;
-use bevy_log::info;
 use bevy_picking::prelude::*;
 use bevy_ui::Interaction;
 use bevy_ui::prelude::*;
@@ -12,56 +12,48 @@ use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use exsolis_common::{ClientMessage, UI_MAX_ACTION_LEN};
 
 use super::UiManager;
-use super::spawn::{UiClickAction, UiElement, UiHoverStyle};
+use super::spawn::{
+    UiClickAction, UiElement, UiHoverStyle, UiPointerEnterAction, UiPointerLeaveAction,
+};
 use crate::net::OutgoingPacket;
-use crate::ui::spawn::UiPointerEnterAction;
-use crate::ui::spawn::UiPointerLeaveAction;
+use crate::ui::LOOPBACK_UI_PREFIX;
 
-/// Reserved action: closes the screen locally, nothing is sent. Handy for
-/// "X" buttons so a lagging server can't leave the player stuck in a menu.
+/// Reserved action: closes the screen locally, nothing is sent.
 pub const CLIENT_CLOSE: &str = "client:close";
 
-/// Attached per widget via `.observe(...)` in spawn.rs.
-pub fn on_ui_click(
-    mut click: On<Pointer<Click>>,
-    targets: Query<(&UiElement, &UiClickAction)>,
-    windows: Query<&CursorOptions, With<PrimaryWindow>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut out: MessageWriter<OutgoingPacket>,
-    mut ui: ResMut<UiManager>,
-    mut commands: Commands,
+/// Click on a `clientui:` widget. Never leaves the process.
+#[derive(Message, Debug, Clone)]
+pub struct LocalUiAction {
+    pub ui_id: String,
+    pub element_id: String,
+    pub action: String,
+    pub data: Option<String>,
+}
+
+fn cursor_free(windows: &Query<&CursorOptions, With<PrimaryWindow>>) -> bool {
+    match windows.single() {
+        Ok(c) => c.grab_mode == CursorGrabMode::None && c.visible,
+        Err(_) => true,
+    }
+}
+
+fn route(
+    el: &UiElement,
+    action: &str,
+    custom_data: Option<&str>,
+    keyboard: &ButtonInput<KeyCode>,
+    mouse: &ButtonInput<MouseButton>,
+    ui: &mut UiManager,
+    commands: &mut Commands,
+    out: &mut MessageWriter<OutgoingPacket>,
+    local: &mut MessageWriter<LocalUiAction>,
 ) {
-    if let Ok(cursor) = windows.single() {
-        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
-            return;
-        }
-    }
-
-    let Ok((el, act)) = targets.get(click.event_target()) else {
-        return;
-    };
-
-    let action = match click.event().button {
-        PointerButton::Primary => act.primary.as_deref(),
-        PointerButton::Secondary => act.secondary.as_deref(),
-        _ => None,
-    };
-
-    let Some(action) = action else {
-        return;
-    };
-
-    click.propagate(false);
-
     if action == CLIENT_CLOSE {
-        ui.hide(&mut commands, &el.ui_id);
+        ui.hide(commands, &el.ui_id);
         return;
     }
 
-    // Embeds key modifiers (shift, ctrl, alt, etc.) and active mouse button
-    let data = build_action_data(act.data.as_deref(), &keyboard, &mouse);
-
+    let data = build_action_data(custom_data, keyboard, mouse);
     if action.len() > UI_MAX_ACTION_LEN
         || data.as_ref().is_some_and(|d| d.len() > UI_MAX_ACTION_LEN)
     {
@@ -69,15 +61,125 @@ pub fn on_ui_click(
         return;
     }
 
-    out.write(OutgoingPacket::reliable(ClientMessage::UiAction {
-        ui_id: el.ui_id.clone(),
-        element_id: el.element_id.clone(),
-        action: action.to_owned(),
-        data,
-    }));
+    if el.ui_id.starts_with(LOOPBACK_UI_PREFIX) {
+        local.write(LocalUiAction {
+            ui_id: el.ui_id.clone(),
+            element_id: el.element_id.clone(),
+            action: action.to_owned(),
+            data,
+        });
+    } else {
+        out.write(OutgoingPacket::reliable(ClientMessage::UiAction {
+            ui_id: el.ui_id.clone(),
+            element_id: el.element_id.clone(),
+            action: action.to_owned(),
+            data,
+        }));
+    }
 }
 
-/// Button hover/pressed feedback, purely client-side (no server round trip).
+pub fn on_ui_click(
+    mut click: On<Pointer<Click>>,
+    targets: Query<(&UiElement, &UiClickAction)>,
+    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut out: MessageWriter<OutgoingPacket>,
+    mut local: MessageWriter<LocalUiAction>,
+    mut ui: ResMut<UiManager>,
+    mut commands: Commands,
+) {
+    if !cursor_free(&windows) {
+        return;
+    }
+    let Ok((el, act)) = targets.get(click.event_target()) else {
+        return;
+    };
+    let action = match click.event().button {
+        PointerButton::Primary => act.primary.as_deref(),
+        PointerButton::Secondary => act.secondary.as_deref(),
+        _ => None,
+    };
+    let Some(action) = action else {
+        return;
+    };
+    click.propagate(false);
+    route(
+        el,
+        action,
+        act.data.as_deref(),
+        &keyboard,
+        &mouse,
+        &mut ui,
+        &mut commands,
+        &mut out,
+        &mut local,
+    );
+}
+
+pub fn on_ui_pointer_enter(
+    mut enter: On<Pointer<Over>>,
+    targets: Query<(&UiElement, &UiPointerEnterAction)>,
+    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut out: MessageWriter<OutgoingPacket>,
+    mut local: MessageWriter<LocalUiAction>,
+    mut ui: ResMut<UiManager>,
+    mut commands: Commands,
+) {
+    if !cursor_free(&windows) {
+        return;
+    }
+    let Ok((el, act)) = targets.get(enter.event_target()) else {
+        return;
+    };
+    enter.propagate(false);
+    route(
+        el,
+        &act.action,
+        act.data.as_deref(),
+        &keyboard,
+        &mouse,
+        &mut ui,
+        &mut commands,
+        &mut out,
+        &mut local,
+    );
+}
+
+pub fn on_ui_pointer_leave(
+    mut leave: On<Pointer<Out>>,
+    targets: Query<(&UiElement, &UiPointerLeaveAction)>,
+    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut out: MessageWriter<OutgoingPacket>,
+    mut local: MessageWriter<LocalUiAction>,
+    mut ui: ResMut<UiManager>,
+    mut commands: Commands,
+) {
+    if !cursor_free(&windows) {
+        return;
+    }
+    let Ok((el, act)) = targets.get(leave.event_target()) else {
+        return;
+    };
+    leave.propagate(false);
+    route(
+        el,
+        &act.action,
+        act.data.as_deref(),
+        &keyboard,
+        &mouse,
+        &mut ui,
+        &mut commands,
+        &mut out,
+        &mut local,
+    );
+}
+
+/// Button hover/pressed feedback, purely client-side.
 pub fn update_hover_styles(
     mut q: Query<(&Interaction, &UiHoverStyle, &mut BackgroundColor), Changed<Interaction>>,
 ) {
@@ -96,7 +198,6 @@ pub fn build_action_data(
     mouse: &ButtonInput<MouseButton>,
 ) -> Option<String> {
     let mut parts = Vec::new();
-
     if keyboard.pressed(KeyCode::ControlLeft) || keyboard.pressed(KeyCode::ControlRight) {
         parts.push("ctrl");
     }
@@ -109,7 +210,6 @@ pub fn build_action_data(
     if keyboard.pressed(KeyCode::SuperLeft) || keyboard.pressed(KeyCode::SuperRight) {
         parts.push("super");
     }
-
     if mouse.pressed(MouseButton::Left) {
         parts.push("left");
     }
@@ -119,102 +219,14 @@ pub fn build_action_data(
     if mouse.pressed(MouseButton::Middle) {
         parts.push("middle");
     }
-
     if let Some(d) = custom_data {
         if !d.is_empty() {
             parts.push(d);
         }
     }
-
     if parts.is_empty() {
         None
     } else {
         Some(parts.join(" "))
     }
-}
-
-pub fn on_ui_pointer_enter(
-    mut enter: On<Pointer<Over>>,
-    targets: Query<(&UiElement, &UiPointerEnterAction)>,
-    windows: Query<&CursorOptions, With<PrimaryWindow>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut out: MessageWriter<OutgoingPacket>,
-    mut ui: ResMut<UiManager>,
-    mut commands: Commands,
-) {
-    if let Ok(cursor) = windows.single() {
-        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
-            return;
-        }
-    }
-
-    let Ok((el, act)) = targets.get(enter.event_target()) else {
-        return;
-    };
-    enter.propagate(false);
-
-    if act.action == CLIENT_CLOSE {
-        ui.hide(&mut commands, &el.ui_id);
-        return;
-    }
-
-    let data = build_action_data(act.data.as_deref(), &keyboard, &mouse);
-
-    if act.action.len() > UI_MAX_ACTION_LEN
-        || data.as_ref().is_some_and(|d| d.len() > UI_MAX_ACTION_LEN)
-    {
-        bevy_log::warn!("ui `{}`: action/data too long, not sent", el.ui_id);
-        return;
-    }
-
-    out.write(OutgoingPacket::reliable(ClientMessage::UiAction {
-        ui_id: el.ui_id.clone(),
-        element_id: el.element_id.clone(),
-        action: act.action.clone(),
-        data,
-    }));
-}
-
-pub fn on_ui_pointer_leave(
-    mut leave: On<Pointer<Out>>,
-    targets: Query<(&UiElement, &UiPointerLeaveAction)>,
-    windows: Query<&CursorOptions, With<PrimaryWindow>>,
-    keyboard: Res<ButtonInput<KeyCode>>,
-    mouse: Res<ButtonInput<MouseButton>>,
-    mut out: MessageWriter<OutgoingPacket>,
-    mut ui: ResMut<UiManager>,
-    mut commands: Commands,
-) {
-    if let Ok(cursor) = windows.single() {
-        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
-            return;
-        }
-    }
-
-    let Ok((el, act)) = targets.get(leave.event_target()) else {
-        return;
-    };
-    leave.propagate(false);
-
-    if act.action == CLIENT_CLOSE {
-        ui.hide(&mut commands, &el.ui_id);
-        return;
-    }
-
-    let data = build_action_data(act.data.as_deref(), &keyboard, &mouse);
-
-    if act.action.len() > UI_MAX_ACTION_LEN
-        || data.as_ref().is_some_and(|d| d.len() > UI_MAX_ACTION_LEN)
-    {
-        bevy_log::warn!("ui `{}`: action/data too long, not sent", el.ui_id);
-        return;
-    }
-
-    out.write(OutgoingPacket::reliable(ClientMessage::UiAction {
-        ui_id: el.ui_id.clone(),
-        element_id: el.element_id.clone(),
-        action: act.action.clone(),
-        data,
-    }));
 }

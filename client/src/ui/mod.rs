@@ -19,6 +19,9 @@ use exsolis_common::{ServerMessage, UI_MAX_ID_LEN, UI_MAX_OPEN};
 
 use crate::net::{GameplaySet, IncomingPacket, NetConnected};
 
+pub const LOOPBACK_UI_PREFIX: &str = "clientui:";
+
+pub mod client_ui;
 #[cfg(debug_assertions)]
 pub mod dev_reload;
 pub mod drag;
@@ -79,6 +82,18 @@ impl UiManager {
         info!("ui `{ui_id}` mounted");
     }
 
+    pub fn hide_remote(&mut self, commands: &mut Commands) {
+        let ids: Vec<String> = self
+            .roots
+            .keys()
+            .filter(|id| !id.starts_with(LOOPBACK_UI_PREFIX))
+            .cloned()
+            .collect();
+        for id in ids {
+            self.hide(commands, &id);
+        }
+    }
+
     pub fn hide(&mut self, commands: &mut Commands, ui_id: &str) {
         self.modal.remove(ui_id);
         if let Some(root) = self.roots.remove(ui_id) {
@@ -109,7 +124,9 @@ impl Plugin for UiPlugin {
                 ),
             )
             .add_plugins(render_bridge::UiRenderBridgePlugin)
-            .add_plugins(drag::UiDragPlugin);
+            .add_plugins(drag::UiDragPlugin)
+            .add_message::<events::LocalUiAction>()
+            .add_plugins(client_ui::ClientUiPlugin);
 
         // Debug-only local XML loader — see dev_reload.rs. Compiled out of
         // release builds entirely (not just inactive), so there's no risk
@@ -126,6 +143,9 @@ fn handle_ui_packets(
 ) {
     for IncomingPacket(msg) in incoming.read() {
         match msg {
+            // ServerMessage::UiShow { id, xml } if id.starts_with(LOOPBACK_UI_PREFIX) => {
+            //     warn!("Server wanted to change client-side only UI, using \"clientui:\" namespace");
+            // }
             ServerMessage::UiShow { id, xml } => ui.show(&mut commands, id, xml),
             ServerMessage::UiHide { id } => ui.hide(&mut commands, id),
             _ => {}
@@ -141,6 +161,6 @@ fn hide_on_disconnect(
     mut commands: Commands,
 ) {
     if connected.is_changed() && !connected.get() {
-        ui.hide_all(&mut commands);
+        ui.hide_remote(&mut commands);
     }
 }

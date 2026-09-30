@@ -8,12 +8,18 @@
 //! when player.rs and streaming.rs both drained Unreliable, one of them
 //! silently ate the other's packets (`YourPosition` vs `PlayerMoved`).
 
+use std::net::{SocketAddr, UdpSocket};
+use std::time::SystemTime;
+
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_log::{debug, warn};
-use bevy_renet::RenetClient;
+use bevy_renet::netcode::NetcodeClientTransport;
 use bevy_renet::renet::DefaultChannel;
-use exsolis_common::{ClientMessage, ServerMessage};
+use bevy_renet::{RenetClient, netcode::ClientAuthentication};
+use exsolis_common::{ClientMessage, SERVER_ADDR, ServerMessage};
+
+use crate::ui::LOOPBACK_UI_PREFIX;
 
 /// All inbound packets for this frame, after a single deserialize.
 /// Many systems may `MessageReader` this; each sees every packet.
@@ -102,6 +108,10 @@ fn drain_incoming(mut client: ResMut<RenetClient>, mut incoming: MessageWriter<I
                     } else {
                         debug!("incoming packet {:?}", msg);
                     }
+                    if is_spoofed_loopback(&msg) {
+                        warn!("server tried to use reserved clientui: id, dropping");
+                        continue;
+                    }
                     incoming.write(IncomingPacket(msg));
                 }
                 Err(_) => {
@@ -125,4 +135,40 @@ fn flush_outgoing(mut client: ResMut<RenetClient>, mut outgoing: MessageReader<O
             Err(e) => warn!("failed to serialize client packet: {e}"),
         }
     }
+}
+
+pub fn default_server_addr() -> SocketAddr {
+    std::env::var("EXSOLIS_SERVER_ADDR")
+        .unwrap_or_else(|_| SERVER_ADDR.to_string())
+        .parse()
+        .expect("bad EXSOLIS_SERVER_ADDR")
+}
+
+/// Fresh client + transport. Replaces any previous connection.
+pub fn start_connection(commands: &mut Commands, server_addr: SocketAddr) -> Result<(), String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    let auth = ClientAuthentication::Unsecure {
+        client_id: rand::random::<u64>(),
+        protocol_id: 1,
+        server_addr,
+        user_data: None,
+    };
+    let transport = NetcodeClientTransport::new(now, auth, socket).map_err(|e| e.to_string())?;
+    commands.insert_resource(RenetClient::new(crate::connection_config()));
+    commands.insert_resource(transport);
+    Ok(())
+}
+
+pub fn is_loopback_id(id: &str) -> bool {
+    id.starts_with(LOOPBACK_UI_PREFIX)
+}
+
+fn is_spoofed_loopback(msg: &ServerMessage) -> bool {
+    matches!(
+        msg,
+        ServerMessage::UiShow { id, .. } | ServerMessage::UiHide { id } if is_loopback_id(id)
+    )
 }

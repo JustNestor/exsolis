@@ -133,6 +133,7 @@ struct AtlasEntry {
 #[derive(Resource, Default)]
 struct GlyphAtlasRegistry {
     entries: HashMap<AssetId<Image>, AtlasEntry>,
+    dirty: HashSet<AssetId<Image>>,
 }
 
 /// Upload/refresh bindless copies of whichever `Image` assets this frame's
@@ -177,15 +178,17 @@ fn sync_glyph_atlases(
     // exhaustion, grep your local vulkano-taskgraph source under
     // descriptor_set/ for the actual removal API and wire it in — both
     // call sites below marked (*).
-    let removed_ids: Vec<AssetId<Image>> = events
-        .read()
-        .filter_map(|ev| match ev {
-            AssetEvent::Removed { id } | AssetEvent::Unused { id } => Some(*id),
-            _ => None,
-        })
-        .collect();
-    for id in removed_ids {
-        registry.entries.remove(&id); // (*) slot itself is intentionally leaked, not freed.
+    for ev in events.read() {
+        match ev {
+            AssetEvent::Removed { id } | AssetEvent::Unused { id } => {
+                registry.entries.remove(id); // slot leaked, as before
+                registry.dirty.remove(id);
+            }
+            AssetEvent::Modified { id } => {
+                registry.dirty.insert(*id);
+            }
+            _ => {}
+        }
     }
     // bevy_log::info!(
     //     "glyph sync: {} TextLayoutInfo, {} wanted atlases",
@@ -201,19 +204,17 @@ fn sync_glyph_atlases(
             continue;
         };
 
-        if let Some(existing) = registry.entries.get(&id) {
-            if existing.uploaded_len == data.len() {
-                continue; // Same handle, same size => assume unchanged (see below).
+        if registry.entries.contains_key(&id) {
+            if !registry.dirty.contains(&id) {
+                continue;
             }
-            // Atlas grew or was redrawn. (*) Old slot is intentionally
-            // left registered/leaked (see NOTE above) rather than freed;
-            // we just stop using it and register a new one below.
-            registry.entries.remove(&id);
+            registry.entries.remove(&id); // old slot leaked, new one registered below
         }
 
         let Some(entry) = upload_atlas_image(&vk, image, data) else {
             continue;
         };
+        registry.dirty.remove(&id);
         registry.entries.insert(id, entry);
     }
 }

@@ -208,6 +208,7 @@ fn setup_textures(
         .iter()
         .map(|p| (p.staging_id, HostAccessType::Write))
         .collect();
+    vk.resources.flight(vk.flight_id).wait(None).unwrap();
 
     unsafe {
         vulkano_taskgraph::execute(

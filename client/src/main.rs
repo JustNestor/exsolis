@@ -90,7 +90,6 @@ fn main() {
         // .add_plugins(bevy_winit::WinitPlugin::default())
         .add_plugins((RenetClientPlugin, NetcodeClientPlugin))
         .insert_resource(RenetClient::new(connection_config()))
-        .insert_resource(new_transport())
         .add_observer(log_netcode_error)
         .add_plugins(NetPlugin)
         .add_plugins(ui::UiPlugin)
@@ -103,29 +102,6 @@ fn main() {
             setup_vulkan.run_if(not(resource_exists::<VulkanContext>)),
         )
         .run();
-}
-
-fn new_transport() -> NetcodeClientTransport {
-    let server_addr: SocketAddr = std::env::var("EXSOLIS_SERVER_ADDR")
-        .unwrap_or_else(|_| SERVER_ADDR.to_string())
-        .parse()
-        .expect("bad EXSOLIS_SERVER_ADDR");
-    let socket = UdpSocket::bind("0.0.0.0:0").expect("failed to bind client socket");
-    let current_time = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap();
-
-    let client_id = rand::random::<u64>();
-
-    let authentication = ClientAuthentication::Unsecure {
-        client_id,
-        protocol_id: 1,
-        server_addr,
-        user_data: None,
-    };
-
-    NetcodeClientTransport::new(current_time, authentication, socket)
-        .expect("failed to start transport")
 }
 
 fn log_netcode_error(error: On<NetcodeErrorEvent>) {
