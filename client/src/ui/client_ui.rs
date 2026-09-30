@@ -1,8 +1,4 @@
-//! Client-owned screens (`clientui:*`), independent of any server.
-//!
-//! They are mounted by writing `IncomingPacket(UiShow)` locally (loopback),
-//! so they use the exact same parse/style/spawn path as server screens.
-//! Their clicks arrive as `LocalUiAction`, not as network packets.
+// src/ui/client_ui.rs
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
@@ -25,7 +21,6 @@ const MAIN_MENU_XML: &str = r##"
           bg="#2a5a9a" hover-bg="#3574c2" pressed-bg="#1c3f6e">Direct connect</button>
 </div>"##;
 
-// TODO: address input widget goes above the buttons.
 const DIRECT_MENU_XML: &str = r##"
 <div anchor="center" modal="true" layout="column" width="100%" height="100%"
      align="center" justify="center" gap="12" bg="#101418ee" font-size="20">
@@ -51,15 +46,19 @@ impl Plugin for ClientUiPlugin {
     }
 }
 
-fn mount(out: &mut MessageWriter<IncomingPacket>, xml: &str) {
+pub fn mount(out: &mut MessageWriter<IncomingPacket>, xml: &str) {
     out.write(IncomingPacket(ServerMessage::UiShow {
         id: MAIN_MENU.to_owned(),
         xml: xml.to_owned(),
     }));
 }
 
+pub fn mount_main_menu(out: &mut MessageWriter<IncomingPacket>) {
+    mount(out, MAIN_MENU_XML);
+}
+
 fn show_main_menu(mut out: MessageWriter<IncomingPacket>) {
-    mount(&mut out, MAIN_MENU_XML);
+    mount_main_menu(&mut out);
 }
 
 fn connect(commands: &mut Commands, out: &mut MessageWriter<IncomingPacket>) {
@@ -71,7 +70,7 @@ fn connect(commands: &mut Commands, out: &mut MessageWriter<IncomingPacket>) {
         }
         Err(e) => {
             warn!("connect failed: {e}");
-            mount(out, MAIN_MENU_XML);
+            mount_main_menu(out);
         }
     }
 }
@@ -85,19 +84,17 @@ fn handle_actions(
         match a.action.as_str() {
             "clientui:standard_server" | "clientui:connect" => connect(&mut commands, &mut out),
             "clientui:direct_connect" => mount(&mut out, DIRECT_MENU_XML),
-            "clientui:back" => mount(&mut out, MAIN_MENU_XML),
+            "clientui:back" => mount_main_menu(&mut out),
             other => warn!("unhandled client ui action `{other}`"),
         }
     }
 }
 
-/// Handshake failure or later disconnect: drop the dead transport and go
-/// back to the menu.
 fn menu_on_net_error(
     _: On<NetcodeErrorEvent>,
     mut commands: Commands,
     mut out: MessageWriter<IncomingPacket>,
 ) {
     commands.remove_resource::<NetcodeClientTransport>();
-    mount(&mut out, MAIN_MENU_XML);
+    mount_main_menu(&mut out);
 }

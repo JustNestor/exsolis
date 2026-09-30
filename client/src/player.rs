@@ -6,18 +6,17 @@ use bevy_app::prelude::*;
 use bevy_camera::{Camera, Camera2d, Viewport};
 use bevy_ecs::message::{MessageReader, MessageWriter};
 use bevy_ecs::prelude::*;
-use bevy_input::mouse::{MouseButton, MouseMotion};
+use bevy_input::mouse::MouseMotion;
 use bevy_input::{ButtonInput, keyboard::KeyCode};
 use bevy_log::info;
 use bevy_transform::prelude::Transform;
-use bevy_ui::{Interaction, IsDefaultUiCamera};
+use bevy_ui::IsDefaultUiCamera;
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
 use exsolis_common::{ClientMessage, SPAWN_POS, ServerMessage, TICK_RATE};
 use glam::{EulerRot, Quat, UVec2, Vec3};
 
 use crate::net::{GameplaySet, IncomingPacket, NetConnected, OutgoingPacket};
 use crate::streaming::RemotePlayer;
-use crate::ui::UiManager;
 
 #[derive(Component)]
 pub struct LocalPlayer;
@@ -77,7 +76,6 @@ impl Plugin for PlayerPlugin {
         app.add_systems(Startup, spawn_local_player).add_systems(
             Update,
             (
-                toggle_cursor_grab,
                 fly_camera_look,
                 send_movement_input,
                 sync_ui_layout_camera,
@@ -131,40 +129,6 @@ fn sync_ui_layout_camera(
                 physical_size: UVec2::new(w, h),
                 depth: 0.0..1.0,
             });
-        }
-    }
-}
-
-fn toggle_cursor_grab(
-    mouse: Res<ButtonInput<MouseButton>>,
-    keys: Res<ButtonInput<KeyCode>>,
-    ui_manager: Res<UiManager>,
-    ui_interactions: Query<&Interaction>,
-    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
-) {
-    let Ok(mut cursor) = windows.single_mut() else {
-        return;
-    };
-
-    if ui_manager.captures_input() {
-        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
-            cursor.grab_mode = CursorGrabMode::None;
-            cursor.visible = true;
-        }
-        return;
-    }
-
-    if keys.just_pressed(KeyCode::Escape) {
-        cursor.grab_mode = CursorGrabMode::None;
-        cursor.visible = true;
-    } else if mouse.just_pressed(MouseButton::Left) && cursor.grab_mode == CursorGrabMode::None {
-        let clicked_on_ui = ui_interactions
-            .iter()
-            .any(|interaction| *interaction != Interaction::None);
-
-        if !clicked_on_ui {
-            cursor.grab_mode = CursorGrabMode::Locked;
-            cursor.visible = false;
         }
     }
 }

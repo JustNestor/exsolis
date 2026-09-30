@@ -1,6 +1,4 @@
-//! Client-side block targeting: raycasts from the camera through loaded
-//! chunks to find what the player is aiming at, and sends
-//! `PlaceBlock`/`BreakBlock` requests on click or continuous press.
+// src/interaction.rs
 
 use bevy_app::prelude::*;
 use bevy_ecs::message::MessageWriter;
@@ -18,6 +16,7 @@ use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
 use crate::net::{GameplaySet, NetConnected, OutgoingPacket};
 use crate::player::{FlyCamera, LocalPlayer};
+use crate::ui::gameplay_input_allowed;
 
 const REACH: f32 = 8.0;
 const RAYCAST_STEP_LIMIT: i32 = 64;
@@ -70,10 +69,13 @@ impl Plugin for InteractionPlugin {
                 Update,
                 (
                     ensure_targeting_component,
-                    select_hotbar_by_number_input,
-                    update_targeting,
-                    handle_break_input,
-                    handle_place_input,
+                    (
+                        select_hotbar_by_number_input,
+                        update_targeting,
+                        handle_break_input,
+                        handle_place_input,
+                    )
+                        .run_if(gameplay_input_allowed),
                 )
                     .in_set(GameplaySet),
             );

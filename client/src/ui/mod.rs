@@ -1,20 +1,23 @@
-//! Server-driven UI.
-//!
-//! Server sends `UiShow { id, xml }` / `UiHide { id }`; the client parses
-//! the XML (`parse`), maps attributes to `bevy_ui` (`style`), spawns the
-//! entity tree (`spawn`) and reports clicks back as `UiAction` (`events`).
-//!
-//! Requires `crate::net::NetPlugin` to be added (uses `GameplaySet`).
-//! Input code (mouse look, movement) should check
-//! [`UiManager::captures_input`] and release the cursor while it is true.
-//!
-//! Reserved: action `client:close` closes the screen locally.
+// Server-driven UI.
+//
+// Server sends `UiShow { id, xml }` / `UiHide { id }`; the client parses
+// the XML (`parse`), maps attributes to `bevy_ui` (`style`), spawns the
+// entity tree (`spawn`) and reports clicks back as `UiAction` (`events`).
+//
+// Requires `crate::net::NetPlugin` to be added (uses `GameplaySet`).
+// Input code (mouse look, movement) should check
+// [`UiManager::captures_input`] and release the cursor while it is true.
+//
+// Reserved: action `client:close` closes the screen locally.
 
 use std::collections::{HashMap, HashSet};
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
+use bevy_input::{ButtonInput, keyboard::KeyCode, mouse::MouseButton};
 use bevy_log::{info, warn};
+use bevy_ui::Interaction;
+use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow};
 use exsolis_common::{ServerMessage, UI_MAX_ID_LEN, UI_MAX_OPEN};
 
 use crate::net::{GameplaySet, IncomingPacket, NetConnected};
@@ -52,6 +55,33 @@ impl UiManager {
     /// (camera, block break/place) should back off while this holds.
     pub fn captures_input(&self) -> bool {
         !self.modal.is_empty()
+    }
+
+    pub fn has_client_modal(&self) -> bool {
+        self.modal
+            .iter()
+            .any(|id| id.starts_with(LOOPBACK_UI_PREFIX))
+    }
+
+    pub fn has_remote_modal(&self) -> bool {
+        self.modal
+            .iter()
+            .any(|id| !id.starts_with(LOOPBACK_UI_PREFIX))
+    }
+
+    /// Closes every server-owned modal screen. Returns true if any was closed.
+    pub fn close_remote_modals(&mut self, commands: &mut Commands) -> bool {
+        let ids: Vec<String> = self
+            .modal
+            .iter()
+            .filter(|id| !id.starts_with(LOOPBACK_UI_PREFIX))
+            .cloned()
+            .collect();
+        let any = !ids.is_empty();
+        for id in ids {
+            self.hide(commands, &id);
+        }
+        any
     }
 
     /// Parse + mount (replacing any screen with the same id). On error the
@@ -110,6 +140,77 @@ impl UiManager {
     }
 }
 
+pub fn gameplay_input_allowed(
+    ui: Res<UiManager>,
+    windows: Query<&CursorOptions, With<PrimaryWindow>>,
+    mut prev_ok: Local<bool>,
+) -> bool {
+    let grabbed = windows
+        .single()
+        .map(|c| c.grab_mode != CursorGrabMode::None)
+        .unwrap_or(false);
+    let ok_now = grabbed && !ui.captures_input();
+    let allowed = ok_now && *prev_ok;
+    *prev_ok = ok_now;
+    allowed
+}
+
+fn grab(c: &mut CursorOptions) {
+    c.grab_mode = CursorGrabMode::Locked;
+    c.visible = false;
+}
+
+fn release(c: &mut CursorOptions) {
+    c.grab_mode = CursorGrabMode::None;
+    c.visible = true;
+}
+
+/// Owns Esc handling and cursor grab state (replaces `toggle_cursor_grab`).
+fn escape_and_cursor(
+    keys: Res<ButtonInput<KeyCode>>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    ui_interactions: Query<&Interaction>,
+    mut windows: Query<&mut CursorOptions, With<PrimaryWindow>>,
+    mut ui: ResMut<UiManager>,
+    mut commands: Commands,
+    mut out: MessageWriter<IncomingPacket>,
+    mut had_modal: Local<bool>,
+) {
+    let Ok(mut cursor) = windows.single_mut() else {
+        return;
+    };
+    let mut closed_by_esc = false;
+
+    if keys.just_pressed(KeyCode::Escape) {
+        if ui.has_client_modal() {
+            client_ui::mount_main_menu(&mut out);
+        } else if ui.has_remote_modal() {
+            ui.close_remote_modals(&mut commands);
+            release(&mut cursor);
+            closed_by_esc = true;
+        } else if cursor.grab_mode != CursorGrabMode::None {
+            release(&mut cursor);
+        } else {
+            grab(&mut cursor);
+        }
+    }
+
+    let modal = ui.captures_input();
+    if modal {
+        if cursor.grab_mode != CursorGrabMode::None || !cursor.visible {
+            release(&mut cursor);
+        }
+    } else if *had_modal && !closed_by_esc {
+        grab(&mut cursor);
+    } else if mouse.just_pressed(MouseButton::Left)
+        && cursor.grab_mode == CursorGrabMode::None
+        && !ui_interactions.iter().any(|i| *i != Interaction::None)
+    {
+        grab(&mut cursor);
+    }
+    *had_modal = modal;
+}
+
 pub struct UiPlugin;
 
 impl Plugin for UiPlugin {
@@ -119,6 +220,9 @@ impl Plugin for UiPlugin {
                 Update,
                 (
                     handle_ui_packets.in_set(GameplaySet),
+                    escape_and_cursor
+                        .in_set(GameplaySet)
+                        .before(handle_ui_packets),
                     hide_on_disconnect,
                     events::update_hover_styles,
                 ),
@@ -128,9 +232,6 @@ impl Plugin for UiPlugin {
             .add_message::<events::LocalUiAction>()
             .add_plugins(client_ui::ClientUiPlugin);
 
-        // Debug-only local XML loader — see dev_reload.rs. Compiled out of
-        // release builds entirely (not just inactive), so there's no risk
-        // of it shipping or of assets/xml/ being expected at runtime.
         #[cfg(debug_assertions)]
         app.add_plugins(dev_reload::UiDevReloadPlugin);
     }
@@ -143,9 +244,6 @@ fn handle_ui_packets(
 ) {
     for IncomingPacket(msg) in incoming.read() {
         match msg {
-            // ServerMessage::UiShow { id, xml } if id.starts_with(LOOPBACK_UI_PREFIX) => {
-            //     warn!("Server wanted to change client-side only UI, using \"clientui:\" namespace");
-            // }
             ServerMessage::UiShow { id, xml } => ui.show(&mut commands, id, xml),
             ServerMessage::UiHide { id } => ui.hide(&mut commands, id),
             _ => {}
@@ -153,8 +251,6 @@ fn handle_ui_packets(
     }
 }
 
-/// Screens are server state: when the connection drops they must not linger
-/// (a stale modal would also keep the cursor captured forever).
 fn hide_on_disconnect(
     connected: Res<NetConnected>,
     mut ui: ResMut<UiManager>,
