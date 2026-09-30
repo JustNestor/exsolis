@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client"]
+members = ["common", "server", "client", "crates/fastpak"]
 resolver = "2"
 
 [workspace.dependencies]
@@ -65,6 +65,7 @@ mimalloc = "0.1.52"
 bevy_picking ="0.19"
 naga = {version="30.0.1", features = ["spv-out", "wgsl-in"]}
 zrip = "0.8.11"
+fastpack = {path = "./crates/fastpak"}
 
 
 # [workspace.dependencies.bevy_mod_scripting]

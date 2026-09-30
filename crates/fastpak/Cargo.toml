@@ -1,0 +1,16 @@
+[package]
+name = "fastpak"
+version = "0.1.0"
+edition = "2021"
+description = "Fast memory-mapped asset archive (.pak) with O(1) lookup, extension-grouped layout and zstd compression"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+zrip = "0.8"
+memmap2 = "0.9"
+zerocopy = { version = "0.8", features = ["derive"] }
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
