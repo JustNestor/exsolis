@@ -10,14 +10,11 @@ struct FrameData {
     view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
     model_view_projection: mat4x4<f32>,
-    camera_right: vec3<f32>,
-    _padding4: f32,
-    camera_up: vec3<f32>,
-    _padding5: f32,
 }
 
 struct FlyAction {
     strength: f32,
+    position: vec3<f32>,
 }
 
 struct Particle {
@@ -38,7 +35,7 @@ fn spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let angle = f32(index) * 2.39996323;
     let ring = 0.18 + f32(index % 11u) * 0.035;
-    let origin = frame.model[3].xyz + vec3<f32>(0.0, 0.06, 0.0);
+    let origin = action.position + vec3<f32>(0.0, 0.06, 0.0);
     var particle = particles[index];
     particle.position_age = vec4<f32>(
         origin + vec3<f32>(cos(angle) * ring, 0.0, sin(angle) * ring),
@@ -83,6 +80,8 @@ fn simulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     particles[index] = particle;
 }
 
+const PARTICLE_SIZE: f32 = 0.035;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) life: f32,
@@ -100,19 +99,28 @@ fn vs_main(
     );
     let particle = particles[instance_index];
     let life = particle.position_age.w;
-    let corner = corners[vertex_index];
-    let world_position = particle.position_age.xyz
-        + frame.camera_right * corner.x * 0.035
-        + frame.camera_up * corner.y * 0.035;
+    let corner = corners[vertex_index % 6u];
     var out: VertexOutput;
     if (life < 0.0) {
         out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
         out.life = 0.0;
         out.local_corner = vec2<f32>(2.0, 2.0);
     } else {
+        // Camera-facing billboard. Recover the camera basis from the rows of
+        // view_projection (column-major: vp[col][row]):
+        //   row 0 = P00 * right      (clip.x depends only on view x)
+        //   row 3 = forward          (clip.w = distance along forward)
+        // up = right x forward  (right-handed). Rows 0 and 3 are unaffected
+        // by the NDC Y convention, so this holds whether or not Y is flipped.
+        let vp = frame.view_projection;
+        let right = normalize(vec3<f32>(vp[0][0], vp[1][0], vp[2][0]));
+        let forward = normalize(vec3<f32>(vp[0][3], vp[1][3], vp[2][3]));
+        let up = cross(right, forward);
+        let world_position = particle.position_age.xyz
+            + (right * corner.x + up * corner.y) * PARTICLE_SIZE;
         out.clip_position = frame.view_projection * vec4<f32>(world_position, 1.0);
         out.life = clamp(1.0 - life / particle.velocity_lifetime.w, 0.0, 1.0);
-        out.local_corner = corners[vertex_index];
+        out.local_corner = corner;
     }
     return out;
 }

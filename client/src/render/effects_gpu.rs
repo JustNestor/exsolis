@@ -25,7 +25,9 @@ use vulkano::{
         compute::ComputePipelineCreateInfo,
         graphics::{
             GraphicsPipelineCreateInfo,
-            color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState},
+            color_blend::{
+                AttachmentBlend, BlendFactor, ColorBlendAttachmentState, ColorBlendState,
+            },
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
@@ -259,7 +261,14 @@ impl EffectGpuState {
                     let blend = match pass.blend.unwrap() {
                         BlendMode::Opaque => None,
                         BlendMode::Alpha => Some(AttachmentBlend::alpha()),
-                        BlendMode::Additive => Some(AttachmentBlend::additive()),
+                        // `AttachmentBlend::additive()` is One/One, which ignores the
+                        // fragment's alpha: every quad would add its full colour as a
+                        // hard square. Weight by alpha so soft edges and fade-out work.
+                        BlendMode::Additive => Some(AttachmentBlend {
+                            src_color_blend_factor: BlendFactor::SrcAlpha,
+                            dst_color_blend_factor: BlendFactor::One,
+                            ..AttachmentBlend::additive()
+                        }),
                     };
                     let depth = match pass.depth.unwrap() {
                         DepthMode::Disabled => DepthStencilState::default(),
@@ -501,7 +510,9 @@ impl EffectGpuState {
         frame_bytes: &[u8],
         transient: &mut u64,
     ) -> TaskResult {
-        let payload_size = payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64;
+        // WGSL rounds struct size up to its alignment (16 with a vec3 member);
+        // binding a smaller range than the declared struct is invalid.
+        let payload_size = align_up(payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64, 16);
         let action_offset = align_up(*transient, self.storage_alignment);
         let frame_offset = align_up(action_offset + payload_size, self.storage_alignment);
         let end = frame_offset + FRAME_BYTES as u64;
@@ -606,7 +617,9 @@ impl EffectGpuState {
             let model = state.model;
             let buffers = instance.buffers.clone();
             let pass = &effect.passes[pass_index];
-            let payload_size = payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64;
+            // Round up to the WGSL struct size (see `dispatch`).
+            let payload_size =
+                align_up(payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64, 16);
             let action_offset = align_up(self.graphics_cursor, self.storage_alignment);
             let frame_offset = align_up(action_offset + payload_size, self.storage_alignment);
             let end = frame_offset + FRAME_BYTES as u64;
@@ -877,6 +890,21 @@ fn load_entry(
     })
 }
 
+/// View-projection as effect shaders expect it: standard WebGPU convention
+/// (Y up in NDC).
+///
+/// `FlyCamera::view_projection` bakes a Y flip into the projection because
+/// the hand-written chunk shaders output Vulkan clip space directly. Effect
+/// shaders are WGSL, and naga's SPIR-V writer (default
+/// `ADJUST_COORDINATE_SPACE`) negates `@builtin(position).y` on output.
+/// Handing mods the Vulkan-flipped matrix therefore flips them twice, which
+/// mirrors every effect vertically about the screen centre: it only lines up
+/// with the world when the effect is at the vertical centre of the view.
+/// Undo the engine's flip here so mod authors can use plain WebGPU maths.
+fn webgpu_view_proj(frame: &FrameData) -> glam::Mat4 {
+    glam::Mat4::from_scale(glam::Vec3::new(1.0, -1.0, 1.0)) * frame.view_proj
+}
+
 fn build_frame_bytes(
     frame: &FrameData,
     inputs: &[FrameInput],
@@ -884,12 +912,13 @@ fn build_frame_bytes(
 ) -> Vec<u8> {
     let mut bytes = vec![0; FRAME_BYTES];
     let has = |input| inputs.contains(&input);
+    let view_proj = webgpu_view_proj(frame);
     // Identity (not an all-zero matrix) when no model is bound.
     if has(FrameInput::Model) {
         write_mat4(&mut bytes, 112, glam::Mat4::IDENTITY);
     }
     if has(FrameInput::ModelViewProjection) {
-        write_mat4(&mut bytes, 176, frame.view_proj);
+        write_mat4(&mut bytes, 176, view_proj);
     }
     if has(FrameInput::FrameIndex) {
         write_u32(&mut bytes, 0, frame.frame_index as u32);
@@ -910,14 +939,14 @@ fn build_frame_bytes(
         write_f32(&mut bytes, 40, frame.camera_position.z);
     }
     if has(FrameInput::ViewProjection) {
-        write_mat4(&mut bytes, 48, frame.view_proj);
+        write_mat4(&mut bytes, 48, view_proj);
     }
     if let Some(model) = model {
         if has(FrameInput::Model) {
             write_mat4(&mut bytes, 112, model);
         }
         if has(FrameInput::ModelViewProjection) {
-            write_mat4(&mut bytes, 176, frame.view_proj * model);
+            write_mat4(&mut bytes, 176, view_proj * model);
         }
     }
     bytes
