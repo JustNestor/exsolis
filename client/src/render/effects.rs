@@ -52,6 +52,8 @@ pub enum FrameInput {
     DeltaTime,
     Viewport,
     CameraPosition,
+    CameraRight,
+    CameraUp,
     ViewProjection,
     Model,
     ModelViewProjection,

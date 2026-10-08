@@ -1,7 +1,7 @@
 {
   "format_version": 1,
   "id": "example:fly",
-  "frame_inputs": ["frame_index", "time", "delta_time", "viewport", "view_projection", "model"],
+  "frame_inputs": ["frame_index", "time", "delta_time", "viewport", "view_projection", "model", "camera_right", "camera_up"],
   "actions": [
     {
       "id": "example:player_fly",

@@ -7,11 +7,11 @@ api.on("player_join", function(_ev)
     })
 end)
 
-api.on("break_block", function(ev)
-    -- if ev.id == "example:fly" and ev.pressed then
+api.on("keybind", function(ev)
+    if ev.id == "example:fly" and ev.pressed then
         api.broadcast_action("example:player_fly", {
             player_id = ev.player_id,
             strength = 1.0,
         })
-    -- end
+    end
 end)

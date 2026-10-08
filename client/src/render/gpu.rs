@@ -80,6 +80,8 @@ pub(super) struct FrameData {
     pub delta_seconds: f32,
     pub view_proj: Mat4,
     pub camera_position: Vec3,
+    pub camera_right: Vec3,
+    pub camera_up: Vec3,
     pub viewport: vulkano::pipeline::graphics::viewport::Viewport,
     /// Bindless sampler used to read every block texture. Same sampler for
     /// all chunks; per-texture state lives in the image, not here.
@@ -630,6 +632,12 @@ pub(super) fn render_frame(
         camera_position: camera_transform
             .map(|transform| transform.translation)
             .unwrap_or(Vec3::ZERO),
+        camera_right: camera_transform
+            .map(|transform| transform.rotation * Vec3::X)
+            .unwrap_or(Vec3::X),
+        camera_up: camera_transform
+            .map(|transform| transform.rotation * Vec3::Y)
+            .unwrap_or(Vec3::Y),
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
         avatar_models,

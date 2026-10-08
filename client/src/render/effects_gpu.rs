@@ -53,7 +53,7 @@ use super::{effects::*, gpu::FrameData};
 
 pub(super) const EFFECT_ARENA_BYTES: u64 = 16 * 1024 * 1024;
 const TRANSIENT_BYTES: u64 = 4 * 1024 * 1024;
-const FRAME_BYTES: usize = 240;
+const FRAME_BYTES: usize = 272;
 const MIN_DESCRIPTOR_RANGE: u64 = 4;
 
 #[derive(Clone, Copy)]
@@ -768,6 +768,16 @@ fn build_frame_bytes(frame: &FrameData, inputs: &[FrameInput], player_id: Option
         write_f32(&mut bytes, 32, frame.camera_position.x);
         write_f32(&mut bytes, 36, frame.camera_position.y);
         write_f32(&mut bytes, 40, frame.camera_position.z);
+    }
+    if has(FrameInput::CameraRight) {
+        write_f32(&mut bytes, 240, frame.camera_right.x);
+        write_f32(&mut bytes, 244, frame.camera_right.y);
+        write_f32(&mut bytes, 248, frame.camera_right.z);
+    }
+    if has(FrameInput::CameraUp) {
+        write_f32(&mut bytes, 256, frame.camera_up.x);
+        write_f32(&mut bytes, 260, frame.camera_up.y);
+        write_f32(&mut bytes, 264, frame.camera_up.z);
     }
     if has(FrameInput::ViewProjection) {
         write_mat4(&mut bytes, 48, frame.view_proj);
