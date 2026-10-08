@@ -6,16 +6,17 @@ clients route that action to a shader package and run it locally.
 
 ## Server API
 
-The server Lua API exposes a broadcast helper:
+The server Lua API exposes a broadcast helper. Keybind event tables contain
+`player_id`, `id`, `pressed`, and the current server position as
+`position = { x, y, z }`:
 
 ```lua
 api.on("keybind", function(ev)
     if ev.id == "example:fly" and ev.pressed then
-        local position = api.get_player_pos(ev.player_id)
-        if not position then return end
+        if not ev.position then return end
         api.broadcast_action("example:player_fly", {
             player_id = ev.player_id,
-            position = position,
+            position = ev.position,
             strength = 1.0,
         })
     end
@@ -33,6 +34,9 @@ represent every `u64`.
 Key registration remains independent: a mod registers the keybind, and its
 server-side `keybind` or `on_tick` handler decides whether to broadcast an
 action. Actions need not be tied to a built-in game event.
+`api.get_player_pos` remains a scoped pull helper for `api.on_tick`; event
+handlers should use their event data instead of retaining a world-read
+callback beyond that tick scope.
 
 ## Client package direction
 
@@ -48,12 +52,14 @@ position, and view-projection matrix. Actions that identify an entity can
 also request its model transform; the engine supplies model and model-view-
 projection matrices rather than asking each mod to reconstruct them.
 
-Compute passes can run for incoming actions and/or each frame. Each action is
-packed into a temporary GPU storage range and dispatched immediately; the
-shader can update package-owned persistent buffers. Graphics passes consume
-those buffers. The temporary payload range and persistent simulation state
-have separate lifetimes, so discarding the action input cannot erase live
-particles.
+Compute passes can run for incoming actions and/or each frame. Each incoming
+action creates an independent effect instance with its own copy of every
+declared buffer, its payload, and a snapshot of its requested player transform.
+Compute and graphics passes use that instance's buffers, so repeated actions
+and actions from different players can overlap without overwriting each other.
+The manifest's `max_instances` bounds the pool (default 8, maximum 64), and
+`instance_lifetime_seconds` controls when a slot becomes reusable (default 3
+seconds). If the pool is full, the oldest instance is reused.
 
 Manifest buffers are package-owned storage allocations. The renderer places
 them in a bounded arena and binds them to shader group 1 in declaration
@@ -80,12 +86,15 @@ can include this `example:fly` manifest and the referenced WGSL files:
 {
   "format_version": 1,
   "id": "example:fly",
+  "max_instances": 16,
+  "instance_lifetime_seconds": 1.25,
   "frame_inputs": ["time", "delta_time", "view_projection", "model"],
   "actions": [{
     "id": "example:player_fly",
     "compute_pass": "spawn",
     "fields": [
-      { "name": "strength", "source": "strength", "type": "f32" }
+      { "name": "strength", "source": "strength", "type": "f32" },
+      { "name": "position", "source": "position", "type": "vec3" }
     ],
     "model_player_id": "player_id"
   }],
@@ -117,7 +126,7 @@ can include this `example:fly` manifest and the referenced WGSL files:
       "phase": "world_transparent",
       "blend": "additive",
       "depth": "test",
-      "vertex_count": 6,
+      "vertex_count": 12,
       "instance_count": 8192,
       "reads": ["particles"],
       "after": ["simulate"]
@@ -129,15 +138,23 @@ can include this `example:fly` manifest and the referenced WGSL files:
 ```
 
 `model_player_id` is a decimal string in the payload because JSON numbers
-cannot safely represent every player ID. Payload fields use an explicit type
-set (`i32`, `u32`, `f32`, vectors, and `mat4`); the client packs them with
-WGSL storage-layout alignment and rejects missing or out-of-range values.
+cannot safely represent every player ID. For event positions that must match
+across clients, include the server's world position in the payload and bind it
+as a `vec3`; client-side model transforms are interpolated snapshots and can
+differ slightly between observers. Payload fields use an explicit type set
+(`i32`, `u32`, `f32`, vectors, and `mat4`); the client packs them with WGSL
+storage-layout alignment and rejects missing or out-of-range values.
 Manifest and resource sizes are bounded by the client. Version 1 can declare
 frame inputs for frame index, time, delta time, viewport, camera position,
 view-projection, model, and model-view-projection matrices. The renderer now
 collects frame timing, camera position, player model transforms, and queued
 actions into its per-frame data. The join handshake includes the receiving
 player’s ID so model transforms can include both remote and local players.
+
+Each instance receives the full declared buffer set. Its buffers are
+initialized when the instance starts; persistent buffers then keep their
+simulation state until that instance expires. Non-persistent buffers are
+cleared before each active frame's compute passes.
 
 The GPU ABI is now available at descriptor set `@group(1)`: binding 0 is the
 packed action struct, binding 1 is the engine `FrameData` struct, and bindings
@@ -151,11 +168,10 @@ manifest fields in order and type.
 
 Graphics passes use procedural vertices (`vertex_index`) and manifest draw
 counts. The executor runs compute nodes before world graphics in the Vulkano
-graph, then runs graphics passes in their phase. Package buffers share a
+graph, then runs graphics passes in their phase. Per-instance buffers share a
 16 MiB client arena with descriptor offsets aligned to the device's storage
-buffer alignment. Persistent buffers are initialized once; transient buffers
-are cleared each frame. Updated WGSL or manifests rebuild the package set
-after the active frame completes.
+buffer alignment. Updated WGSL or manifests rebuild the package set after the
+active frame completes.
 
 The fly mod is installed and runnable in this checkout at
 [`mods/fly`](/home/nestor/prj/exsolis/mods/fly). Its source package is in

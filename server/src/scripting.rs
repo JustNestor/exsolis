@@ -853,6 +853,7 @@ pub struct KeybindActionRequested {
 
 fn forward_keybind_action(
     mut events: MessageReader<KeybindActionRequested>,
+    positions: Query<(&Player, &PlayerPosition)>,
     runtime: NonSend<ScriptRuntime>,
 ) {
     for ev in events.read() {
@@ -862,6 +863,16 @@ fn forward_keybind_action(
         let _ = t.set("player_id", player_id_to_lua(ev.player_id));
         let _ = t.set("id", ev.id.as_str());
         let _ = t.set("pressed", matches!(ev.state, KeybindState::Pressed));
+        if let Some((_, position)) = positions
+            .iter()
+            .find(|(player, _)| player.0 == ev.player_id)
+            && let Ok(position_table) = runtime.lua.create_table()
+        {
+            let _ = position_table.set("x", position.0.x);
+            let _ = position_table.set("y", position.0.y);
+            let _ = position_table.set("z", position.0.z);
+            let _ = t.set("position", position_table);
+        }
         runtime.dispatch("keybind", t);
     }
 }

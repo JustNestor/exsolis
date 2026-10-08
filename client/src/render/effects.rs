@@ -32,6 +32,13 @@ pub struct ModActionEvent {
 pub struct EffectManifest {
     pub format_version: u32,
     pub id: String,
+    /// Number of independent in-flight action instances this effect can hold.
+    /// When full, the oldest active instance is reused.
+    #[serde(default = "default_max_instances")]
+    pub max_instances: u32,
+    /// Instances become reusable after this many seconds.
+    #[serde(default = "default_instance_lifetime_seconds")]
+    pub instance_lifetime_seconds: f32,
     #[serde(default)]
     pub frame_inputs: Vec<FrameInput>,
     #[serde(default)]
@@ -44,6 +51,14 @@ pub struct EffectManifest {
     pub images: Vec<ImageDecl>,
 }
 
+fn default_max_instances() -> u32 {
+    8
+}
+
+fn default_instance_lifetime_seconds() -> f32 {
+    3.0
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameInput {
@@ -52,8 +67,6 @@ pub enum FrameInput {
     DeltaTime,
     Viewport,
     CameraPosition,
-    CameraRight,
-    CameraUp,
     ViewProjection,
     Model,
     ModelViewProjection,
@@ -231,6 +244,14 @@ fn validate_manifest(manifest: &EffectManifest) -> Result<(), String> {
     }
     if !is_valid_mod_action_id(&manifest.id) {
         return Err(format!("invalid effect id '{}'", manifest.id));
+    }
+    if !(1..=64).contains(&manifest.max_instances) {
+        return Err("effect max_instances must be between 1 and 64".into());
+    }
+    if !manifest.instance_lifetime_seconds.is_finite()
+        || !(0.05..=120.0).contains(&manifest.instance_lifetime_seconds)
+    {
+        return Err("effect instance_lifetime_seconds must be between 0.05 and 120".into());
     }
     if manifest.frame_inputs.len() > 16
         || manifest.actions.len() > 64

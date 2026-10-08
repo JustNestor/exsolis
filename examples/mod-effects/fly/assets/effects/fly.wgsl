@@ -10,14 +10,11 @@ struct FrameData {
     view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
     model_view_projection: mat4x4<f32>,
-    camera_right: vec3<f32>,
-    _padding4: f32,
-    camera_up: vec3<f32>,
-    _padding5: f32,
 }
 
 struct FlyAction {
     strength: f32,
+    position: vec3<f32>,
 }
 
 struct Particle {
@@ -38,7 +35,7 @@ fn spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let angle = f32(index) * 2.39996323;
     let ring = 0.18 + f32(index % 11u) * 0.035;
-    let origin = frame.model[3].xyz + vec3<f32>(0.0, 0.06, 0.0);
+    let origin = action.position + vec3<f32>(0.0, 0.06, 0.0);
     var particle = particles[index];
     particle.position_age = vec4<f32>(
         origin + vec3<f32>(cos(angle) * ring, 0.0, sin(angle) * ring),
@@ -100,10 +97,13 @@ fn vs_main(
     );
     let particle = particles[instance_index];
     let life = particle.position_age.w;
-    let corner = corners[vertex_index];
-    let world_position = particle.position_age.xyz
-        + frame.camera_right * corner.x * 0.035
-        + frame.camera_up * corner.y * 0.035;
+    let corner = corners[vertex_index % 6u];
+    let plane_offset = select(
+        vec3<f32>(corner.x, corner.y, 0.0),
+        vec3<f32>(0.0, corner.y, corner.x),
+        vertex_index >= 6u
+    ) * 0.035;
+    let world_position = particle.position_age.xyz + plane_offset;
     var out: VertexOutput;
     if (life < 0.0) {
         out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
@@ -112,7 +112,7 @@ fn vs_main(
     } else {
         out.clip_position = frame.view_projection * vec4<f32>(world_position, 1.0);
         out.life = clamp(1.0 - life / particle.velocity_lifetime.w, 0.0, 1.0);
-        out.local_corner = corners[vertex_index];
+        out.local_corner = corner;
     }
     return out;
 }

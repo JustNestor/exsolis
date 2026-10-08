@@ -1,13 +1,16 @@
 {
   "format_version": 1,
   "id": "example:fly",
-  "frame_inputs": ["frame_index", "time", "delta_time", "viewport", "view_projection", "model", "camera_right", "camera_up"],
+  "max_instances": 16,
+  "instance_lifetime_seconds": 1.25,
+  "frame_inputs": ["frame_index", "time", "delta_time", "viewport", "view_projection", "model"],
   "actions": [
     {
       "id": "example:player_fly",
       "compute_pass": "spawn",
       "fields": [
-        { "name": "strength", "source": "strength", "type": "f32" }
+        { "name": "strength", "source": "strength", "type": "f32" },
+        { "name": "position", "source": "position", "type": "vec3" }
       ],
       "model_player_id": "player_id"
     }
@@ -40,7 +43,7 @@
       "phase": "world_transparent",
       "blend": "additive",
       "depth": "test",
-      "vertex_count": 6,
+      "vertex_count": 12,
       "instance_count": 8192,
       "reads": ["particles"],
       "after": ["simulate"]

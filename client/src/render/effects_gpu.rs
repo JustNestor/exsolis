@@ -53,7 +53,7 @@ use super::{effects::*, gpu::FrameData};
 
 pub(super) const EFFECT_ARENA_BYTES: u64 = 16 * 1024 * 1024;
 const TRANSIENT_BYTES: u64 = 4 * 1024 * 1024;
-const FRAME_BYTES: usize = 272;
+const FRAME_BYTES: usize = 240;
 const MIN_DESCRIPTOR_RANGE: u64 = 4;
 
 #[derive(Clone, Copy)]
@@ -82,8 +82,21 @@ pub(super) struct PreparedPass {
 
 pub(super) struct PreparedEffect {
     pub manifest: EffectManifest,
-    pub buffers: Vec<BufferRange>,
+    instances: Vec<EffectInstance>,
     pub passes: Vec<PreparedPass>,
+}
+
+struct EffectInstance {
+    buffers: Vec<BufferRange>,
+    state: Option<EffectInstanceState>,
+}
+
+#[derive(Clone)]
+struct EffectInstanceState {
+    payload: Vec<u8>,
+    model: Option<glam::Mat4>,
+    expires_at: f32,
+    started_at: f32,
 }
 
 pub(super) struct EffectGpuState {
@@ -95,7 +108,6 @@ pub(super) struct EffectGpuState {
     descriptor_allocator: Arc<StandardDescriptorSetAllocator>,
     subpass: Subpass,
     pub effects: HashMap<String, PreparedEffect>,
-    latest_actions: HashMap<String, ModActionEvent>,
     initialized_effects: HashSet<String>,
     rejected_effects: HashSet<String>,
     graphics_frame: Option<u64>,
@@ -116,7 +128,6 @@ impl EffectGpuState {
             )),
             subpass,
             effects: HashMap::new(),
-            latest_actions: HashMap::new(),
             initialized_effects: HashSet::new(),
             rejected_effects: HashSet::new(),
             graphics_frame: None,
@@ -127,7 +138,6 @@ impl EffectGpuState {
     pub fn reset(&mut self) {
         self.persistent_end = 0;
         self.effects.clear();
-        self.latest_actions.clear();
         self.initialized_effects.clear();
         self.rejected_effects.clear();
         self.graphics_frame = None;
@@ -163,24 +173,32 @@ impl EffectGpuState {
             return Err("manifest images are not supported by the current GPU executor".into());
         }
         let mut cursor = align_up(self.persistent_end, self.storage_alignment);
-        let mut buffers = Vec::with_capacity(manifest.buffers.len());
-        for buffer in &manifest.buffers {
-            cursor = align_up(cursor, self.storage_alignment);
-            let size = u64::from(buffer.bytes);
-            let end = cursor
-                .checked_add(size)
-                .ok_or_else(|| "effect arena allocation overflow".to_string())?;
-            if end > self.capacity.saturating_sub(TRANSIENT_BYTES) {
-                return Err("effect GPU arena is full".into());
+        let mut instances = Vec::with_capacity(manifest.max_instances as usize);
+        for _ in 0..manifest.max_instances {
+            let mut buffers = Vec::with_capacity(manifest.buffers.len());
+            for buffer in &manifest.buffers {
+                cursor = align_up(cursor, self.storage_alignment);
+                let size = u64::from(buffer.bytes);
+                let end = cursor
+                    .checked_add(size)
+                    .ok_or_else(|| "effect arena allocation overflow".to_string())?;
+                if end > self.capacity.saturating_sub(TRANSIENT_BYTES) {
+                    return Err("effect GPU arena is full".into());
+                }
+                buffers.push(BufferRange {
+                    offset: cursor,
+                    size,
+                    persistent: buffer.persistent,
+                });
+                cursor = end;
             }
-            buffers.push(BufferRange {
-                offset: cursor,
-                size,
-                persistent: buffer.persistent,
+            instances.push(EffectInstance {
+                buffers,
+                state: None,
             });
-            cursor = end;
         }
-        let descriptor_layout = create_effect_descriptor_layout(&vk.device, buffers.len())?;
+        let descriptor_layout =
+            create_effect_descriptor_layout(&vk.device, manifest.buffers.len())?;
         let mut passes = Vec::with_capacity(manifest.passes.len());
         for pass in &manifest.passes {
             let prepared = match pass.kind {
@@ -300,7 +318,7 @@ impl EffectGpuState {
         self.persistent_end = cursor;
         Ok(PreparedEffect {
             manifest: manifest.clone(),
-            buffers,
+            instances,
             passes,
         })
     }
@@ -313,49 +331,116 @@ impl EffectGpuState {
     ) -> TaskResult {
         let transient_start = align_up(self.persistent_end, self.storage_alignment);
         let mut transient = transient_start;
-        let packages: Vec<_> = self.effects.values().collect();
-        for effect in &packages {
-            if !self.initialized_effects.contains(&effect.manifest.id) {
-                for buffer in &effect.buffers {
-                    let bytes = tcx.try_write_buffer::<[u8]>(
-                        self.arena_id,
-                        buffer.offset..buffer.offset + buffer.size,
-                    )?;
-                    bytes.fill(0);
+        for effect in self.effects.values_mut() {
+            for instance in &mut effect.instances {
+                if instance
+                    .state
+                    .as_ref()
+                    .is_some_and(|state| state.expires_at <= frame.time_seconds)
+                {
+                    instance.state = None;
                 }
-                self.initialized_effects.insert(effect.manifest.id.clone());
-            } else {
-                for buffer in &effect.buffers {
-                    if !buffer.persistent {
-                        let bytes = tcx.try_write_buffer::<[u8]>(
+            }
+        }
+
+        let mut initialized = Vec::new();
+        for effect in self.effects.values() {
+            if self.initialized_effects.contains(&effect.manifest.id) {
+                continue;
+            }
+            for buffer in effect.instances.iter().flat_map(|slot| &slot.buffers) {
+                tcx.try_write_buffer::<[u8]>(
+                    self.arena_id,
+                    buffer.offset..buffer.offset + buffer.size,
+                )?
+                .fill(0);
+            }
+            initialized.push(effect.manifest.id.clone());
+        }
+        self.initialized_effects.extend(initialized);
+
+        for effect in self.effects.values() {
+            if self.initialized_effects.contains(&effect.manifest.id) {
+                for instance in &effect.instances {
+                    if instance.state.is_none() {
+                        continue;
+                    }
+                    for buffer in instance.buffers.iter().filter(|buffer| !buffer.persistent) {
+                        tcx.try_write_buffer::<[u8]>(
                             self.arena_id,
                             buffer.offset..buffer.offset + buffer.size,
-                        )?;
-                        bytes.fill(0);
+                        )?
+                        .fill(0);
                     }
                 }
             }
         }
 
         for event in &frame.mod_actions {
-            let Some(effect) = self.effects.get(&event.effect_id) else {
+            let model = event
+                .model_player_id
+                .and_then(|id| frame.model_transforms.get(&id).copied());
+            if event.model_player_id.is_some() && model.is_none() {
+                warn!(
+                    "effect '{}' action '{}': no transform for player {:?}; skipped",
+                    event.effect_id, event.id, event.model_player_id
+                );
+                continue;
+            }
+            let Some(effect) = self.effects.get_mut(&event.effect_id) else {
                 continue;
             };
-            let Some(pass) = effect
+            let Some(pass_index) = effect
                 .passes
                 .iter()
-                .find(|pass| pass.id == event.compute_pass && pass.kind == PassKind::Compute)
+                .position(|pass| pass.id == event.compute_pass && pass.kind == PassKind::Compute)
             else {
                 continue;
             };
-            self.latest_actions
-                .insert(effect.manifest.id.clone(), event.clone());
-            let model = event.model_player_id;
-            let frame_bytes = build_frame_bytes(frame, &effect.manifest.frame_inputs, model);
+            let now = frame.time_seconds;
+            let instance_index = effect
+                .instances
+                .iter()
+                .position(|instance| instance.state.is_none())
+                .or_else(|| {
+                    effect
+                        .instances
+                        .iter()
+                        .enumerate()
+                        .min_by(|(_, a), (_, b)| {
+                            a.state
+                                .as_ref()
+                                .unwrap()
+                                .started_at
+                                .total_cmp(&b.state.as_ref().unwrap().started_at)
+                        })
+                        .map(|(index, _)| index)
+                });
+            let Some(instance_index) = instance_index else {
+                continue;
+            };
+            let buffers = effect.instances[instance_index].buffers.clone();
+            for buffer in &buffers {
+                tcx.try_write_buffer::<[u8]>(
+                    self.arena_id,
+                    buffer.offset..buffer.offset + buffer.size,
+                )?
+                .fill(0);
+            }
+            effect.instances[instance_index].state = Some(EffectInstanceState {
+                payload: event.payload.clone(),
+                model,
+                expires_at: now + effect.manifest.instance_lifetime_seconds,
+                started_at: now,
+            });
+            let frame_inputs = effect.manifest.frame_inputs.clone();
+            let frame_bytes = build_frame_bytes(frame, &frame_inputs, model);
+            let effect = self.effects.get(&event.effect_id).unwrap();
+            let pass = &effect.passes[pass_index];
             self.dispatch(
                 cbf,
                 tcx,
-                effect,
+                &buffers,
                 pass,
                 &event.payload,
                 &frame_bytes,
@@ -363,23 +448,45 @@ impl EffectGpuState {
             )?;
         }
 
-        for effect in &packages {
-            for pass in effect
-                .passes
-                .iter()
-                .filter(|pass| pass.kind == PassKind::Compute)
-            {
-                let declared_each_frame = effect
-                    .manifest
-                    .passes
-                    .iter()
-                    .any(|decl| decl.id == pass.id && decl.run_each_frame);
-                if !declared_each_frame {
+        let mut per_frame_passes = Vec::new();
+        for (effect_id, effect) in &self.effects {
+            for (instance_index, instance) in effect.instances.iter().enumerate() {
+                if instance.state.is_none() {
                     continue;
                 }
-                let frame_bytes = build_frame_bytes(frame, &effect.manifest.frame_inputs, None);
-                self.dispatch(cbf, tcx, effect, pass, &[], &frame_bytes, &mut transient)?;
+                for (pass_index, pass) in effect.passes.iter().enumerate() {
+                    if pass.kind == PassKind::Compute
+                        && effect
+                            .manifest
+                            .passes
+                            .iter()
+                            .any(|decl| decl.id == pass.id && decl.run_each_frame)
+                    {
+                        per_frame_passes.push((effect_id.clone(), instance_index, pass_index));
+                    }
+                }
             }
+        }
+        for (effect_id, instance_index, pass_index) in per_frame_passes {
+            let effect = &self.effects[&effect_id];
+            let instance = &effect.instances[instance_index];
+            let Some(state) = instance.state.as_ref() else {
+                continue;
+            };
+            let payload = state.payload.clone();
+            let model = state.model;
+            let buffers = instance.buffers.clone();
+            let pass = &effect.passes[pass_index];
+            let frame_bytes = build_frame_bytes(frame, &effect.manifest.frame_inputs, model);
+            self.dispatch(
+                cbf,
+                tcx,
+                &buffers,
+                pass,
+                &payload,
+                &frame_bytes,
+                &mut transient,
+            )?;
         }
         Ok(())
     }
@@ -388,7 +495,7 @@ impl EffectGpuState {
         &self,
         cbf: &mut RecordingCommandBuffer<'_>,
         tcx: &mut TaskContext<'_>,
-        effect: &PreparedEffect,
+        buffers: &[BufferRange],
         pass: &PreparedPass,
         payload: &[u8],
         frame_bytes: &[u8],
@@ -410,7 +517,7 @@ impl EffectGpuState {
 
         let descriptor_set = match self.create_descriptor_set(
             pass,
-            effect,
+            buffers,
             action_offset,
             payload_size,
             frame_offset,
@@ -465,80 +572,103 @@ impl EffectGpuState {
             self.graphics_frame = Some(frame.frame_index);
             self.graphics_cursor = self.capacity - TRANSIENT_BYTES;
         }
-        for effect in self.effects.values() {
-            let latest = self.latest_actions.get(&effect.manifest.id);
-            for pass in effect
-                .passes
-                .iter()
-                .filter(|pass| pass.kind == PassKind::Graphics && pass.phase == Some(phase))
-            {
-                let (payload, model) = latest
-                    .map(|action| (action.payload.as_slice(), action.model_player_id))
-                    .unwrap_or((&[], None));
-                let payload_size = payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64;
-                let action_offset = align_up(self.graphics_cursor, self.storage_alignment);
-                let frame_offset = align_up(action_offset + payload_size, self.storage_alignment);
-                let end = frame_offset + FRAME_BYTES as u64;
-                if end > self.capacity {
-                    continue;
-                }
-                let action_write = tcx.try_write_buffer::<[u8]>(
-                    self.arena_id,
-                    action_offset..action_offset + payload_size,
-                )?;
-                action_write.fill(0);
-                action_write[..payload.len()].copy_from_slice(payload);
-                tcx.try_write_buffer::<[u8]>(self.arena_id, frame_offset..end)?
-                    .copy_from_slice(&build_frame_bytes(
-                        frame,
-                        &effect.manifest.frame_inputs,
-                        model,
-                    ));
-                let descriptor_set = match self.create_descriptor_set(
-                    pass,
-                    effect,
-                    action_offset,
-                    payload_size,
-                    frame_offset,
-                ) {
-                    Ok(set) => set,
-                    Err(error) => {
-                        warn!("could not allocate effect descriptor set: {error}");
-                        continue;
-                    }
-                };
-                let EffectPipeline::Graphics(pipeline) = &pass.pipeline else {
-                    continue;
-                };
-                unsafe { cbf.bind_pipeline(pipeline) };
-                unsafe {
-                    cbf.as_raw().bind_descriptor_sets(
-                        PipelineBindPoint::Graphics,
-                        pipeline.layout(),
-                        1,
-                        &[descriptor_set.as_raw()],
-                        &[],
-                    );
-                    cbf.draw(pass.vertex_count, pass.instance_count, 0, 0);
-                }
-                let graphics_barrier = MemoryBarrier {
-                    src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER,
-                    src_access: vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
-                    dst_stages: vulkano::sync::PipelineStages::VERTEX_SHADER
-                        | vulkano::sync::PipelineStages::FRAGMENT_SHADER,
-                    dst_access: vulkano::sync::AccessFlags::SHADER_STORAGE_READ
-                        | vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
-                    ..Default::default()
-                };
-                unsafe {
-                    cbf.pipeline_barrier(&DependencyInfo {
-                        memory_barriers: std::slice::from_ref(&graphics_barrier),
-                        ..Default::default()
-                    });
-                }
-                cbf.destroy_object(descriptor_set);
-                self.graphics_cursor = end;
+        let draws: Vec<_> = self
+            .effects
+            .iter()
+            .flat_map(|(effect_id, effect)| {
+                effect
+                    .instances
+                    .iter()
+                    .enumerate()
+                    .flat_map(move |(instance_index, instance)| {
+                        if instance.state.is_none() {
+                            return Vec::new();
+                        }
+                        effect
+                            .passes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, pass)| {
+                                pass.kind == PassKind::Graphics && pass.phase == Some(phase)
+                            })
+                            .map(|(pass_index, _)| (effect_id.clone(), instance_index, pass_index))
+                            .collect()
+                    })
+            })
+            .collect();
+        for (effect_id, instance_index, pass_index) in draws {
+            let effect = &self.effects[&effect_id];
+            let instance = &effect.instances[instance_index];
+            let Some(state) = instance.state.as_ref() else {
+                continue;
+            };
+            let payload = state.payload.clone();
+            let model = state.model;
+            let buffers = instance.buffers.clone();
+            let pass = &effect.passes[pass_index];
+            let payload_size = payload.len().max(MIN_DESCRIPTOR_RANGE as usize) as u64;
+            let action_offset = align_up(self.graphics_cursor, self.storage_alignment);
+            let frame_offset = align_up(action_offset + payload_size, self.storage_alignment);
+            let end = frame_offset + FRAME_BYTES as u64;
+            if end > self.capacity {
+                continue;
             }
+            let action_write = tcx.try_write_buffer::<[u8]>(
+                self.arena_id,
+                action_offset..action_offset + payload_size,
+            )?;
+            action_write.fill(0);
+            action_write[..payload.len()].copy_from_slice(&payload);
+            tcx.try_write_buffer::<[u8]>(self.arena_id, frame_offset..end)?
+                .copy_from_slice(&build_frame_bytes(
+                    frame,
+                    &effect.manifest.frame_inputs,
+                    model,
+                ));
+            let descriptor_set = match self.create_descriptor_set(
+                pass,
+                &buffers,
+                action_offset,
+                payload_size,
+                frame_offset,
+            ) {
+                Ok(set) => set,
+                Err(error) => {
+                    warn!("could not allocate effect descriptor set: {error}");
+                    continue;
+                }
+            };
+            let EffectPipeline::Graphics(pipeline) = &pass.pipeline else {
+                continue;
+            };
+            unsafe { cbf.bind_pipeline(pipeline) };
+            unsafe {
+                cbf.as_raw().bind_descriptor_sets(
+                    PipelineBindPoint::Graphics,
+                    pipeline.layout(),
+                    1,
+                    &[descriptor_set.as_raw()],
+                    &[],
+                );
+                cbf.draw(pass.vertex_count, pass.instance_count, 0, 0);
+            }
+            let graphics_barrier = MemoryBarrier {
+                src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER,
+                src_access: vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+                dst_stages: vulkano::sync::PipelineStages::VERTEX_SHADER
+                    | vulkano::sync::PipelineStages::FRAGMENT_SHADER,
+                dst_access: vulkano::sync::AccessFlags::SHADER_STORAGE_READ
+                    | vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+                ..Default::default()
+            };
+            unsafe {
+                cbf.pipeline_barrier(&DependencyInfo {
+                    memory_barriers: std::slice::from_ref(&graphics_barrier),
+                    ..Default::default()
+                });
+            }
+            cbf.destroy_object(descriptor_set);
+            self.graphics_cursor = end;
         }
         Ok(())
     }
@@ -546,7 +676,7 @@ impl EffectGpuState {
     fn create_descriptor_set(
         &self,
         pass: &PreparedPass,
-        effect: &PreparedEffect,
+        buffers: &[BufferRange],
         action_offset: u64,
         action_size: u64,
         frame_offset: u64,
@@ -565,8 +695,7 @@ impl EffectGpuState {
             WriteDescriptorSet::buffer(0, &action_info),
             WriteDescriptorSet::buffer(1, &frame_info),
         ];
-        let infos: Vec<_> = effect
-            .buffers
+        let infos: Vec<_> = buffers
             .iter()
             .enumerate()
             .map(|(i, buffer)| {
@@ -748,9 +877,20 @@ fn load_entry(
     })
 }
 
-fn build_frame_bytes(frame: &FrameData, inputs: &[FrameInput], player_id: Option<u64>) -> Vec<u8> {
+fn build_frame_bytes(
+    frame: &FrameData,
+    inputs: &[FrameInput],
+    model: Option<glam::Mat4>,
+) -> Vec<u8> {
     let mut bytes = vec![0; FRAME_BYTES];
     let has = |input| inputs.contains(&input);
+    // Identity (not an all-zero matrix) when no model is bound.
+    if has(FrameInput::Model) {
+        write_mat4(&mut bytes, 112, glam::Mat4::IDENTITY);
+    }
+    if has(FrameInput::ModelViewProjection) {
+        write_mat4(&mut bytes, 176, frame.view_proj);
+    }
     if has(FrameInput::FrameIndex) {
         write_u32(&mut bytes, 0, frame.frame_index as u32);
     }
@@ -769,20 +909,10 @@ fn build_frame_bytes(frame: &FrameData, inputs: &[FrameInput], player_id: Option
         write_f32(&mut bytes, 36, frame.camera_position.y);
         write_f32(&mut bytes, 40, frame.camera_position.z);
     }
-    if has(FrameInput::CameraRight) {
-        write_f32(&mut bytes, 240, frame.camera_right.x);
-        write_f32(&mut bytes, 244, frame.camera_right.y);
-        write_f32(&mut bytes, 248, frame.camera_right.z);
-    }
-    if has(FrameInput::CameraUp) {
-        write_f32(&mut bytes, 256, frame.camera_up.x);
-        write_f32(&mut bytes, 260, frame.camera_up.y);
-        write_f32(&mut bytes, 264, frame.camera_up.z);
-    }
     if has(FrameInput::ViewProjection) {
         write_mat4(&mut bytes, 48, frame.view_proj);
     }
-    if let Some(model) = player_id.and_then(|id| frame.model_transforms.get(&id).copied()) {
+    if let Some(model) = model {
         if has(FrameInput::Model) {
             write_mat4(&mut bytes, 112, model);
         }

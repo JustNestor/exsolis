@@ -80,8 +80,6 @@ pub(super) struct FrameData {
     pub delta_seconds: f32,
     pub view_proj: Mat4,
     pub camera_position: Vec3,
-    pub camera_right: Vec3,
-    pub camera_up: Vec3,
     pub viewport: vulkano::pipeline::graphics::viewport::Viewport,
     /// Bindless sampler used to read every block texture. Same sampler for
     /// all chunks; per-texture state lives in the image, not here.
@@ -545,8 +543,9 @@ pub(super) fn render_frame(
     let Ok(window) = windows.single() else {
         return;
     };
-    let width = window.resolution.width() as u32;
-    let height = window.resolution.height() as u32;
+    // Swapchain/viewport are in physical pixels; logical size is wrong on HiDPI.
+    let width = window.resolution.physical_width();
+    let height = window.resolution.physical_height();
     if width == 0 || height == 0 {
         return;
     }
@@ -632,12 +631,6 @@ pub(super) fn render_frame(
         camera_position: camera_transform
             .map(|transform| transform.translation)
             .unwrap_or(Vec3::ZERO),
-        camera_right: camera_transform
-            .map(|transform| transform.rotation * Vec3::X)
-            .unwrap_or(Vec3::X),
-        camera_up: camera_transform
-            .map(|transform| transform.rotation * Vec3::Y)
-            .unwrap_or(Vec3::Y),
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
         avatar_models,
