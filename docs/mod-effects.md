@@ -36,11 +36,11 @@ action. Actions need not be tied to a built-in game event.
 
 ## Client package direction
 
-A server asset package will declare action routes, payload field types, WGSL
-entry points, render phases, and resource access. The client will match a
-received action ID against those routes, validate and pack its payload, then
-enqueue it for the declared compute pass. Unknown action IDs are ignored.
-Packages contain data and WGSL, never client-side scripts.
+A server asset package declares action routes, payload field types, WGSL entry
+points, render phases, and resource access. The client matches a received
+action ID against those routes, validates and packs its payload, then dispatches
+the declared compute pass. Unknown action IDs are ignored. Packages contain
+data and WGSL, never client-side scripts.
 
 WGSL will receive only declared engine resources. The proposed stable frame
 binding includes frame index, elapsed time, delta time, viewport, camera
@@ -48,18 +48,30 @@ position, and view-projection matrix. Actions that identify an entity can
 also request its model transform; the engine supplies model and model-view-
 projection matrices rather than asking each mod to reconstruct them.
 
-Compute passes can run for incoming actions and/or each frame. They read a
-bounded action-event buffer and update package-owned persistent buffers.
-Graphics passes consume those buffers. Event input and persistent simulation
-state have separate lifetimes, so clearing consumed events cannot erase live
+Compute passes can run for incoming actions and/or each frame. Each action is
+packed into a temporary GPU storage range and dispatched immediately; the
+shader can update package-owned persistent buffers. Graphics passes consume
+those buffers. The temporary payload range and persistent simulation state
+have separate lifetimes, so discarding the action input cannot erase live
 particles.
 
-The manifest may declare buffers and images, but only through supported
-resource kinds, formats, access modes, sizes, and lifetime policies. It can
-declare pass dependencies; the engine translates those into Vulkano task
-graph nodes and resource access declarations. It cannot inject arbitrary
-Vulkano callbacks or bypass graph synchronization. Bindless texture handles
-are logical asset references resolved by the client.
+Manifest buffers are package-owned storage allocations. The renderer places
+them in a bounded arena and binds them to shader group 1 in declaration
+order. Server-synced PNG files are uploaded by the existing texture loader
+into group 0's bindless set, but version 1 does not yet provide effect
+manifests with a stable way to name those texture handles. `images` is
+reserved for GPU-owned images and is currently rejected when non-empty;
+sampled, storage, and render-target image declarations are not executable
+yet.
+
+Pass `reads`, `writes`, and `after` are validated at load time, but do not
+create one Vulkano task-graph node per pass or narrow access to individual
+resources yet. Compute passes execute in the shared compute node before the
+renderer node; graphics passes execute in the renderer node at their declared
+phase. The task graph declares read/write access to the shared effect arena
+for both nodes, and explicit shader-storage barriers separate dispatches and
+draws. This is enough for the buffer-only fly example, but packages must not
+depend on arbitrary cross-pass ordering beyond that schedule.
 
 The first manifest format is JSON with the `.fxm` extension. An effect package
 can include this `example:fly` manifest and the referenced WGSL files:
@@ -149,11 +161,12 @@ An executable mod package is in
 [`examples/mod-effects/fly`](/home/nestor/prj/exsolis/examples/mod-effects/fly).
 Copy its `.fxm` and WGSL files into the server's asset catalog and run its Lua
 handler as a server mod. The example spawns and simulates particles in compute,
-then draws them as additive billboards when players press Space.
+then draws them as additive quads when players press Space.
 
 Naga validates WGSL and generates SPIR-V per entry point and stage; the
-manifest selects which compiled entry points become pipelines. naga-oil
-composition can add reusable WGSL imports. A replacement package becomes
+manifest selects which compiled entry points become pipelines. naga-oil is a
+dependency for a future reusable WGSL import/composition step, but imports
+are not part of the version 1 loader yet. A replacement package becomes
 active only after manifest validation, shader validation, SPIR-V generation,
 and pipeline creation all succeed.
 
@@ -162,14 +175,13 @@ and pipeline creation all succeed.
 The code now includes the server action packet/API, client action event
 boundary, Naga validation and per-entry-point SPIR-V generation, automatic
 loading of `.fxm` manifests and `.wgsl` assets, manifest validation, and typed
-payload packing into queued compute action events. It also validates pass
-dependencies and resource declarations.
+payload packing into queued compute action events. The renderer builds
+compute and procedural graphics pipelines, runs dispatches through the
+Vulkano task graph, and supplies the declared frame matrices and timing.
 
 The executor currently supports storage buffers and procedural graphics
-passes. Manifest-declared images and per-pass image synchronization are not
-implemented yet; manifests that declare images are rejected at pipeline-load
-time. The graph currently exposes the shared storage arena to effect compute
-and graphics nodes, so `reads` and `writes` are validated metadata and do not
-yet narrow access per individual buffer. The fly example uses only supported
-buffer resources and exercises the action, compute, frame matrix, and draw
-path.
+passes. Manifests that declare images are rejected at pipeline-load time.
+Effect texture lookup, independently scheduled task-graph passes, and
+per-resource graph access declarations remain follow-up work. The fly
+example uses only supported buffer resources and exercises the action,
+compute, frame matrix, and draw path.

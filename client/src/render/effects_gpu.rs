@@ -39,7 +39,7 @@ use vulkano::{
 };
 use vulkano_taskgraph::{
     Id, Task, TaskContext, TaskResult,
-    command_buffer::RecordingCommandBuffer,
+    command_buffer::{DependencyInfo, MemoryBarrier, RecordingCommandBuffer},
     resource::{AccessTypes, HostAccessType},
 };
 
@@ -432,6 +432,21 @@ impl EffectGpuState {
             );
             cbf.dispatch(pass.workgroups);
         }
+        let compute_barrier = MemoryBarrier {
+            src_stages: vulkano::sync::PipelineStages::COMPUTE_SHADER,
+            src_access: vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+            dst_stages: vulkano::sync::PipelineStages::COMPUTE_SHADER,
+            dst_access: vulkano::sync::AccessFlags::SHADER_STORAGE_READ
+                | vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+            ..Default::default()
+        };
+        unsafe {
+            cbf.pipeline_barrier(&DependencyInfo {
+                memory_barriers: std::slice::from_ref(&compute_barrier),
+                ..Default::default()
+            });
+        }
+        cbf.destroy_object(descriptor_set);
         *transient = end;
         Ok(())
     }
@@ -503,6 +518,22 @@ impl EffectGpuState {
                     );
                     cbf.draw(pass.vertex_count, pass.instance_count, 0, 0);
                 }
+                let graphics_barrier = MemoryBarrier {
+                    src_stages: vulkano::sync::PipelineStages::FRAGMENT_SHADER,
+                    src_access: vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+                    dst_stages: vulkano::sync::PipelineStages::VERTEX_SHADER
+                        | vulkano::sync::PipelineStages::FRAGMENT_SHADER,
+                    dst_access: vulkano::sync::AccessFlags::SHADER_STORAGE_READ
+                        | vulkano::sync::AccessFlags::SHADER_STORAGE_WRITE,
+                    ..Default::default()
+                };
+                unsafe {
+                    cbf.pipeline_barrier(&DependencyInfo {
+                        memory_barriers: std::slice::from_ref(&graphics_barrier),
+                        ..Default::default()
+                    });
+                }
+                cbf.destroy_object(descriptor_set);
                 self.graphics_cursor = end;
             }
         }

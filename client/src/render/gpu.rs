@@ -387,7 +387,7 @@ pub(super) fn setup_renderer(
         vulkano_taskgraph::QueueFamilyType::Graphics,
         compute_task,
     );
-    compute_node
+    let compute_node_id = compute_node
         .buffer_access(effect_arena_id, effect_storage_access())
         .build();
 
@@ -402,7 +402,8 @@ pub(super) fn setup_renderer(
 
     let mut node =
         task_graph.create_task_node("Chunks", vulkano_taskgraph::QueueFamilyType::Graphics, task);
-    node.framebuffer(virtual_framebuffer_id)
+    let chunk_node_id = node
+        .framebuffer(virtual_framebuffer_id)
         .color_attachment(
             virtual_swapchain_id.current_image_id(),
             AccessTypes::COLOR_ATTACHMENT_WRITE,
@@ -426,6 +427,10 @@ pub(super) fn setup_renderer(
         .buffer_access(ui_gpu.buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .buffer_access(effect_arena_id, effect_storage_access())
         .build();
+
+    // Both nodes access the effect arena, so make the compute-to-draw order
+    // explicit. TaskGraph does not infer an edge from shared resource IDs.
+    task_graph.add_edge(compute_node_id, chunk_node_id).unwrap();
 
     let task_graph = unsafe {
         task_graph
