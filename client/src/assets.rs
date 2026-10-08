@@ -57,6 +57,15 @@ impl AssetHandlerRegistry {
     pub fn get<T: Any + Send + Sync>(&self, path: &str) -> Option<&T> {
         self.resident.get(path)?.as_ref().downcast_ref::<T>()
     }
+
+    pub fn iter_loaded<T: Any + Send + Sync>(&self) -> impl Iterator<Item = (&str, &T)> {
+        self.resident.iter().filter_map(|(path, asset)| {
+            asset
+                .as_ref()
+                .downcast_ref::<T>()
+                .map(|value| (path.as_str(), value))
+        })
+    }
 }
 
 #[derive(Resource)]
@@ -125,6 +134,8 @@ impl Plugin for AssetClientPlugin {
             .expect("failed to start client asset worker");
         let mut registry = AssetHandlerRegistry::default();
         registry.register("png", decode_png);
+        registry.register("wgsl", decode_wgsl);
+        registry.register("fxm", crate::render::effects::decode_manifest);
         app.insert_resource(WorkerQueue {
             jobs: job_sender,
             receiver: Mutex::new(receiver),
@@ -139,6 +150,58 @@ impl Plugin for AssetClientPlugin {
                 .in_set(net::GameplaySet),
         );
     }
+}
+
+/// Validated WGSL source retained as a CPU-side asset. Pipeline entry points
+/// and SPIR-V generation are selected later from the effect manifest.
+#[derive(Debug)]
+pub struct WgslAsset {
+    pub source: String,
+    pub entry_points: Vec<WgslEntryPoint>,
+}
+
+#[derive(Debug)]
+pub struct WgslEntryPoint {
+    pub name: String,
+    pub stage: naga::ShaderStage,
+    /// SPIR-V words generated for this exact stage/entry-point pair.
+    pub spirv: Vec<u32>,
+}
+
+fn decode_wgsl(bytes: &[u8]) -> Result<LoadedAsset, String> {
+    let source = std::str::from_utf8(bytes)
+        .map_err(|e| format!("WGSL source is not UTF-8: {e}"))?
+        .to_owned();
+    let module = naga::front::wgsl::parse_str(&source).map_err(|e| e.emit_to_string(&source))?;
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(&module)
+    .map_err(|e| format!("WGSL validation failed: {e}"))?;
+
+    let mut spv_options = naga::back::spv::Options::default();
+    spv_options.fake_missing_bindings = false;
+    let mut entry_points = Vec::with_capacity(module.entry_points.len());
+    for entry in &module.entry_points {
+        let pipeline_options = naga::back::spv::PipelineOptions {
+            shader_stage: entry.stage,
+            entry_point: entry.name.clone(),
+        };
+        let spirv =
+            naga::back::spv::write_vec(&module, &info, &spv_options, Some(&pipeline_options))
+                .map_err(|e| format!("WGSL SPIR-V generation failed for '{}': {e}", entry.name))?;
+        entry_points.push(WgslEntryPoint {
+            name: entry.name.clone(),
+            stage: entry.stage,
+            spirv,
+        });
+    }
+
+    Ok(Arc::new(WgslAsset {
+        source,
+        entry_points,
+    }))
 }
 
 #[derive(Message, Debug, Clone)]
@@ -282,6 +345,7 @@ fn poll_workers(
             }
             WorkerEvent::SyncReady(assets) => {
                 let mut loaded_paths = load_pending_assets(&assets, &paths, &mut handlers);
+                loaded_paths.extend(load_effect_assets(&assets, &paths, &mut handlers));
                 if !assets.is_empty() {
                     changed.write(AssetCacheChanged { assets });
                 }
@@ -341,6 +405,42 @@ fn poll_workers(
             }
         }
     }
+}
+
+fn load_effect_assets(
+    assets: &[AssetHash],
+    paths: &AssetCachePaths,
+    handlers: &mut AssetHandlerRegistry,
+) -> Vec<String> {
+    let mut loaded = Vec::new();
+    for asset in assets {
+        let ext = Path::new(&asset.path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if !matches!(ext.as_str(), "fxm" | "wgsl") || handlers.resident.contains_key(&asset.path) {
+            continue;
+        }
+        let full_path = paths.extracted.join(&asset.path);
+        let result = fs::read(&full_path)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| {
+                let loader = handlers
+                    .loaders
+                    .get(&ext)
+                    .ok_or_else(|| format!("no loader for .{ext}"))?;
+                loader(&bytes)
+            });
+        match result {
+            Ok(value) => {
+                handlers.resident.insert(asset.path.clone(), value);
+                loaded.push(asset.path.clone());
+            }
+            Err(error) => warn!("effect asset {} failed to load: {error}", asset.path),
+        }
+    }
+    loaded
 }
 
 fn load_pending_assets(

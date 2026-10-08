@@ -68,7 +68,7 @@ impl Plugin for ScriptingPlugin {
     fn build(&self, app: &mut App) {
         let runtime = ScriptRuntime::new().expect("failed to initialize Lua runtime");
 
-        app.insert_non_send_resource(runtime)
+        app.insert_non_send(runtime)
             .add_systems(
                 Update,
                 (
@@ -165,6 +165,11 @@ enum ScriptRequest {
         kind: String,
         args: Vec<LuaScalar>,
         except: Option<PlayerId>,
+    },
+    BroadcastAction {
+        id: String,
+        payload_json: String,
+        unreliable: bool,
     },
     SetBlock {
         pos: BlockPos,
@@ -548,6 +553,48 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
                     kind,
                     args: rest,
                     except: None,
+                });
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // Reliable actions suit one-shot events. The unreliable variant suits
+    // frequent visual updates from `api.on_tick` that can be superseded.
+    for (name, unreliable) in [
+        ("broadcast_action", false),
+        ("broadcast_action_unreliable", true),
+    ] {
+        let outbox = outbox.clone();
+        api.set(
+            name,
+            lua.create_function(move |_, (id, payload): (String, Value)| {
+                if !exsolis_common::is_valid_mod_action_id(&id) {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "{name}: invalid namespaced action id '{id}'"
+                    )));
+                }
+                let mut nodes = 0;
+                let payload = lua_value_to_json(&payload, 0, &mut nodes)
+                    .map_err(mlua::Error::RuntimeError)?;
+                if !payload.is_object() {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "{name}: payload must be an object table"
+                    )));
+                }
+                let payload_json = serde_json::to_string(&payload)
+                    .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
+                if payload_json.len() > exsolis_common::MOD_ACTION_MAX_PAYLOAD_BYTES {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "{name}: payload too large ({} > {})",
+                        payload_json.len(),
+                        exsolis_common::MOD_ACTION_MAX_PAYLOAD_BYTES
+                    )));
+                }
+                outbox.borrow_mut().push(ScriptRequest::BroadcastAction {
+                    id,
+                    payload_json,
+                    unreliable,
                 });
                 Ok(())
             })?,
@@ -973,6 +1020,18 @@ pub(crate) fn drain_script_requests(
                     Err(e) => warn!("scripting: api.broadcast: {e}"),
                 }
             }
+            ScriptRequest::BroadcastAction {
+                id,
+                payload_json,
+                unreliable,
+            } => {
+                let msg = ServerMessage::ModAction { id, payload_json };
+                outgoing.write(if unreliable {
+                    OutgoingPacket::broadcast_unreliable(msg)
+                } else {
+                    OutgoingPacket::broadcast(msg)
+                });
+            }
             ScriptRequest::RegisterKeybind {
                 id,
                 default_key,
@@ -991,6 +1050,84 @@ pub(crate) fn drain_script_requests(
             }
         }
     }
+}
+
+const MOD_ACTION_MAX_DEPTH: usize = 8;
+const MOD_ACTION_MAX_NODES: usize = 256;
+
+fn lua_value_to_json(
+    value: &Value,
+    depth: usize,
+    nodes: &mut usize,
+) -> Result<serde_json::Value, String> {
+    use serde_json::{Map, Number, Value as JsonValue};
+
+    *nodes += 1;
+    if *nodes > MOD_ACTION_MAX_NODES {
+        return Err(format!("payload exceeds {MOD_ACTION_MAX_NODES} values"));
+    }
+    if depth > MOD_ACTION_MAX_DEPTH {
+        return Err(format!("payload nesting exceeds {MOD_ACTION_MAX_DEPTH}"));
+    }
+
+    Ok(match value {
+        Value::Nil => JsonValue::Null,
+        Value::Boolean(value) => JsonValue::Bool(*value),
+        Value::Integer(value) => JsonValue::Number((*value).into()),
+        Value::Number(value) => Number::from_f64(*value)
+            .map(JsonValue::Number)
+            .ok_or_else(|| "payload numbers must be finite".to_string())?,
+        Value::String(value) => {
+            JsonValue::String(value.to_str().map_err(|e| e.to_string())?.to_string())
+        }
+        Value::Table(table) => {
+            let mut pairs = Vec::new();
+            for pair in table.pairs::<Value, Value>() {
+                pairs.push(pair.map_err(|e| e.to_string())?);
+                if pairs.len() > MOD_ACTION_MAX_NODES {
+                    return Err(format!("table exceeds {MOD_ACTION_MAX_NODES} entries"));
+                }
+            }
+            let is_array = !pairs.is_empty()
+                && pairs
+                    .iter()
+                    .all(|(key, _)| matches!(key, Value::Integer(i) if *i > 0))
+                && pairs.len()
+                    == pairs
+                        .iter()
+                        .filter_map(|(key, _)| match key {
+                            Value::Integer(i) => Some(*i as usize),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+            if is_array {
+                let mut values = vec![JsonValue::Null; pairs.len()];
+                for (key, value) in pairs {
+                    let Value::Integer(index) = key else {
+                        unreachable!()
+                    };
+                    values[index as usize - 1] = lua_value_to_json(&value, depth + 1, nodes)?;
+                }
+                JsonValue::Array(values)
+            } else {
+                let mut values = Map::new();
+                for (key, value) in pairs {
+                    let Value::String(key) = key else {
+                        return Err("object payload tables require string keys".to_string());
+                    };
+                    let key = key.to_str().map_err(|e| e.to_string())?.to_string();
+                    values.insert(key, lua_value_to_json(&value, depth + 1, nodes)?);
+                }
+                JsonValue::Object(values)
+            }
+        }
+        _ => {
+            return Err(
+                "payload supports only nil, booleans, numbers, strings, arrays, and objects".into(),
+            );
+        }
+    })
 }
 
 /// The fixed set of `ServerMessage` kinds a mod is allowed to construct.

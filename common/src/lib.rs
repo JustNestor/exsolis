@@ -286,6 +286,17 @@ pub enum ServerMessage {
     AssetDownloadFailed {
         reason: String,
     },
+    /// A server-side mod asks clients to run a package-declared visual action.
+    /// `payload_json` is interpreted by the matching client shader manifest;
+    /// clients without a handler ignore it. Appended to preserve existing
+    /// bincode variant indices.
+    ModAction {
+        id: String,
+        payload_json: String,
+    },
+    /// Authenticated identity of the receiving client, for correlating local
+    /// model transforms with server-authored actions. Appended for wire compatibility.
+    YourPlayerId(PlayerId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -309,3 +320,25 @@ pub const UI_MAX_OPEN: usize = 32;
 /// Max length of `UiDrag.source_id` / `target_id` — reuses the id budget
 /// since both are `UiAction.element_id`-shaped.
 pub const UI_DRAG_MAX_ID_LEN: usize = UI_MAX_ID_LEN;
+/// Maximum namespaced mod action identifier sent to clients.
+pub const MOD_ACTION_MAX_ID_BYTES: usize = 128;
+/// Maximum UTF-8 JSON payload size for one mod action packet.
+pub const MOD_ACTION_MAX_PAYLOAD_BYTES: usize = 4096;
+
+/// Mod action identifiers use the same `namespace:name` form as keybinds.
+pub fn is_valid_mod_action_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > MOD_ACTION_MAX_ID_BYTES {
+        return false;
+    }
+    let Some((namespace, name)) = id.split_once(':') else {
+        return false;
+    };
+    !namespace.is_empty()
+        && !name.is_empty()
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+}

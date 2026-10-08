@@ -17,11 +17,15 @@ use crate::{
 #[derive(Component)]
 pub struct RemotePlayer(pub PlayerId);
 
+#[derive(Resource, Default)]
+pub struct LocalPlayerId(pub Option<PlayerId>);
+
 pub struct StreamingPlugin;
 
 impl Plugin for StreamingPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ChunkRegistry>()
+            .init_resource::<LocalPlayerId>()
             .add_systems(Update, receive_chunk_updates.in_set(GameplaySet));
     }
 }
@@ -31,11 +35,13 @@ fn receive_chunk_updates(
     mut incoming: MessageReader<IncomingPacket>,
     mut registry: ResMut<ChunkRegistry>,
     mut inventory: ResMut<ClientInventory>,
+    mut local_player_id: ResMut<LocalPlayerId>,
     mut chunks: Query<&mut Chunk>,
     remote_players: Query<(Entity, &RemotePlayer)>,
 ) {
     for packet in incoming.read() {
         match &packet.0 {
+            ServerMessage::YourPlayerId(id) => local_player_id.0 = Some(*id),
             ServerMessage::ChunkData { coord, blocks } => {
                 let Some(chunk) = Chunk::from_packed(*coord, blocks) else {
                     warn!("malformed chunk {coord:?}, dropping");

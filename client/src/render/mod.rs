@@ -9,6 +9,8 @@
 
 mod allocator;
 mod avatars;
+pub(crate) mod effects;
+mod effects_gpu;
 mod gpu;
 mod meshing;
 pub mod ui_pass;
@@ -24,20 +26,25 @@ pub struct RendererPlugin;
 
 impl Plugin for RendererPlugin {
     fn build(&self, app: &mut App) {
-        app.add_plugins(TexturePlugin).add_systems(
-            Update,
-            (
-                gpu::setup_renderer,
-                meshing::invalidate_stale_meshes.run_if(resource_exists::<RenderState>),
-                meshing::invalidate_for_asset_change,
-                meshing::queue_chunk_meshing.run_if(resource_exists::<RenderState>),
-                meshing::collect_finished_meshes.run_if(resource_exists::<RenderState>),
-                meshing::upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
-                avatars::ensure_avatar_mesh.run_if(resource_exists::<RenderState>),
-                meshing::cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
-                gpu::render_frame.run_if(resource_exists::<RenderState>),
-            )
-                .chain(),
-        );
+        app.add_plugins(TexturePlugin)
+            .add_message::<effects::ModActionEvent>()
+            .add_systems(
+                Update,
+                (
+                    gpu::setup_renderer,
+                    effects::route_mod_actions,
+                    effects_gpu::prepare_gpu_effects,
+                    meshing::invalidate_stale_meshes.run_if(resource_exists::<RenderState>),
+                    meshing::invalidate_for_asset_change,
+                    meshing::queue_chunk_meshing.run_if(resource_exists::<RenderState>),
+                    meshing::collect_finished_meshes.run_if(resource_exists::<RenderState>),
+                    meshing::upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
+                    avatars::ensure_avatar_mesh.run_if(resource_exists::<RenderState>),
+                    meshing::cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
+                    gpu::render_frame.run_if(resource_exists::<RenderState>),
+                )
+                    .chain()
+                    .in_set(crate::net::GameplaySet),
+            );
     }
 }

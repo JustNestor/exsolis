@@ -95,6 +95,10 @@ pub(crate) fn spawn_joined_player(
     if player_map.playerid_to_entity.contains_key(&client_id) {
         return;
     }
+    outgoing.write(OutgoingPacket::to(
+        client_id,
+        ServerMessage::YourPlayerId(client_id),
+    ));
     for (&existing_id, &existing_entity) in &player_map.playerid_to_entity {
         outgoing.write(OutgoingPacket::to(
             client_id,

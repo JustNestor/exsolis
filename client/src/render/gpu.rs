@@ -8,9 +8,10 @@ use std::{
 };
 
 use bevy_ecs::prelude::*;
+use bevy_time::Time;
 use bevy_transform::prelude::Transform;
 use bevy_window::{PrimaryWindow, Window};
-use glam::Mat4;
+use glam::{Mat4, Vec3};
 use vulkano::{
     DeviceSize, VulkanError,
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
@@ -44,7 +45,7 @@ use vulkano_taskgraph::{
     resource_map,
 };
 
-use crate::streaming::RemotePlayer;
+use crate::streaming::{LocalPlayerId, RemotePlayer};
 use crate::{
     mesh::{ChunkVertex, fs, vs},
     player::{FlyCamera, LocalPlayer},
@@ -70,16 +71,25 @@ pub(super) struct RenderStateShared {
     /// per-player model matrices.
     pub allocations: HashMap<Entity, GpuMeshAllocation>,
     pub avatar: Option<GpuMeshAllocation>,
+    pub effects_gpu: Option<super::effects_gpu::EffectGpuState>,
 }
 
-pub struct FrameData {
+pub(super) struct FrameData {
+    pub frame_index: u64,
+    pub time_seconds: f32,
+    pub delta_seconds: f32,
     pub view_proj: Mat4,
+    pub camera_position: Vec3,
     pub viewport: vulkano::pipeline::graphics::viewport::Viewport,
     /// Bindless sampler used to read every block texture. Same sampler for
     /// all chunks; per-texture state lives in the image, not here.
     pub sampler_id: SamplerId,
     /// One model matrix per remote player. Mesh is local-space in [`avatar`].
     pub avatar_models: Vec<Mat4>,
+    /// Player ID -> model transform, for actions that explicitly request it.
+    pub model_transforms: HashMap<u64, Mat4>,
+    /// Validated actions received since the preceding rendered frame.
+    pub mod_actions: Vec<super::effects::ModActionEvent>,
     /// UI instance buffer + live count (synced from `UiDrawList` each frame).
     pub ui_buffer_id: Id<Buffer>,
     pub ui_count: u32,
@@ -108,66 +118,74 @@ impl Task for ChunkRenderTask {
     unsafe fn execute(
         &self,
         cbf: &mut RecordingCommandBuffer<'_>,
-        _tcx: &mut TaskContext<'_>,
+        tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
         cbf.set_viewport(0, std::slice::from_ref(&world.viewport));
 
-        let shared = self.shared.read().unwrap();
-        let Some(pipeline) = shared.pipeline.as_ref() else {
-            return Ok(());
-        };
-
-        let push = |cbf: &mut RecordingCommandBuffer<'_>, view_proj: Mat4| {
-            cbf.push_constants(
-                pipeline.layout(),
-                0,
-                &vs::PushConstants {
-                    view_proj: view_proj.to_cols_array_2d(),
-                    sampler_id: world.sampler_id,
-                },
-            );
-        };
-
-        push(cbf, world.view_proj);
-        cbf.bind_pipeline(pipeline);
-        cbf.bind_index_buffer(
-            self.index_buffer_id,
-            0,
-            None,
-            vulkano::buffer::IndexType::U32,
-        );
-        cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[]);
-        for alloc in shared.allocations.values() {
-            if alloc.index_count == 0 {
-                continue;
-            }
-            unsafe {
-                cbf.draw_indexed(
-                    alloc.index_count,
-                    1,
-                    alloc.first_index(),
-                    alloc.vertex_offset(),
+        let mut shared = self.shared.write().unwrap();
+        if let Some(pipeline) = shared.pipeline.as_ref() {
+            let push = |cbf: &mut RecordingCommandBuffer<'_>, view_proj: Mat4| {
+                cbf.push_constants(
+                    pipeline.layout(),
                     0,
+                    &vs::PushConstants {
+                        view_proj: view_proj.to_cols_array_2d(),
+                        sampler_id: world.sampler_id,
+                    },
                 );
-            }
-        }
+            };
 
-        if let Some(avatar) = shared.avatar {
-            if avatar.index_count > 0 {
-                for model in &world.avatar_models {
-                    push(cbf, world.view_proj * *model);
-                    unsafe {
-                        cbf.draw_indexed(
-                            avatar.index_count,
-                            1,
-                            avatar.first_index(),
-                            avatar.vertex_offset(),
-                            0,
-                        );
+            push(cbf, world.view_proj);
+            cbf.bind_pipeline(pipeline);
+            cbf.bind_index_buffer(
+                self.index_buffer_id,
+                0,
+                None,
+                vulkano::buffer::IndexType::U32,
+            );
+            cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[]);
+            for alloc in shared.allocations.values() {
+                if alloc.index_count == 0 {
+                    continue;
+                }
+                unsafe {
+                    cbf.draw_indexed(
+                        alloc.index_count,
+                        1,
+                        alloc.first_index(),
+                        alloc.vertex_offset(),
+                        0,
+                    );
+                }
+            }
+
+            if let Some(avatar) = shared.avatar {
+                if avatar.index_count > 0 {
+                    for model in &world.avatar_models {
+                        push(cbf, world.view_proj * *model);
+                        unsafe {
+                            cbf.draw_indexed(
+                                avatar.index_count,
+                                1,
+                                avatar.first_index(),
+                                avatar.vertex_offset(),
+                                0,
+                            );
+                        }
                     }
                 }
             }
+        }
+
+        if let Some(effects) = shared.effects_gpu.as_mut() {
+            effects.record_graphics(
+                cbf,
+                tcx,
+                world,
+                super::effects::RenderPhase::WorldTransparent,
+            )?;
+            effects.record_graphics(cbf, tcx, world, super::effects::RenderPhase::WorldOverlay)?;
         }
 
         // UI pass: same subpass, after world geometry. Alpha-blended, no
@@ -181,6 +199,9 @@ impl Task for ChunkRenderTask {
                 [world.viewport.extent[0], world.viewport.extent[1]],
                 world.sampler_id,
             );
+        }
+        if let Some(effects) = shared.effects_gpu.as_mut() {
+            effects.record_graphics(cbf, tcx, world, super::effects::RenderPhase::UiOverlay)?;
         }
 
         Ok(())
@@ -198,6 +219,7 @@ pub struct RenderState {
     pub(super) shared: Arc<RwLock<RenderStateShared>>,
     pub(super) allocator: MeshBufferAllocator,
     pub(super) ui_gpu: UiPassGpu,
+    pub(super) frame_index: u64,
 }
 
 pub(super) struct PendingWrite<T> {
@@ -331,12 +353,15 @@ pub(super) fn setup_renderer(
     // UI instance buffer must exist before the task graph is built so we
     // can declare VERTEX_ATTRIBUTE_READ access on the node.
     let ui_gpu = UiPassGpu::new(&vk);
+    let effect_arena_id = super::effects_gpu::create_effect_arena(&vk)
+        .expect("failed to create mod-effect buffer arena");
 
     let shared = Arc::new(RwLock::new(RenderStateShared {
         pipeline: None,
         ui_pipeline: None,
         allocations: HashMap::new(),
         avatar: None,
+        effects_gpu: None,
     }));
 
     let mut task_graph: TaskGraph<FrameData> = TaskGraph::new(&vk.resources);
@@ -351,6 +376,20 @@ pub(super) fn setup_renderer(
         format: Format::D32_SFLOAT,
         ..Default::default()
     });
+
+    task_graph.add_host_buffer_access(effect_arena_id, HostAccessType::Write);
+    let compute_task = super::effects_gpu::EffectComputeTask {
+        shared: Arc::clone(&shared),
+        arena_id: effect_arena_id,
+    };
+    let mut compute_node = task_graph.create_task_node(
+        "ModEffectsCompute",
+        vulkano_taskgraph::QueueFamilyType::Graphics,
+        compute_task,
+    );
+    compute_node
+        .buffer_access(effect_arena_id, effect_storage_access())
+        .build();
 
     let task = ChunkRenderTask {
         vertex_buffer_id,
@@ -385,6 +424,7 @@ pub(super) fn setup_renderer(
         .buffer_access(index_buffer_id, AccessTypes::INDEX_READ)
         .buffer_access(vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .buffer_access(ui_gpu.buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
+        .buffer_access(effect_arena_id, effect_storage_access())
         .build();
 
     let task_graph = unsafe {
@@ -398,8 +438,10 @@ pub(super) fn setup_renderer(
             .unwrap()
     };
 
-    let node = task_graph.task_nodes().next().unwrap();
-    let subpass = node.subpass().unwrap().clone();
+    let subpass = task_graph
+        .task_nodes()
+        .find_map(|node| node.subpass().cloned())
+        .unwrap();
 
     let vs = unsafe { vs::load(&vk.device).unwrap().entry_point("main").unwrap() };
     let fs = unsafe { fs::load(&vk.device).unwrap().entry_point("main").unwrap() };
@@ -453,6 +495,11 @@ pub(super) fn setup_renderer(
     // UI pipeline shares the same subpass; alpha blend, no depth.
     let ui_pipeline = ui_pass::create_pipeline(&vk, &subpass);
     shared.write().unwrap().ui_pipeline = Some(ui_pipeline);
+    shared.write().unwrap().effects_gpu = Some(super::effects_gpu::EffectGpuState::new(
+        &vk,
+        effect_arena_id,
+        subpass,
+    ));
 
     commands.insert_resource(RenderState {
         vertex_buffer_id,
@@ -464,16 +511,29 @@ pub(super) fn setup_renderer(
         shared,
         allocator: MeshBufferAllocator::new(),
         ui_gpu,
+        frame_index: 0,
     });
+}
+
+fn effect_storage_access() -> AccessTypes {
+    AccessTypes::COMPUTE_SHADER_STORAGE_READ
+        | AccessTypes::COMPUTE_SHADER_STORAGE_WRITE
+        | AccessTypes::VERTEX_SHADER_STORAGE_READ
+        | AccessTypes::VERTEX_SHADER_STORAGE_WRITE
+        | AccessTypes::FRAGMENT_SHADER_STORAGE_READ
+        | AccessTypes::FRAGMENT_SHADER_STORAGE_WRITE
 }
 
 pub(super) fn render_frame(
     mut vk: ResMut<VulkanContext>,
     mut render_state: ResMut<RenderState>,
+    time: Res<Time>,
+    mut mod_actions: MessageReader<super::effects::ModActionEvent>,
     ui_list: Option<Res<UiDrawList>>,
+    local_player_id: Option<Res<LocalPlayerId>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
-    remotes: Query<&Transform, With<RemotePlayer>>,
+    remotes: Query<(&RemotePlayer, &Transform)>,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -515,16 +575,25 @@ pub(super) fn render_frame(
     }
 
     let aspect = vk.viewport.extent[0] / vk.viewport.extent[1];
+    let camera_transform = camera.iter().next().map(|(transform, _)| transform);
     let view_proj = camera
         .iter()
         .next()
         .map(|(transform, cam)| cam.view_projection(transform, aspect))
         .unwrap_or(Mat4::IDENTITY);
 
-    let avatar_models = remotes
+    let mut model_transforms: HashMap<u64, Mat4> = remotes
         .iter()
-        .map(|t| Mat4::from_translation(t.translation))
+        .map(|(player, transform)| (player.0, transform.to_matrix()))
         .collect();
+    if let (Some(player_id), Some((transform, _))) = (
+        local_player_id.as_deref().and_then(|id| id.0),
+        camera.iter().next(),
+    ) {
+        model_transforms.insert(player_id, transform.to_matrix());
+    }
+    let avatar_models = model_transforms.values().copied().collect();
+    let mod_actions = mod_actions.read().cloned().collect();
 
     // Upload UI instances only when `UiDrawList.generation` changed.
     if let Some(list) = ui_list.as_deref() {
@@ -534,13 +603,22 @@ pub(super) fn render_frame(
     let ui_buffer_id = render_state.ui_gpu.buffer_id;
 
     let frame = FrameData {
+        frame_index: render_state.frame_index,
+        time_seconds: time.elapsed_secs(),
+        delta_seconds: time.delta_secs(),
         view_proj,
+        camera_position: camera_transform
+            .map(|transform| transform.translation)
+            .unwrap_or(Vec3::ZERO),
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
         avatar_models,
+        model_transforms,
+        mod_actions,
         ui_buffer_id,
         ui_count,
     };
+    render_state.frame_index = render_state.frame_index.wrapping_add(1);
 
     vk.resources.flight(vk.flight_id).wait(None).unwrap();
 
