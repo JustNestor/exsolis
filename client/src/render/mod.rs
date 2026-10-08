@@ -29,6 +29,7 @@ impl Plugin for RendererPlugin {
             (
                 gpu::setup_renderer,
                 meshing::invalidate_stale_meshes.run_if(resource_exists::<RenderState>),
+                meshing::invalidate_for_asset_change,
                 meshing::queue_chunk_meshing.run_if(resource_exists::<RenderState>),
                 meshing::collect_finished_meshes.run_if(resource_exists::<RenderState>),
                 meshing::upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),

@@ -10,7 +10,7 @@ use crate::codec;
 use crate::error::{Error, Result};
 use crate::format::*;
 use crate::util::{atomic_write, default_threads, par_map};
-use crate::writer::{PackStats, PakWriter, Packed};
+use crate::writer::{PackStats, Packed, PakWriter};
 
 /// Compression intent. Maps onto zrip levels (zrip's ceiling is level 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,12 +154,23 @@ impl PakBuilder {
         self.items.is_empty()
     }
 
-    fn push(&mut self, path: &str, source: Source, intent: Option<Intent>, size_hint: u64) -> Result<&mut Self> {
+    fn push(
+        &mut self,
+        path: &str,
+        source: Source,
+        intent: Option<Intent>,
+        size_hint: u64,
+    ) -> Result<&mut Self> {
         let path = normalize_path(path)?;
         if !self.seen.insert(path.clone()) {
             return Err(Error::DuplicatePath(path));
         }
-        self.items.push(Pending { path, source, intent, size_hint });
+        self.items.push(Pending {
+            path,
+            source,
+            intent,
+            size_hint,
+        });
         Ok(self)
     }
 
@@ -168,7 +179,12 @@ impl PakBuilder {
         self.push(path, Source::Bytes(data), None, n)
     }
 
-    pub fn add_bytes_with(&mut self, path: &str, data: Vec<u8>, intent: Intent) -> Result<&mut Self> {
+    pub fn add_bytes_with(
+        &mut self,
+        path: &str,
+        data: Vec<u8>,
+        intent: Intent,
+    ) -> Result<&mut Self> {
         let n = data.len() as u64;
         self.push(path, Source::Bytes(data), Some(intent), n)
     }
@@ -193,7 +209,11 @@ impl PakBuilder {
                     .file_name()
                     .into_string()
                     .map_err(|n| Error::InvalidPath(format!("{n:?}")))?;
-                let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                let rel = if prefix.is_empty() {
+                    name
+                } else {
+                    format!("{prefix}/{name}")
+                };
                 let ft = ent.file_type()?;
                 if ft.is_dir() {
                     stack.push((ent.path(), rel));

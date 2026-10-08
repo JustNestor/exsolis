@@ -31,6 +31,7 @@ use bevy_renet::{
 use bevy_window::{Window, WindowPlugin, WindowResolution};
 use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 
+mod assets;
 mod block_textures;
 mod chunk;
 mod chunk_registry;
@@ -92,6 +93,7 @@ fn main() {
         .insert_resource(RenetClient::new(connection_config()))
         .add_observer(log_netcode_error)
         .add_plugins(NetPlugin)
+        .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)

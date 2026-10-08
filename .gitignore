@@ -1,3 +1,10 @@
 /target
 log*
 assets/ui/fastfetch.png
+
+crates/fastpak/goldclient_test.pak
+.exsolis/
+/downloaded/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+/graft/

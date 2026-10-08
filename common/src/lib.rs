@@ -16,6 +16,13 @@ pub const SPAWN_POS: [f32; 3] = [0.0, 28.0, 0.0];
 pub type LevelId = u32;
 pub type PlayerId = u64;
 
+/// A stable asset name and the fastpak xxh3-64 checksum of its decoded bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AssetHash {
+    pub path: String,
+    pub checksum: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ChunkCoord {
     pub x: i32,
@@ -167,6 +174,16 @@ pub enum ClientMessage {
         id: String, // "namespace:action"
         state: KeybindState,
     },
+    /// Assets the client does not have (or has at a different content hash).
+    AssetRequest {
+        assets: Vec<AssetHash>,
+    },
+    /// The client has persisted and verified the requested assets.
+    AssetSyncComplete,
+    /// A client asset handler completed a server-requested preload.
+    AssetLoadComplete {
+        paths: Vec<String>,
+    },
 }
 
 #[non_exhaustive]
@@ -240,6 +257,34 @@ pub enum ServerMessage {
     },
     UnregisterKeybind {
         id: String,
+    },
+    /// Server-authored catalog for the current session. The server remains the
+    /// authority on which assets are required; client hashes only avoid transfers.
+    AssetManifest {
+        assets: Vec<AssetHash>,
+        base_url: String,
+    },
+    /// Authenticated, short-lived HTTP(S) URL for a fastpak delta archive.
+    AssetDownload {
+        url: String,
+        assets: Vec<AssetHash>,
+    },
+    /// Ask the client to make these assets resident through their registered handlers.
+    AssetLoad {
+        paths: Vec<String>,
+    },
+    /// New or changed assets are available; download and apply them immediately.
+    AssetUpdate {
+        url: String,
+        assets: Vec<AssetHash>,
+    },
+    /// Files removed from the authoritative catalog during development.
+    AssetRemove {
+        paths: Vec<String>,
+    },
+    /// The server could not create the requested pak; clients may join with fallbacks.
+    AssetDownloadFailed {
+        reason: String,
     },
 }
 

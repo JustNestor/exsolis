@@ -29,7 +29,11 @@ pub struct OpenOptions {
 
 impl Default for OpenOptions {
     fn default() -> Self {
-        Self { validate: true, verify_reads: false, max_asset_size: 1 << 30 }
+        Self {
+            validate: true,
+            verify_reads: false,
+            max_asset_size: 1 << 30,
+        }
     }
 }
 
@@ -100,7 +104,10 @@ impl Pak {
                 return Err(Error::Corrupt("bad magic"));
             }
             if h.version.get() != VERSION {
-                return Err(Error::Unsupported(format!("pak version {}", h.version.get())));
+                return Err(Error::Unsupported(format!(
+                    "pak version {}",
+                    h.version.get()
+                )));
             }
             let total = usz(h.total_len.get())?;
             if total != bytes.len() {
@@ -160,7 +167,9 @@ impl Pak {
                     let codec = Codec::from_u8(e.codec)
                         .ok_or_else(|| Error::Unsupported(format!("codec id {}", e.codec)))?;
                     let off = usz(e.offset.get())?;
-                    let end = off.checked_add(e.stored_len.get() as usize).ok_or_else(ovf)?;
+                    let end = off
+                        .checked_add(e.stored_len.get() as usize)
+                        .ok_or_else(ovf)?;
                     if off < HEADER_SIZE || end > layout.data_end {
                         return Err(Error::Corrupt("blob out of range"));
                     }
@@ -222,7 +231,9 @@ impl Pak {
     }
 
     fn entry(&self, id: EntryId) -> Result<&Entry> {
-        self.entries().get(id.0 as usize).ok_or(Error::Corrupt("bad entry id"))
+        self.entries()
+            .get(id.0 as usize)
+            .ok_or(Error::Corrupt("bad entry id"))
     }
 
     fn blob(&self, e: &Entry) -> Result<&[u8]> {
@@ -310,7 +321,8 @@ impl Pak {
     }
 
     pub fn iter_ext(&self, ext: &str) -> impl Iterator<Item = EntryInfo<'_>> + '_ {
-        self.ext_range(ext).filter_map(move |i| self.info(EntryId(i as u32)))
+        self.ext_range(ext)
+            .filter_map(move |i| self.info(EntryId(i as u32)))
     }
 
     /// Hints the OS to page in every asset of this extension with one sequential
@@ -327,8 +339,11 @@ impl Pak {
             hi = hi.max(e.offset.get() + e.stored_len.get() as u64);
         }
         let start = lo & !0xFFFF; // page-aligned (64 KiB covers 4/16/64 KiB pages)
-        self.mmap
-            .advise_range(memmap2::Advice::WillNeed, start as usize, (hi - start) as usize)?;
+        self.mmap.advise_range(
+            memmap2::Advice::WillNeed,
+            start as usize,
+            (hi - start) as usize,
+        )?;
         Ok(())
     }
 
@@ -341,7 +356,9 @@ impl Pak {
     /// mmap (zero-copy, no allocation); compressed ones are decoded into a new Vec.
     /// Only this asset's bytes are touched.
     pub fn get(&self, path: &str) -> Result<Cow<'_, [u8]>> {
-        let id = self.find(path).ok_or_else(|| Error::NotFound(path.to_owned()))?;
+        let id = self
+            .find(path)
+            .ok_or_else(|| Error::NotFound(path.to_owned()))?;
         self.get_id(id)
     }
 
@@ -408,9 +425,7 @@ impl Pak {
         }
         out.into_iter()
             .enumerate()
-            .map(|(i, r)| {
-                r.unwrap_or_else(|| Err(Error::NotFound(paths[i].as_ref().to_owned())))
-            })
+            .map(|(i, r)| r.unwrap_or_else(|| Err(Error::NotFound(paths[i].as_ref().to_owned()))))
             .collect()
     }
 

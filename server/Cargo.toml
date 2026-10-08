@@ -13,6 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 exsolis_common.workspace = true
+fastpack.workspace = true
+axum.workspace = true
+bytes.workspace = true
+tokio.workspace = true
 
 bevy_app.workspace = true
 bevy_ecs.workspace = true

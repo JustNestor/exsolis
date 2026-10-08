@@ -47,65 +47,28 @@ pub fn on_server_event(
     event: On<RenetServerEvent>,
     mut commands: Commands,
     mut player_map: ResMut<PlayerMap>,
-    positions: Query<&PlayerPosition>,
     mut outgoing: MessageWriter<OutgoingPacket>,
+    catalog: Res<crate::assets::AssetCatalog>,
+    mut http: ResMut<crate::assets::AssetHttpService>,
+    mut pending: ResMut<crate::assets::PendingAssetJoins>,
 ) {
     match **event {
         ServerEvent::ClientConnected { client_id } => {
             info!("client {client_id} connected");
-
-            // 1. Send all existing connected players to the new client
-            for (&existing_id, &existing_entity) in &player_map.playerid_to_entity {
-                outgoing.write(OutgoingPacket::to(
-                    client_id,
-                    ServerMessage::PlayerJoined(existing_id),
-                ));
-
-                if let Ok(pos) = positions.get(existing_entity) {
-                    outgoing.write(OutgoingPacket::to(
-                        client_id,
-                        ServerMessage::PlayerMoved {
-                            player_id: existing_id,
-                            x: pos.0.x,
-                            y: pos.0.y,
-                            z: pos.0.z,
-                        },
-                    ));
-                }
-            }
-
-            // 2. Initialize inventory and spawn entity for new player
-            let mut inventory = crate::Inventory::default();
-            for block in [
-                BlockType::Dirt,
-                BlockType::Stone,
-                BlockType::Sand,
-                BlockType::Snow,
-                BlockType::Glass,
-            ] {
-                inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
-            }
-
-            let entity = commands
-                .spawn((
-                    Player(client_id),
-                    PlayerPosition(Vec3::from(SPAWN_POS)),
-                    PlayerInput::default(),
-                    PositionSync::default(),
-                    inventory,
-                ))
-                .id();
-            player_map.playerid_to_entity.insert(client_id, entity);
-            player_map.entity_to_playerid.insert(entity, client_id);
-
-            commands.write_message(PlayerJoined(client_id));
-
-            // 3. Broadcast PlayerJoined for the new client to everyone else
-            // let join_msg = bincode::serialize(&ServerMessage::PlayerJoined(client_id)).unwrap();
-            // server.broadcast_message_except(client_id, DefaultChannel::ReliableOrdered, join_msg);
+            crate::assets::handle_connected(
+                client_id,
+                &catalog,
+                &mut http,
+                &mut pending,
+                &mut outgoing,
+            );
         }
         ServerEvent::ClientDisconnected { client_id, reason } => {
             info!("client {client_id} disconnected: {reason}");
+            crate::assets::handle_disconnected(client_id, &mut pending);
+            if !player_map.playerid_to_entity.contains_key(&client_id) {
+                return;
+            }
             if let Some(entity) = player_map.playerid_to_entity.remove(&client_id) {
                 player_map.entity_to_playerid.remove(&entity);
                 commands.entity(entity).despawn();
@@ -118,6 +81,60 @@ pub fn on_server_event(
             )));
         }
     }
+}
+
+/// Called only after the client has downloaded, merged, and verified its
+/// server-required asset set.
+pub(crate) fn spawn_joined_player(
+    client_id: PlayerId,
+    commands: &mut Commands,
+    player_map: &mut PlayerMap,
+    positions: &Query<&PlayerPosition>,
+    outgoing: &mut MessageWriter<OutgoingPacket>,
+) {
+    if player_map.playerid_to_entity.contains_key(&client_id) {
+        return;
+    }
+    for (&existing_id, &existing_entity) in &player_map.playerid_to_entity {
+        outgoing.write(OutgoingPacket::to(
+            client_id,
+            ServerMessage::PlayerJoined(existing_id),
+        ));
+        if let Ok(pos) = positions.get(existing_entity) {
+            outgoing.write(OutgoingPacket::to(
+                client_id,
+                ServerMessage::PlayerMoved {
+                    player_id: existing_id,
+                    x: pos.0.x,
+                    y: pos.0.y,
+                    z: pos.0.z,
+                },
+            ));
+        }
+    }
+
+    let mut inventory = crate::Inventory::default();
+    for block in [
+        BlockType::Dirt,
+        BlockType::Stone,
+        BlockType::Sand,
+        BlockType::Snow,
+        BlockType::Glass,
+    ] {
+        inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+    }
+    let entity = commands
+        .spawn((
+            Player(client_id),
+            PlayerPosition(Vec3::from(SPAWN_POS)),
+            PlayerInput::default(),
+            PositionSync::default(),
+            inventory,
+        ))
+        .id();
+    player_map.playerid_to_entity.insert(client_id, entity);
+    player_map.entity_to_playerid.insert(entity, client_id);
+    commands.write_message(PlayerJoined(client_id));
 }
 
 /// Fans `IncomingPacket`s out into the per-feature request `Message`s

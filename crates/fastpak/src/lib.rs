@@ -49,3 +49,59 @@ pub use format::{cmp_entries, ext_of, normalize_path, Codec};
 pub use merge::{merge, merge_to, Conflict, MergeOptions};
 pub use reader::{EntryId, EntryInfo, OpenOptions, Pak};
 pub use writer::PackStats;
+
+// use fastpak::{Intent, Pak, PakBuilder};
+use std::io::{self, Write};
+use std::time::Instant;
+
+#[test]
+fn test_pack_and_fetch_goldclient() {
+    let source_dir = "/home/nestor/Games/c-s/drive_c/Games/CS 1.6 GoldClient";
+    let pak_path = "goldclient_test.pak";
+
+    // 1. Measure packing latency
+    let pack_start = Instant::now();
+    let mut builder = PakBuilder::new();
+    builder.intent(Intent::Store);
+    builder
+        .add_dir(source_dir)
+        .expect("Failed to read source directory");
+    builder.build(pak_path).expect("Failed to build archive");
+    let pack_duration = pack_start.elapsed();
+
+    // 2. Measure fetching latency (dynamically locating the nested file)
+    let fetch_start = Instant::now();
+    let pak = Pak::open(pak_path).expect("Failed to memory-map archive");
+
+    // Search the index layout for the demo file regardless of its subdirectory depth
+    let target_entry = pak
+        .iter()
+        .find(|e| e.path.ends_with("vbios_de_dust2_2x2.dem"))
+        .expect("vbios_de_dust2_2x2.dem not found in any subdirectory");
+
+    println!("Resolved relative path in archive: {}", target_entry.path);
+
+    // O(1) random-access read using its EntryId[cite: 3, 5]
+    let asset_data = pak
+        .get_id(target_entry.id)
+        .expect("Failed to read asset data");
+    let fetch_duration = fetch_start.elapsed();
+
+    fn to_mb(bytes: usize) -> String {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+
+    // 3. Print metrics and flush stdout
+    println!("\n[PERFORMANCE METRICS]");
+    println!("Packing duration:  {:?}", pack_duration);
+    println!(
+        "Fetching duration: {:?} (size: {} bytes)",
+        fetch_duration,
+        to_mb(asset_data.len())
+    );
+
+    io::stdout().flush().unwrap();
+
+    // Cleanup
+    // let _ = std::fs::remove_file(pak_path);
+}

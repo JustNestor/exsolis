@@ -15,7 +15,9 @@ pub(crate) fn align_up(x: u64, a: u64) -> u64 {
 }
 
 pub(crate) fn default_threads() -> usize {
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
 }
 
 /// Runs `f(0..n)` on up to `threads` scoped threads (dynamic work stealing via an
@@ -57,15 +59,15 @@ where
             slots[i] = Some(t);
         }
     }
-    slots.into_iter().map(|t| t.expect("missing result")).collect()
+    slots
+        .into_iter()
+        .map(|t| t.expect("missing result"))
+        .collect()
 }
 
 /// Writes to `<path>.tmp`, fsyncs, then renames over `path`, so a crash never
 /// leaves a half-written .pak under the final name.
-pub(crate) fn atomic_write<T>(
-    path: &Path,
-    f: impl FnOnce(File) -> Result<(File, T)>,
-) -> Result<T> {
+pub(crate) fn atomic_write<T>(path: &Path, f: impl FnOnce(File) -> Result<(File, T)>) -> Result<T> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".tmp");
     let tmp = PathBuf::from(tmp);

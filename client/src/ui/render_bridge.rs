@@ -352,7 +352,16 @@ fn sync_ui_images(
     vk: Option<Res<VulkanContext>>,
     mut registry: ResMut<UiImageRegistry>,
     wanted: Query<&UiImageSrc>,
+    mut cache_changes: MessageReader<crate::assets::AssetCacheChanged>,
 ) {
+    for change in cache_changes.read() {
+        for asset in &change.assets {
+            if let Some(src) = asset.path.strip_prefix("ui/") {
+                registry.entries.remove(src);
+                registry.failed.remove(src);
+            }
+        }
+    }
     let Some(vk) = vk else {
         return;
     };

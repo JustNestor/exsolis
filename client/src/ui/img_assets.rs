@@ -5,8 +5,6 @@
 
 use std::path::PathBuf;
 
-/// Images referenced by `<img src="...">` live under this folder.
-pub const UI_IMAGE_DIR: &str = "assets/ui";
 /// Sanity cap so a hostile/huge file can't eat VRAM.
 pub const MAX_IMAGE_DIM: u32 = 4096;
 
@@ -17,18 +15,9 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
 }
 
-/// `assets/ui/<src>`, resolved like Bevy's asset root: relative to the
-/// working directory if it exists there, otherwise to `CARGO_MANIFEST_DIR`
-/// (what `cargo run` from a workspace root needs).
+/// UI images are read from the client cache populated by server downloads.
 pub fn path_for(src: &str) -> PathBuf {
-    let local = PathBuf::from(UI_IMAGE_DIR).join(src);
-    if local.exists() {
-        return local;
-    }
-    match std::env::var_os("CARGO_MANIFEST_DIR") {
-        Some(root) => PathBuf::from(root).join(UI_IMAGE_DIR).join(src),
-        None => local,
-    }
+    crate::assets::asset_directory().join("ui").join(src)
 }
 
 /// Header-only read: cheap enough to call while spawning a screen.

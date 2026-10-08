@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::format::cmp_entries;
 use crate::reader::{EntryId, Pak};
 use crate::util::atomic_write;
-use crate::writer::{PackStats, PakWriter, Packed};
+use crate::writer::{PackStats, Packed, PakWriter};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Conflict {
@@ -30,7 +30,11 @@ pub struct MergeOptions {
 
 impl Default for MergeOptions {
     fn default() -> Self {
-        Self { on_conflict: Conflict::LastWins, dedup: false, raw_align: 64 }
+        Self {
+            on_conflict: Conflict::LastWins,
+            dedup: false,
+            raw_align: 64,
+        }
     }
 }
 
@@ -70,7 +74,9 @@ pub fn merge_to<W: Write + Seek>(
     let mut writer = PakWriter::new(w, opts.raw_align, opts.dedup)?;
     for (name, (pi, id)) in list {
         let pak = inputs[pi];
-        let info = pak.info(id).ok_or(Error::Corrupt("bad entry during merge"))?;
+        let info = pak
+            .info(id)
+            .ok_or(Error::Corrupt("bad entry during merge"))?;
         writer.add(Packed {
             name,
             codec: info.codec,

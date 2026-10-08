@@ -112,7 +112,11 @@ impl<W: Write + Seek> PakWriter<W> {
                 off
             }
             None => {
-                let align = if p.codec == Codec::Raw { self.raw_align } else { 8 };
+                let align = if p.codec == Codec::Raw {
+                    self.raw_align
+                } else {
+                    8
+                };
                 self.pad(align)?;
                 let off = self.pos;
                 self.out.write_all(p.stored)?;
@@ -199,7 +203,10 @@ impl<W: Write + Seek> PakWriter<W> {
         let mut stats = self.stats;
         stats.entries = n as u64;
         stats.file_size = total_len;
-        let inner = self.out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+        let inner = self
+            .out
+            .into_inner()
+            .map_err(|e| Error::Io(e.into_error()))?;
         Ok((inner, stats))
     }
 }

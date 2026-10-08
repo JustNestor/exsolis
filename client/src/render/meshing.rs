@@ -36,6 +36,32 @@ const MAX_UPLOADS_PER_FRAME: usize = 4;
 #[derive(Component)]
 pub(crate) struct ChunkMeshUploaded;
 
+/// Asset texture ids are captured in chunk mesh snapshots. Rebuild uploaded
+/// and in-flight meshes after a texture replacement so they reference the
+/// newly registered sampled-image ids.
+pub(super) fn invalidate_for_asset_change(
+    mut commands: Commands,
+    mut changes: MessageReader<crate::assets::AssetCacheChanged>,
+    chunks: Query<Entity, With<Chunk>>,
+) {
+    if !changes.read().any(|change| {
+        change
+            .assets
+            .iter()
+            .any(|asset| asset.path.ends_with(".png"))
+    }) {
+        return;
+    }
+    for entity in &chunks {
+        commands.entity(entity).try_remove::<(
+            ChunkMeshUploaded,
+            MeshingChunk,
+            ChunkMeshReady,
+            MeshNeighbors,
+        )>();
+    }
+}
+
 /// A chunk whose mesh is being built on the async compute pool.
 #[derive(Component)]
 pub(crate) struct MeshingChunk(pub(crate) Option<AsyncTask<ChunkMeshData>>);

@@ -55,6 +55,9 @@ pub struct TextureManager {
     fallback: Option<SampledImageId>,
 }
 
+#[derive(Resource, Default)]
+struct TextureReload(bool);
+
 impl TextureManager {
     pub fn get(&self, name: &str) -> Option<SampledImageId> {
         self.textures.get(name).copied().or(self.fallback)
@@ -93,7 +96,22 @@ pub struct TexturePlugin;
 
 impl Plugin for TexturePlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, setup_textures);
+        app.init_resource::<TextureReload>()
+            .add_systems(Update, (request_texture_reload, setup_textures).chain());
+    }
+}
+
+fn request_texture_reload(
+    mut changes: MessageReader<crate::assets::AssetCacheChanged>,
+    mut reload: ResMut<TextureReload>,
+) {
+    if changes.read().any(|change| {
+        change
+            .assets
+            .iter()
+            .any(|asset| asset.path.ends_with(".png"))
+    }) {
+        reload.0 = true;
     }
 }
 
@@ -118,17 +136,19 @@ fn setup_textures(
     mut commands: Commands,
     vk: Option<Res<VulkanContext>>,
     textures: Option<Res<TextureManager>>,
+    mut reload: ResMut<TextureReload>,
 ) {
     let Some(vk) = vk else {
         return;
     };
-    if textures.is_some() {
+    if textures.is_some() && !reload.0 {
         return;
     }
+    reload.0 = false;
 
-    let base_dir = Path::new("assets");
+    let base_dir = crate::assets::asset_directory();
     let mut discovered = Vec::new();
-    TextureManager::discover_pngs(base_dir, base_dir, &mut discovered);
+    TextureManager::discover_pngs(&base_dir, &base_dir, &mut discovered);
 
     let mut manager = TextureManager::default();
     let mut loaded: HashMap<String, SampledImageId> = HashMap::new();
