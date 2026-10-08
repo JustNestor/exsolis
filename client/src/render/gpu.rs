@@ -11,7 +11,7 @@ use bevy_ecs::prelude::*;
 use bevy_time::Time;
 use bevy_transform::prelude::Transform;
 use bevy_window::{PrimaryWindow, Window};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Quat, Vec3};
 use vulkano::{
     DeviceSize, VulkanError,
     buffer::{Buffer, BufferCreateInfo, BufferUsage},
@@ -591,13 +591,28 @@ pub(super) fn render_frame(
         .iter()
         .map(|(player, transform)| (player.0, transform.to_matrix()))
         .collect();
-    if let (Some(player_id), Some((transform, _))) = (
-        local_player_id.as_deref().and_then(|id| id.0),
-        camera.iter().next(),
-    ) {
-        model_transforms.insert(player_id, transform.to_matrix());
+    let local_player_id = local_player_id.as_deref().and_then(|id| id.0);
+    if let (Some(player_id), Some((transform, camera))) = (local_player_id, camera.iter().next()) {
+        // The camera pitch belongs to the view, not the character model.
+        // The avatar mesh faces local +Z while the camera looks along -Z, so
+        // turn its yaw by PI to make the avatar face the direction of travel.
+        let body_rotation = Quat::from_rotation_y(camera.yaw + std::f32::consts::PI);
+        let model = Mat4::from_scale_rotation_translation(
+            transform.scale,
+            body_rotation,
+            transform.translation,
+        );
+        model_transforms.insert(player_id, model);
     }
-    let avatar_models = model_transforms.values().copied().collect();
+    // This is a first-person camera: drawing its own head from a matrix that
+    // encloses the camera exposes the inside of the cube and blocks the view.
+    // Keep the local matrix in `model_transforms` for shader effects, but only
+    // draw remote avatars here.
+    let avatar_models = model_transforms
+        .iter()
+        .filter(|(player_id, _)| Some(**player_id) != local_player_id)
+        .map(|(_, model)| *model)
+        .collect();
     let mod_actions = mod_actions.read().cloned().collect();
 
     // Upload UI instances only when `UiDrawList.generation` changed.

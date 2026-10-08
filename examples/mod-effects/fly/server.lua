@@ -1,9 +1,11 @@
-api.register_keybind({
-    id = "example:fly",
-    key = "Space",
-    description = "Fly burst",
-    category = "Movement",
-})
+api.on("player_join", function(_ev)
+    api.register_keybind({
+        id = "example:fly",
+        key = "Space",
+        description = "Fly burst",
+        category = "Movement",
+    })
+end)
 
 api.on("keybind", function(ev)
     if ev.id == "example:fly" and ev.pressed then

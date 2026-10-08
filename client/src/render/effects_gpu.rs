@@ -30,6 +30,7 @@ use vulkano::{
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
             rasterization::{CullMode, RasterizationState},
+            vertex_input::VertexInputState,
             viewport::ViewportState,
         },
         layout::{PipelineLayoutCreateInfo, push_constant_ranges_from_stages},
@@ -257,7 +258,9 @@ impl EffectGpuState {
                         None,
                         &GraphicsPipelineCreateInfo {
                             stages: &stages,
-                            vertex_input_state: None,
+                            // Effect geometry is generated from `vertex_index` in WGSL;
+                            // no vertex buffers or attributes are required.
+                            vertex_input_state: Some(&VertexInputState::default()),
                             input_assembly_state: Some(&InputAssemblyState::default()),
                             viewport_state: Some(&ViewportState::default()),
                             rasterization_state: Some(&RasterizationState {

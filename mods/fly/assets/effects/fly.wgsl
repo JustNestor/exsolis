@@ -61,12 +61,20 @@ fn simulate(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let dt = min(frame.delta_time, 0.05);
-    particle.position_age.w += dt;
-    if (particle.position_age.w >= particle.velocity_lifetime.w) {
-        particle.position_age.w = -1.0;
+    let age = particle.position_age.w + dt;
+    if (age >= particle.velocity_lifetime.w) {
+        particle.position_age = vec4<f32>(particle.position_age.xyz, -1.0);
     } else {
-        particle.position_age.xyz += particle.velocity_lifetime.xyz * dt;
-        particle.velocity_lifetime.y -= 0.9 * dt;
+        particle.position_age = vec4<f32>(
+            particle.position_age.xyz + particle.velocity_lifetime.xyz * dt,
+            age
+        );
+        particle.velocity_lifetime = vec4<f32>(
+            particle.velocity_lifetime.x,
+            particle.velocity_lifetime.y - 0.9 * dt,
+            particle.velocity_lifetime.z,
+            particle.velocity_lifetime.w
+        );
     }
     particles[index] = particle;
 }

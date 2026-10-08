@@ -1,0 +1,53 @@
+{
+  "format_version": 1,
+  "id": "example:fly",
+  "frame_inputs": ["frame_index", "time", "delta_time", "viewport", "view_projection", "model"],
+  "actions": [
+    {
+      "id": "example:player_fly",
+      "compute_pass": "spawn",
+      "fields": [
+        { "name": "strength", "source": "strength", "type": "f32" }
+      ],
+      "model_player_id": "player_id"
+    }
+  ],
+  "passes": [
+    {
+      "id": "spawn",
+      "kind": "compute",
+      "shader": "mods/fly/effects/fly.wgsl",
+      "entry_point": "spawn",
+      "workgroups": [128, 1, 1],
+      "writes": ["particles"]
+    },
+    {
+      "id": "simulate",
+      "kind": "compute",
+      "shader": "mods/fly/effects/fly.wgsl",
+      "entry_point": "simulate",
+      "run_each_frame": true,
+      "workgroups": [128, 1, 1],
+      "reads": ["particles"],
+      "writes": ["particles"],
+      "after": ["spawn"]
+    },
+    {
+      "id": "draw",
+      "kind": "graphics",
+      "vertex": { "shader": "mods/fly/effects/fly.wgsl", "entry_point": "vs_main" },
+      "fragment": { "shader": "mods/fly/effects/fly.wgsl", "entry_point": "fs_main" },
+      "phase": "world_transparent",
+      "blend": "additive",
+      "depth": "test",
+      "vertex_count": 6,
+      "instance_count": 8192,
+      "reads": ["particles"],
+      "after": ["simulate"]
+    }
+  ],
+  "buffers": [
+    { "id": "particles", "bytes": 262144, "persistent": true }
+  ],
+  "images": []
+}

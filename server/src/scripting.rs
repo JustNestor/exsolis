@@ -38,6 +38,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -239,13 +240,13 @@ impl ScriptRuntime {
         let outbox: Rc<RefCell<Vec<ScriptRequest>>> = Rc::new(RefCell::new(Vec::new()));
 
         install_api(&lua, outbox.clone())?;
-        load_mods(&lua)?;
-
-        Ok(Self {
+        let runtime = Self {
             lua,
             outbox,
             mod_timestamps: Default::default(),
-        })
+        };
+        runtime.reload_mods()?;
+        Ok(runtime)
     }
 
     pub fn check_and_reload_mods(&self) {
@@ -258,48 +259,28 @@ impl ScriptRuntime {
     }
 
     fn should_reload(&self) -> bool {
-        let dir = Path::new(MODS_DIR);
-        if !dir.is_dir() {
-            return !self.mod_timestamps.borrow().is_empty();
-        }
-
-        let Ok(entries) = fs::read_dir(dir) else {
-            return false;
-        };
-
-        let current_timestamps = self.mod_timestamps.borrow();
-        let mut found_count = 0;
-
-        for entry in entries.filter_map(|e| e.ok()) {
-            let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "lua") {
-                found_count += 1;
-                let mtime = entry.metadata().and_then(|m| m.modified()).ok();
-
-                match (current_timestamps.get(&path), mtime) {
-                    (Some(old_mtime), Some(new_mtime)) => {
-                        if new_mtime > *old_mtime {
-                            return true; // Файл модифіковано
-                        }
-                    }
-                    (None, Some(_)) => return true, // Новий файл додано
-                    _ => {}
-                }
+        let discovered = match discover_lua_files(&crate::assets::mods_directory()) {
+            Ok(paths) => paths,
+            Err(error) => {
+                warn!("scripting: could not scan mod files: {error}");
+                return false;
             }
-        }
-
-        // Якщо якийсь файл видалили з папки
-        if found_count != current_timestamps.len() {
-            return true;
-        }
-
-        false
+        };
+        let current: HashMap<_, _> = discovered.into_iter().collect();
+        let previous = self.mod_timestamps.borrow();
+        current.len() != previous.len()
+            || current
+                .iter()
+                .any(|(path, mtime)| previous.get(path) != Some(mtime))
     }
 
     pub fn reload_mods(&self) -> mlua::Result<()> {
-        let dir = Path::new(MODS_DIR);
+        let dir = crate::assets::mods_directory();
         if !dir.is_dir() {
-            warn!("scripting: no '{MODS_DIR}' directory found, no mods loaded");
+            warn!(
+                "scripting: no '{}' directory found, no mods loaded",
+                dir.display()
+            );
             self.mod_timestamps.borrow_mut().clear();
             return Ok(());
         }
@@ -309,26 +290,12 @@ impl ScriptRuntime {
         globals.set("__handlers", self.lua.create_table()?)?;
         globals.set("__tick_handlers", self.lua.create_table()?)?;
 
-        let mut paths = Vec::new();
-        let mut new_timestamps = HashMap::new();
+        let paths = discover_lua_files(&dir).map_err(|e| {
+            mlua::Error::RuntimeError(format!("could not scan {}: {e}", dir.display()))
+        })?;
+        let new_timestamps: HashMap<_, _> = paths.iter().cloned().collect();
 
-        if let Ok(entries) = fs::read_dir(dir) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "lua") {
-                    let mtime = entry
-                        .metadata()
-                        .and_then(|m| m.modified())
-                        .unwrap_or(SystemTime::UNIX_EPOCH);
-                    new_timestamps.insert(path.clone(), mtime);
-                    paths.push(path);
-                }
-            }
-        }
-
-        paths.sort();
-
-        for path in paths {
+        for (path, _) in paths {
             let src = match fs::read_to_string(&path) {
                 Ok(src) => src,
                 Err(e) => {
@@ -705,34 +672,37 @@ fn collect_scalars(it: impl Iterator<Item = Value>) -> Vec<LuaScalar> {
     it.filter_map(|v| LuaScalar::from_value(&v)).collect()
 }
 
-/// Where mod files live. v1: load every `.lua` file in this directory,
-/// in filename order, at startup. No hot reload yet.
-const MODS_DIR: &str = "mods";
-
-fn load_mods(lua: &Lua) -> mlua::Result<()> {
-    let dir = std::path::Path::new(MODS_DIR);
-    if !dir.is_dir() {
-        warn!("scripting: no '{MODS_DIR}' directory found, no mods loaded");
-        return Ok(());
-    }
-    let mut paths: Vec<_> = std::fs::read_dir(dir)
-        .map_err(|e| mlua::Error::RuntimeError(e.to_string()))?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|ext| ext == "lua"))
-        .collect();
-    paths.sort();
-
-    for path in paths {
-        let src =
-            std::fs::read_to_string(&path).map_err(|e| mlua::Error::RuntimeError(e.to_string()))?;
-        let name = path.display().to_string();
-        if let Err(e) = lua.load(&src).set_name(&name).exec() {
-            error!("scripting: failed to load {name}: {e}");
+/// Discover server Lua scripts recursively. Symlinks are ignored so a mod
+/// cannot make the server traverse files outside its configured mods tree.
+fn discover_lua_files(root: &Path) -> io::Result<Vec<(PathBuf, SystemTime)>> {
+    fn walk(dir: &Path, out: &mut Vec<(PathBuf, SystemTime)>) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                walk(&path, out)?;
+            } else if kind.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("lua"))
+            {
+                let modified = entry
+                    .metadata()?
+                    .modified()
+                    .unwrap_or(SystemTime::UNIX_EPOCH);
+                out.push((path, modified));
+            }
         }
-        info!("[mod] loading {}", name);
+        Ok(())
     }
-    Ok(())
+
+    let mut paths = Vec::new();
+    if root.is_dir() {
+        walk(root, &mut paths)?;
+    }
+    paths.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(paths)
 }
 
 fn forward_player_join(mut events: MessageReader<PlayerJoined>, runtime: NonSend<ScriptRuntime>) {

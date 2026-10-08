@@ -16,7 +16,7 @@
     {
       "id": "spawn",
       "kind": "compute",
-      "shader": "effects/fly.wgsl",
+      "shader": "mods/fly/effects/fly.wgsl",
       "entry_point": "spawn",
       "workgroups": [128, 1, 1],
       "writes": ["particles"]
@@ -24,7 +24,7 @@
     {
       "id": "simulate",
       "kind": "compute",
-      "shader": "effects/fly.wgsl",
+      "shader": "mods/fly/effects/fly.wgsl",
       "entry_point": "simulate",
       "run_each_frame": true,
       "workgroups": [128, 1, 1],
@@ -35,8 +35,8 @@
     {
       "id": "draw",
       "kind": "graphics",
-      "vertex": { "shader": "effects/fly.wgsl", "entry_point": "vs_main" },
-      "fragment": { "shader": "effects/fly.wgsl", "entry_point": "fs_main" },
+      "vertex": { "shader": "mods/fly/effects/fly.wgsl", "entry_point": "vs_main" },
+      "fragment": { "shader": "mods/fly/effects/fly.wgsl", "entry_point": "fs_main" },
       "phase": "world_transparent",
       "blend": "additive",
       "depth": "test",

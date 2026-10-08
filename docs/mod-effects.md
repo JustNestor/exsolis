@@ -157,11 +157,27 @@ buffer alignment. Persistent buffers are initialized once; transient buffers
 are cleared each frame. Updated WGSL or manifests rebuild the package set
 after the active frame completes.
 
-An executable mod package is in
+The fly mod is installed and runnable in this checkout at
+[`mods/fly`](/home/nestor/prj/exsolis/mods/fly). Its source package is in
 [`examples/mod-effects/fly`](/home/nestor/prj/exsolis/examples/mod-effects/fly).
-Copy its `.fxm` and WGSL files into the server's asset catalog and run its Lua
-handler as a server mod. The example spawns and simulates particles in compute,
-then draws them as additive quads when players press Space.
+To install it on another server, copy the example directory's contents into
+`mods/fly`. The server discovers Lua files recursively and scans each mod's
+`assets/` directory recursively. It publishes `.fxm`, `.wgsl`, `.png`, `.xml`,
+and `.json` files automatically; `.lua` files stay server-side. Mod asset paths
+are namespaced as `mods/<mod-name>/...`, so the manifest references the shader
+as `mods/fly/effects/fly.wgsl`. The client loads manifests and WGSL on asset
+sync, then runs the effect when players press Space.
+
+From the workspace root, start the server and client in separate terminals:
+
+```sh
+cargo run -p exsolis_server --bin exsolis_server_bin
+cargo run -p exsolis_client --bin exsolis
+```
+
+The default asset folder remains the source for shared game assets. Set
+`EXSOLIS_MODS_DIR` to use a different server mod directory; the client asset
+catalog remains controlled by `EXSOLIS_ASSET_DIR`.
 
 Naga validates WGSL and generates SPIR-V per entry point and stage; the
 manifest selects which compiled entry points become pipelines. naga-oil is a

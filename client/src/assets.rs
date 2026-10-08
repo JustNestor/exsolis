@@ -181,7 +181,9 @@ fn decode_wgsl(bytes: &[u8]) -> Result<LoadedAsset, String> {
     .map_err(|e| format!("WGSL validation failed: {e}"))?;
 
     let mut spv_options = naga::back::spv::Options::default();
-    spv_options.fake_missing_bindings = false;
+    // Effect WGSL declares the Vulkano descriptor-set ABI directly with
+    // @group/@binding, so preserve those values when Naga resolves resources.
+    spv_options.fake_missing_bindings = true;
     let mut entry_points = Vec::with_capacity(module.entry_points.len());
     for entry in &module.entry_points {
         let pipeline_options = naga::back::spv::PipelineOptions {
@@ -302,20 +304,35 @@ fn asset_worker(
     events: mpsc::Sender<WorkerEvent>,
     paths: AssetCachePaths,
 ) {
+    // Retain the authoritative full manifest across the two-step request:
+    // the server's pak response contains only assets that were transferred,
+    // while effect shaders already present in the local cache still need to
+    // be decoded and made resident before gameplay starts.
+    let mut active_manifest = Vec::new();
     while let Ok(job) = jobs.recv() {
         let event = match job {
-            AssetJob::Manifest(manifest) => match prepare_cache(&paths, &manifest) {
-                Ok(missing) if missing.is_empty() => WorkerEvent::SyncReady(manifest),
-                Ok(missing) => WorkerEvent::NeedAssets(missing),
-                Err(e) => WorkerEvent::Failed(e),
-            },
+            AssetJob::Manifest(manifest) => {
+                active_manifest = manifest.clone();
+                match prepare_cache(&paths, &manifest) {
+                    Ok(missing) if missing.is_empty() => WorkerEvent::SyncReady(manifest),
+                    Ok(missing) => WorkerEvent::NeedAssets(missing),
+                    Err(e) => WorkerEvent::Failed(e),
+                }
+            }
             AssetJob::Download {
                 url,
                 assets,
                 update,
             } => match fetch_merge_extract(&url, &assets, &paths) {
                 Ok(()) if update => WorkerEvent::Updated(assets),
-                Ok(()) => WorkerEvent::SyncReady(assets),
+                Ok(()) => {
+                    let assets = if active_manifest.is_empty() {
+                        assets
+                    } else {
+                        active_manifest.clone()
+                    };
+                    WorkerEvent::SyncReady(assets)
+                }
                 Err(e) => WorkerEvent::Failed(e),
             },
         };

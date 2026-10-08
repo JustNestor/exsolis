@@ -38,22 +38,24 @@ const IDLE_SHUTDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Resource)]
 pub struct AssetCatalog {
-    root: PathBuf,
     assets: HashMap<String, AssetHash>,
-    disk_state: HashMap<PathBuf, (u64, Option<SystemTime>)>,
+    files: HashMap<String, PathBuf>,
+    disk_state: HashMap<String, (u64, Option<SystemTime>)>,
     last_scan: Instant,
 }
 
 impl AssetCatalog {
     fn new() -> Self {
-        let root = asset_root();
-        let (assets, disk_state) = scan_catalog(&root).unwrap_or_else(|e| {
-            warn!("could not build asset catalog from {}: {e}", root.display());
-            (HashMap::new(), HashMap::new())
-        });
+        let assets_root = asset_root();
+        let mods_root = mods_directory();
+        let (assets, files, disk_state) =
+            scan_catalog(&assets_root, &mods_root).unwrap_or_else(|e| {
+                warn!("could not build asset catalog: {e}");
+                (HashMap::new(), HashMap::new(), HashMap::new())
+            });
         Self {
-            root,
             assets,
+            files,
             disk_state,
             last_scan: Instant::now(),
         }
@@ -73,7 +75,9 @@ impl AssetCatalog {
             let Some(actual) = self.assets.get(&item.path) else {
                 continue;
             };
-            let path = self.root.join(&item.path);
+            let Some(path) = self.files.get(&item.path) else {
+                continue;
+            };
             builder
                 .add_file(&item.path, path)
                 .map_err(|e| e.to_string())?;
@@ -91,13 +95,15 @@ impl AssetCatalog {
             return None;
         }
         self.last_scan = Instant::now();
-        let current_state = disk_snapshot(&self.root).unwrap_or_default();
+        let assets_root = asset_root();
+        let mods_root = mods_directory();
+        let current_state = disk_snapshot(&assets_root, &mods_root).unwrap_or_default();
         if current_state == self.disk_state {
             return None;
         }
         self.disk_state = current_state;
-        match scan_catalog(&self.root) {
-            Ok((assets, state)) => {
+        match scan_catalog(&assets_root, &mods_root) {
+            Ok((assets, files, state)) => {
                 self.disk_state = state;
                 let changed: Vec<_> = assets
                     .iter()
@@ -113,6 +119,7 @@ impl AssetCatalog {
                     .cloned()
                     .collect();
                 self.assets = assets;
+                self.files = files;
                 Some((changed, removed))
             }
             Err(e) => {
@@ -474,19 +481,39 @@ fn asset_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../assets")
 }
 
+/// Directory containing server-side mod folders. Each mod may have Lua
+/// sources anywhere below its folder and client assets under `assets/`.
+pub(crate) fn mods_directory() -> PathBuf {
+    if let Some(path) = std::env::var_os("EXSOLIS_MODS_DIR") {
+        return PathBuf::from(path);
+    }
+    let cwd = PathBuf::from("mods");
+    if cwd.is_dir() {
+        return cwd;
+    }
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../mods")
+}
+
 fn scan_catalog(
-    root: &Path,
+    assets_root: &Path,
+    mods_root: &Path,
 ) -> Result<
     (
         HashMap<String, AssetHash>,
-        HashMap<PathBuf, (u64, Option<SystemTime>)>,
+        HashMap<String, PathBuf>,
+        HashMap<String, (u64, Option<SystemTime>)>,
     ),
     String,
 > {
-    let state = disk_snapshot(root).map_err(|e| e.to_string())?;
+    let files = discover_client_assets(assets_root, mods_root)?;
+    let state = snapshot_files(&files).map_err(|e| e.to_string())?;
     let mut builder = PakBuilder::new();
     builder.intent(Intent::Fast);
-    builder.add_dir(root).map_err(|e| e.to_string())?;
+    for (logical_path, disk_path) in &files {
+        builder
+            .add_file(logical_path, disk_path)
+            .map_err(|e| format!("could not add asset '{logical_path}': {e}"))?;
+    }
     let pak_path = temp_pak_path("catalog");
     builder.build(&pak_path).map_err(|e| e.to_string())?;
     let pak = Pak::open(&pak_path).map_err(|e| e.to_string())?;
@@ -504,36 +531,120 @@ fn scan_catalog(
         .collect();
     drop(pak);
     let _ = fs::remove_file(pak_path);
-    Ok((assets, state))
+    Ok((assets, files, state))
 }
 
-fn disk_snapshot(root: &Path) -> std::io::Result<HashMap<PathBuf, (u64, Option<SystemTime>)>> {
-    fn walk(
+fn discover_client_assets(
+    assets_root: &Path,
+    mods_root: &Path,
+) -> Result<HashMap<String, PathBuf>, String> {
+    fn walk_assets(
         dir: &Path,
         root: &Path,
-        out: &mut HashMap<PathBuf, (u64, Option<SystemTime>)>,
+        logical_prefix: &str,
+        filter_extensions: bool,
+        out: &mut HashMap<String, PathBuf>,
     ) -> std::io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let path = entry.path();
             let ty = entry.file_type()?;
             if ty.is_dir() {
-                walk(&path, root, out)?;
+                walk_assets(&path, root, logical_prefix, filter_extensions, out)?;
             } else if ty.is_file() {
-                let metadata = entry.metadata()?;
-                out.insert(
-                    path.strip_prefix(root).unwrap_or(&path).to_path_buf(),
-                    (metadata.len(), metadata.modified().ok()),
-                );
+                if filter_extensions && !is_client_asset_path(&path) {
+                    continue;
+                }
+                let relative = path.strip_prefix(root).unwrap_or(&path);
+                let relative = relative.to_string_lossy().replace('\\', "/");
+                let logical = if logical_prefix.is_empty() {
+                    relative
+                } else {
+                    format!("{logical_prefix}/{relative}")
+                };
+                out.insert(logical, path);
             }
         }
         Ok(())
     }
-    let mut out = HashMap::new();
-    if root.is_dir() {
-        walk(root, root, &mut out)?;
+
+    fn walk_mod_directories(
+        dir: &Path,
+        mods_root: &Path,
+        out: &mut HashMap<String, PathBuf>,
+    ) -> std::io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with('.') {
+                continue;
+            }
+            if name == "assets" {
+                let Some(mod_dir) = path.parent() else {
+                    continue;
+                };
+                let relative_mod = mod_dir.strip_prefix(mods_root).unwrap_or(mod_dir);
+                if relative_mod.as_os_str().is_empty() {
+                    continue;
+                }
+                let mod_name = relative_mod.to_string_lossy().replace('\\', "/");
+                let prefix = format!("mods/{mod_name}");
+                walk_assets(&path, &path, &prefix, true, out)?;
+            } else {
+                walk_mod_directories(&path, mods_root, out)?;
+            }
+        }
+        Ok(())
+    }
+
+    let mut files = HashMap::new();
+    if assets_root.is_dir() {
+        walk_assets(assets_root, assets_root, "", false, &mut files)
+            .map_err(|e| format!("{}: {e}", assets_root.display()))?;
+    }
+
+    if mods_root.is_dir() {
+        walk_mod_directories(mods_root, mods_root, &mut files)
+            .map_err(|e| format!("{}: {e}", mods_root.display()))?;
+    }
+    Ok(files)
+}
+
+fn is_client_asset_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase().as_str(),
+                "fxm" | "wgsl" | "png" | "xml" | "json"
+            )
+        })
+}
+
+fn snapshot_files(
+    files: &HashMap<String, PathBuf>,
+) -> std::io::Result<HashMap<String, (u64, Option<SystemTime>)>> {
+    let mut out = HashMap::with_capacity(files.len());
+    for (logical_path, path) in files {
+        let metadata = fs::metadata(path)?;
+        out.insert(
+            logical_path.clone(),
+            (metadata.len(), metadata.modified().ok()),
+        );
     }
     Ok(out)
+}
+
+fn disk_snapshot(
+    assets_root: &Path,
+    mods_root: &Path,
+) -> std::io::Result<HashMap<String, (u64, Option<SystemTime>)>> {
+    let files = discover_client_assets(assets_root, mods_root).map_err(std::io::Error::other)?;
+    snapshot_files(&files)
 }
 
 fn temp_pak_path(label: &str) -> PathBuf {
