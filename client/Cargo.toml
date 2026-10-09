@@ -55,4 +55,7 @@ rand.workspace = true
 bincode.workspace = true
 offset-allocator.workspace = true
 
+gltf = "0.16"
+gltf_json = "0.16"
+
 # taffy = "0.14.0"
