@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "crates/fastpak"]
+members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf"]
 resolver = "2"
 
 [workspace.dependencies]

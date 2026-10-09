@@ -1,0 +1,17 @@
+[package]
+name = "tesjit-dwarf"
+version = "0.1.0"
+edition = "2024"
+description = "Export Rust type layouts from DWARF into a loadable type database for tesjit."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bincode = "=1.3.3"
+gimli = "0.31"
+memmap2 = "0.9"
+object = "0.36"
+rustc-demangle = "0.1"
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.21"

@@ -132,7 +132,10 @@ pub struct GltfGpuMaterial {
     pub alpha_mode: u32, // 0 = Opaque, 1 = Mask, 2 = Blend
     pub alpha_cutoff: f32,
     pub double_sided: u32,
-    pub _padding: [u32; 3],
+    /// Base-color sampler magnification: 1 = Nearest (block sampler),
+    /// 0 = Linear. From the texture's sampler `magFilter`.
+    pub mag_nearest: u32,
+    pub _padding: [u32; 2],
 }
 
 impl Default for GltfGpuMaterial {
@@ -149,7 +152,8 @@ impl Default for GltfGpuMaterial {
             alpha_mode: 0,
             alpha_cutoff: 0.5,
             double_sided: 0,
-            _padding: [0, 0, 0],
+            mag_nearest: 0,
+            _padding: [0, 0],
         }
     }
 }
@@ -169,6 +173,8 @@ pub struct GltfMaterial {
     pub alpha_mode: AlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
+    /// Base-color texture magnification from the sampler: true = Nearest.
+    pub base_mag_nearest: bool,
 }
 
 /// Texture data from GLTF (decoded to RGBA8 pixels at load time).
@@ -329,9 +335,14 @@ fn load_gltf_material(
     let base_color_factor = pbr.base_color_factor();
     // NOTE: texture index != image index. Our texture list parallels
     // document.images(), so resolve through the texture's source image.
-    let base_color_texture = pbr
-        .base_color_texture()
-        .map(|t| t.texture().source().index());
+    let base_color_info = pbr.base_color_texture();
+    let base_color_texture = base_color_info.as_ref().map(|t| t.texture().source().index());
+    // Honor the authored magnification filter: Nearest gives crisp texels
+    // on pixel-art-ish assets instead of linear blur. Defaults to Linear
+    // when the texture has no sampler (glTF default).
+    let base_mag_nearest = base_color_info.is_some_and(|t| {
+        t.texture().sampler().mag_filter() == Some(gltf::texture::MagFilter::Nearest)
+    });
 
     let normal_texture = material
         .normal_texture()
@@ -362,6 +373,7 @@ fn load_gltf_material(
         alpha_mode,
         alpha_cutoff: material.alpha_cutoff().unwrap_or(0.5),
         double_sided: material.double_sided(),
+        base_mag_nearest,
     })
 }
 
@@ -550,17 +562,24 @@ fn compute_aabb(positions: &[[f32; 3]]) -> Aabb {
     Aabb { min: min.into(), max: max.into() }
 }
 
-/// Convert CPU GltfVertex to GPU GltfGpuVertex with computed tangents.
+/// Convert CPU GltfVertex to GPU GltfGpuVertex. Tangents are only computed
+/// when the model actually needs them (a normal-mapped material exists);
+/// otherwise a constant up-tangent is used. Like bevy_gltf, which only
+/// runs mikktspace when `needs_tangents`, we skip the O(verts) tangent
+/// pass entirely for untextured-lit models.
 pub fn gltf_vertices_to_gpu_vertices(
     vertices: &[GltfVertex],
     indices: &[u32],
+    with_tangents: bool,
 ) -> Vec<GltfGpuVertex> {
-    let positions: Vec<_> = vertices.iter().map(|v| v.position).collect();
-    let normals: Vec<_> = vertices.iter().map(|v| v.normal).collect();
-    let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
-    let colors: Vec<_> = vertices.iter().map(|v| v.color).collect();
-
-    let tangents = compute_tangents(&positions, &normals, &uvs, indices);
+    let tangents = if with_tangents {
+        let positions: Vec<_> = vertices.iter().map(|v| v.position).collect();
+        let normals: Vec<_> = vertices.iter().map(|v| v.normal).collect();
+        let uvs: Vec<_> = vertices.iter().map(|v| v.uv).collect();
+        compute_tangents(&positions, &normals, &uvs, indices)
+    } else {
+        vec![[0.0, 0.0, 1.0, 1.0]; vertices.len()]
+    };
 
     vertices
         .iter()
@@ -622,7 +641,8 @@ pub fn gltf_material_to_gpu_material(
         alpha_mode,
         alpha_cutoff: mat.alpha_cutoff,
         double_sided: if mat.double_sided { 1 } else { 0 },
-        _padding: [0, 0, 0],
+        mag_nearest: if mat.base_mag_nearest { 1 } else { 0 },
+        _padding: [0, 0],
     }
 }
 
@@ -632,6 +652,9 @@ pub struct GltfUploadData {
     pub vertices: Vec<GltfGpuVertex>,
     pub indices: Vec<u32>,
     pub materials: Vec<GltfGpuMaterial>,
+    /// Max UV span across primitives; tiny values magnified over whole
+    /// parts are the usual cause of "blurry" model textures (diagnostic).
+    pub max_uv_span: f32,
 }
 
 /// Upload a GLTF model to GPU buffers (prepares data for upload).
@@ -650,19 +673,40 @@ pub fn upload_gltf_model(
         gpu_materials.push(gltf_material_to_gpu_material(mat, &texture_indices));
     }
 
+    // Tangents are only needed when a normal-mapped material exists.
+    let need_tangents = model.materials.iter().any(|m| m.normal_texture.is_some());
+
     // Collect all vertex/index data
     let mut all_vertices = Vec::new();
     let mut all_indices = Vec::new();
     let mut gpu_primitives = Vec::new();
+
+    // Track max UV span for the upload diagnostic: tiny islands magnified
+    // over whole parts are the usual cause of "blurry" model textures.
+    let mut max_uv_span = 0.0f32;
 
     for (mesh_idx, mesh) in model.meshes.iter().enumerate() {
         for prim in &mesh.primitives {
             let vertex_start = all_vertices.len() as u32;
             let index_start = all_indices.len() as u32;
 
-            // Convert vertices with tangents
-            let gpu_vertices = gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices);
+            // Convert vertices (tangents only when normal-mapped)
+            let gpu_vertices =
+                gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices, need_tangents);
             all_vertices.extend(gpu_vertices);
+
+            // UV span diagnostic
+            if !prim.vertices.is_empty() {
+                let (mut umin, mut umax, mut vmin, mut vmax) =
+                    (f32::MAX, f32::MIN, f32::MAX, f32::MIN);
+                for v in &prim.vertices {
+                    umin = umin.min(v.uv[0]);
+                    umax = umax.max(v.uv[0]);
+                    vmin = vmin.min(v.uv[1]);
+                    vmax = vmax.max(v.uv[1]);
+                }
+                max_uv_span = max_uv_span.max((umax - umin).max(vmax - vmin));
+            }
             all_indices.extend(prim.indices.iter().map(|&i| i + vertex_start));
 
             // Compute bounds
@@ -701,6 +745,7 @@ pub fn upload_gltf_model(
         vertices: all_vertices,
         indices: all_indices,
         materials: gpu_materials,
+        max_uv_span,
     })
 }
 
@@ -831,11 +876,20 @@ pub fn upload_gltf_assets(
         }
         match upload_gltf_model(&mut render_state.gltf_allocator, &asset.model, &indices) {
             Ok(data) => {
+                // UV span diagnostic: tiny islands magnified over whole
+                // parts are the usual cause of "blurry" model textures.
+                if data.max_uv_span < 0.1 {
+                    warn!(
+                        "gltf {path}: max UV span {:.3} — tiny islands, expect blurry magnification",
+                        data.max_uv_span
+                    );
+                }
                 info!(
-                    "gltf uploaded {path}: {} verts, {} prims, {} materials, textures {:?}",
+                    "gltf uploaded {path}: {} verts, {} prims, {} materials, max_uv_span {:.3}, textures {:?}",
                     data.vertices.len(),
                     data.mesh.primitives.len(),
                     data.materials.len(),
+                    data.max_uv_span,
                     indices
                         .iter()
                         .map(|id| id.map(sampled_image_index))
@@ -1081,6 +1135,7 @@ mod tests {
         assert_eq!(offset_of!(GltfGpuMaterial, alpha_mode), 56);
         assert_eq!(offset_of!(GltfGpuMaterial, alpha_cutoff), 60);
         assert_eq!(offset_of!(GltfGpuMaterial, double_sided), 64);
+        assert_eq!(offset_of!(GltfGpuMaterial, mag_nearest), 68);
     }
 
     #[test]
@@ -1182,8 +1237,12 @@ mod tests {
         assert!(vert_count > 0, "duck has no vertices");
         // Tangent generation + material conversion (GPU prep path).
         let prim = &asset.model.meshes[0].primitives[0];
-        let gpu = gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices);
+        let gpu = gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices, true);
         assert_eq!(gpu.len(), prim.vertices.len());
         assert!(gpu.iter().all(|v| v.tangent.iter().all(|c| c.is_finite())));
+        // Untangent path (no normal maps): constant tangent, same count.
+        let gpu_flat = gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices, false);
+        assert_eq!(gpu_flat.len(), prim.vertices.len());
+        assert!(gpu_flat.iter().all(|v| v.tangent == [0.0, 0.0, 1.0, 1.0]));
     }
 }

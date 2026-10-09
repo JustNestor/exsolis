@@ -1,0 +1,18 @@
+[package]
+name = "tesjit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+thiserror = "2.0.21"
+oxc_allocator = "0.152"
+oxc_parser = "0.152"
+oxc_ast = "0.152"
+oxc_span = "0.152"
+cranelift-codegen = "0.136"
+cranelift-frontend = "0.136"
+cranelift-module = "0.136"
+cranelift-jit = "0.136"
+miette = { version = "7.6.0", features = ["fancy"] }
+linkme = "0.3.37"
+cranelift-native = "0.136.1"

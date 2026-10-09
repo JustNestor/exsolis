@@ -593,6 +593,24 @@ created without anisotropy (`anisotropy: None`). Enabled by:
 Result: textures at oblique angles now remain sharp; mipmap selection uses
 the correct LOD based on the anisotropic footprint.
 
+Fixed next (bevy_gltf parity investigation): three code-side improvements
+from comparing with `temp/bevy/crates/bevy_gltf` —
+(a) tangents are now computed only when a normal-mapped material exists
+(bevy runs mikktspace only on `needs_tangents`; ours ran a hand-rolled pass
+always — pure perf, no visual change since tangents are dead data without
+normal maps);
+(b) the authored sampler `magFilter` is honored for base color: Nearest
+selects the block (nearest-mag) sampler instead of linear, giving crisp
+texels on pixel-art-ish assets (all current models author Linear, so no
+change for them — stored as `mag_nearest` in the material buffer);
+(c) UV-span diagnostic: upload logs `max_uv_span` per model and warns below
+0.1 — tiny islands magnified over whole parts are the proven cause of
+"blurry" model textures, now visible in logs instead of requiring a
+debugger.
+Investigation verdict stands: attribute reading (float/normalized ints),
+TEXCOORD handling, image upload, mipmaps, and sampling are equivalent to
+bevy_gltf for our data; the remaining blur is asset UV quality.
+
 ---
 
 ---
