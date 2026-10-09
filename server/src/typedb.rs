@@ -19,8 +19,8 @@ use bevy_ecs::prelude::Resource;
 use bevy_log::{error, info, warn};
 
 pub use tesjit_dwarf::{
-    Field, Head, LeafField, OpaqueKind, TypeArgs, TypeDb, TypeDbDecodeError, TypeDef, TypeName,
-    Variant, FORMAT_VERSION,
+    FORMAT_VERSION, Field, Head, LeafField, OpaqueKind, TypeArgs, TypeDb, TypeDbDecodeError,
+    TypeDef, TypeName, Variant,
 };
 
 /// Path the type database is read from.

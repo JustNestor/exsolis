@@ -360,6 +360,8 @@ fn handle_asset_packets(
     mut outgoing: MessageWriter<OutgoingPacket>,
     mut commands: Commands,
     mut player_map: ResMut<PlayerMap>,
+    mut joining: ResMut<crate::events::JoiningPlayers>,
+    mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
     positions: Query<(&crate::chunks::PlayerPosition, &crate::movement::PlayerLook)>,
 ) {
     for packet in incoming.read() {
@@ -393,8 +395,10 @@ fn handle_asset_packets(
                     packet.player_id,
                     &mut commands,
                     &mut player_map,
+                    &mut joining,
                     &positions,
                     &mut outgoing,
+                    &mut spawns,
                 );
             }
             ClientMessage::AssetLoadComplete { .. } => {}

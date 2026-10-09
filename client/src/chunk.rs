@@ -69,5 +69,6 @@ pub fn block_color(block: BlockType) -> [f32; 3] {
         BlockType::Glass => [0.75, 0.9, 0.95],
         BlockType::Log => [0.4, 0.27, 0.13],
         BlockType::Leaves => [0.15, 0.45, 0.12],
+        BlockType::Chest => [0.55, 0.38, 0.22],
     }
 }

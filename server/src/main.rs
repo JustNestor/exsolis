@@ -22,6 +22,7 @@ use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMe
 
 mod assets;
 mod chunks;
+mod entities;
 mod events;
 mod gltf_pack;
 mod interaction;
@@ -49,6 +50,26 @@ pub struct Player(pub PlayerId);
 
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct Inventory(pub exsolis_common::inventory::Inventory);
+
+/// Item storage owned by something that is not a player: a chest's
+/// block entity, a dropped item's stack, a future furnace output slot.
+/// Same zero-based slot container the player's `Inventory` uses, so mod
+/// code (`mods/container.lua`) treats them identically.
+#[derive(Component, Debug, Clone, Copy, Default)]
+pub struct Container(pub exsolis_common::inventory::Inventory);
+
+impl Deref for Container {
+    type Target = exsolis_common::inventory::Inventory;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for Container {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 impl Deref for Inventory {
     type Target = exsolis_common::inventory::Inventory;
@@ -114,6 +135,7 @@ fn main() {
         .add_plugins((RenetServerPlugin, NetcodeServerPlugin))
         .add_plugins(NetPlugin)
         .add_plugins(assets::AssetServerPlugin)
+        .add_plugins(entities::EntityPlugin)
         .add_plugins(EventsPlugin)
         .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)

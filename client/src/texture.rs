@@ -27,7 +27,7 @@ use vulkano::memory::DeviceAlignment;
 use vulkano::memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter};
 use vulkano_taskgraph::Id;
 use vulkano_taskgraph::command_buffer::{BlitImageInfo, CopyBufferToImageInfo, ImageBlit};
-use vulkano_taskgraph::descriptor_set::{SamplerId};
+use vulkano_taskgraph::descriptor_set::SamplerId;
 
 pub use vulkano_taskgraph::descriptor_set::SampledImageId;
 use vulkano_taskgraph::resource::{HostAccessType, ImageLayoutType};
@@ -117,7 +117,9 @@ impl TextureManager {
                     format: vulkano::format::Format::R8G8B8A8_UNORM,
                     extent: [width, height, 1],
                     mip_levels,
-                    usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    usage: ImageUsage::TRANSFER_SRC
+                        | ImageUsage::TRANSFER_DST
+                        | ImageUsage::SAMPLED,
                     ..Default::default()
                 },
                 &AllocationCreateInfo::default(),

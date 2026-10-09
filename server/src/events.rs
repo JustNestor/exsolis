@@ -1,3 +1,4 @@
+use crate::entities::{DespawnEntityRequest, SpawnEntityRequest, SpawnExtra};
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::{IncomingPacket, OutgoingPacket};
 use crate::scripting::KeybindActionRequested;
@@ -5,15 +6,17 @@ use crate::scripting::KeybindActionRequested;
 use super::*;
 use bevy_ecs::message::Message;
 use chunks::{PlayerPosition, RenderDistanceRequested};
-use exsolis_common::{BlockType, SPAWN_POS};
+use exsolis_common::{BlockType, EntityKind, EntityState, SPAWN_POS};
 use glam::Vec3;
 use movement::{PlayerInput, PlayerLook, PositionSync};
+use std::collections::HashSet;
 
 pub struct EventsPlugin;
 
 impl Plugin for EventsPlugin {
     fn build(&self, app: &mut App) {
-        app.add_message::<PlayerMoved>()
+        app.init_resource::<JoiningPlayers>()
+            .add_message::<PlayerMoved>()
             .add_message::<PlayerJoined>()
             .add_message::<PlayerLeaved>()
             .add_message::<ChatMessage>()
@@ -47,6 +50,9 @@ pub fn on_server_event(
     event: On<RenetServerEvent>,
     mut commands: Commands,
     mut player_map: ResMut<PlayerMap>,
+    mut joining: ResMut<JoiningPlayers>,
+    entity_registry: Res<crate::entities::EntityRegistry>,
+    mut despawns: MessageWriter<DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     catalog: Res<crate::assets::AssetCatalog>,
     mut http: ResMut<crate::assets::AssetHttpService>,
@@ -66,12 +72,23 @@ pub fn on_server_event(
         ServerEvent::ClientDisconnected { client_id, reason } => {
             info!("client {client_id} disconnected: {reason}");
             crate::assets::handle_disconnected(client_id, &mut pending);
-            if !player_map.playerid_to_entity.contains_key(&client_id) {
-                return;
-            }
+            joining.requested.remove(&client_id);
             if let Some(entity) = player_map.playerid_to_entity.remove(&client_id) {
                 player_map.entity_to_playerid.remove(&entity);
-                commands.entity(entity).despawn();
+                // Despawn through the registry so peers get `DespawnEntity`
+                // and the id is retired. The ECS entity itself is removed by
+                // `entities::despawn_requested`.
+                match entity_registry.id_of(entity) {
+                    Some(id) => {
+                        despawns.write(DespawnEntityRequest(id));
+                    }
+                    // No registry entry (a client that never finished the
+                    // asset handshake, or one already despawned): take the
+                    // entity down directly so it does not linger.
+                    None => {
+                        commands.entity(entity).despawn();
+                    }
+                }
             }
             commands.write_message(PlayerLeaved(client_id));
 
@@ -85,20 +102,30 @@ pub fn on_server_event(
 
 /// Called only after the client has downloaded, merged, and verified its
 /// server-required asset set.
+///
+/// The player's entity is created through `SpawnEntityRequest` rather than
+/// inline, so the id allocation, component set and `SpawnEntity` broadcast
+/// all live in one place. That means this function cannot know the new
+/// `EntityId` yet — it passes the `PlayerId` as a token and
+/// `entities::spawn_requested` fills `PlayerMap` once the id exists.
 pub(crate) fn spawn_joined_player(
     client_id: PlayerId,
     commands: &mut Commands,
     player_map: &mut PlayerMap,
+    joining: &mut JoiningPlayers,
     positions: &Query<(&PlayerPosition, &PlayerLook)>,
     outgoing: &mut MessageWriter<OutgoingPacket>,
+    spawns: &mut MessageWriter<SpawnEntityRequest>,
 ) {
-    if player_map.playerid_to_entity.contains_key(&client_id) {
+    if !joining.requested.insert(client_id) {
         return;
     }
     outgoing.write(OutgoingPacket::to(
         client_id,
         ServerMessage::YourPlayerId(client_id),
     ));
+    // Everyone already here, so a joining client can render them before it
+    // receives any of their movement updates.
     for (&existing_id, &existing_entity) in &player_map.playerid_to_entity {
         outgoing.write(OutgoingPacket::to(
             client_id,
@@ -119,6 +146,36 @@ pub(crate) fn spawn_joined_player(
         }
     }
 
+    spawns.write(SpawnEntityRequest {
+        kind: EntityKind::Player,
+        state: EntityState {
+            x: SPAWN_POS[0],
+            y: SPAWN_POS[1],
+            z: SPAWN_POS[2],
+            ..Default::default()
+        },
+        model: Some(entities::PLAYER_MODEL.to_string()),
+        scale: entities::PLAYER_MODEL_SCALE,
+        block_pos: None,
+        extra: SpawnExtra::Player,
+        player_token: Some(client_id),
+    });
+    commands.write_message(PlayerJoined(client_id));
+}
+
+/// Clients whose spawn has already been requested this session.
+///
+/// `PlayerMap` cannot be used for this guard: the entity is created a frame
+/// later by `entities::spawn_requested`, so a second call in the same frame
+/// would not see the first one's id yet.
+#[derive(Resource, Default)]
+pub struct JoiningPlayers {
+    pub requested: HashSet<PlayerId>,
+}
+
+/// Components only a player entity carries: input, look, the authoritative
+/// position, sync state and a starting inventory.
+pub(crate) fn attach_player_components(commands: &mut Commands, entity: Entity) {
     let mut inventory = crate::Inventory::default();
     for block in [
         BlockType::Dirt,
@@ -129,19 +186,13 @@ pub(crate) fn spawn_joined_player(
     ] {
         inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
     }
-    let entity = commands
-        .spawn((
-            Player(client_id),
-            PlayerPosition(Vec3::from(SPAWN_POS)),
-            PlayerInput::default(),
-            PlayerLook::default(),
-            PositionSync::default(),
-            inventory,
-        ))
-        .id();
-    player_map.playerid_to_entity.insert(client_id, entity);
-    player_map.entity_to_playerid.insert(entity, client_id);
-    commands.write_message(PlayerJoined(client_id));
+    commands.entity(entity).insert((
+        PlayerPosition(Vec3::from(SPAWN_POS)),
+        PlayerInput::default(),
+        PlayerLook::default(),
+        PositionSync::default(),
+        inventory,
+    ));
 }
 
 /// Fans `IncomingPacket`s out into the per-feature request `Message`s

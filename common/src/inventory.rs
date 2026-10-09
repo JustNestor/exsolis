@@ -106,7 +106,6 @@ impl Inventory {
         }
         true
     }
-
 }
 
 impl Default for Inventory {

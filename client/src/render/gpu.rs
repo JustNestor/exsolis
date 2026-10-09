@@ -12,9 +12,10 @@ use bevy_time::Time;
 use bevy_transform::prelude::Transform;
 use bevy_window::{PrimaryWindow, Window};
 use glam::{Mat4, Quat, Vec3};
+use vulkano::shader::ShaderStages;
 use vulkano::{
     DeviceSize, VulkanError,
-    buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents},
+    buffer::{Buffer, BufferContents, BufferCreateInfo, BufferUsage},
     descriptor_set::{
         DescriptorBufferInfo, DescriptorSet, WriteDescriptorSet,
         allocator::StandardDescriptorSetAllocator,
@@ -28,7 +29,6 @@ use vulkano::{
     },
     pipeline::{
         DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
-        layout::{PipelineLayoutCreateInfo, push_constant_ranges_from_stages},
         graphics::{
             GraphicsPipelineCreateInfo,
             color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState},
@@ -39,10 +39,10 @@ use vulkano::{
             vertex_input::{Vertex, VertexDefinition},
             viewport::ViewportState,
         },
+        layout::{PipelineLayoutCreateInfo, push_constant_ranges_from_stages},
     },
     swapchain::{PresentMode, Swapchain, SwapchainCreateInfo},
 };
-use vulkano::shader::ShaderStages;
 use vulkano_taskgraph::{
     ClearValues, Id, Task, TaskContext, TaskResult,
     command_buffer::RecordingCommandBuffer,
@@ -576,12 +576,18 @@ impl Task for GltfRenderTask {
         }
 
         let shared = self.shared.read().unwrap();
-        let (Some(pipeline), Some(pipeline_nocull), Some(pipeline_blend), Some(pipeline_blend_nocull)) = (
+        let (
+            Some(pipeline),
+            Some(pipeline_nocull),
+            Some(pipeline_blend),
+            Some(pipeline_blend_nocull),
+        ) = (
             shared.gltf_pipeline.as_ref(),
             shared.gltf_pipeline_nocull.as_ref(),
             shared.gltf_pipeline_blend.as_ref(),
             shared.gltf_pipeline_blend_nocull.as_ref(),
-        ) else {
+        )
+        else {
             return Ok(());
         };
         {
@@ -621,9 +627,11 @@ impl Task for GltfRenderTask {
                     (true, true) => pipeline_blend_nocull,
                 };
                 cbf.bind_pipeline(pipe);
-                for draw in world.gltf_draws.iter().filter(|d| {
-                    d.double_sided == double_sided && d.alpha_blend == blend
-                }) {
+                for draw in world
+                    .gltf_draws
+                    .iter()
+                    .filter(|d| d.double_sided == double_sided && d.alpha_blend == blend)
+                {
                     cbf.push_constants(
                         pipe.layout(),
                         0,
@@ -631,7 +639,12 @@ impl Task for GltfRenderTask {
                             view_proj: world.view_proj.to_cols_array_2d(),
                             pixel_sampler_id: world.pixel_sampler_id,
                             linear_sampler_id: world.linear_sampler_id,
-                            camera_position: [world.camera_position.x, world.camera_position.y, world.camera_position.z, 1.0],
+                            camera_position: [
+                                world.camera_position.x,
+                                world.camera_position.y,
+                                world.camera_position.z,
+                                1.0,
+                            ],
                             material_index: draw.material_index,
                             time_seconds: world.time_seconds,
                             _pad: [0.0, 0.0],
@@ -778,13 +791,9 @@ pub(crate) fn upload_gltf_writes(
                     .copy_from_slice(&write.data);
                 }
                 for write in instance_writes {
-                    let end =
-                        write.offset_bytes + (write.data.len() * size_of::<Mat4>()) as u64;
-                    tcx.try_write_buffer::<[Mat4]>(
-                        instance_buffer_id,
-                        write.offset_bytes..end,
-                    )?
-                    .copy_from_slice(&write.data);
+                    let end = write.offset_bytes + (write.data.len() * size_of::<Mat4>()) as u64;
+                    tcx.try_write_buffer::<[Mat4]>(instance_buffer_id, write.offset_bytes..end)?
+                        .copy_from_slice(&write.data);
                 }
                 Ok(())
             },
@@ -885,11 +894,13 @@ pub(super) fn setup_renderer(
 
     // Create GLTF material storage buffer (max 256 materials)
     const MAX_GLTF_MATERIALS: u32 = 256;
-    let gltf_material_buffer_size = size_of::<crate::gltf::GltfGpuMaterial>() as u64 * MAX_GLTF_MATERIALS as u64;
+    let gltf_material_buffer_size =
+        size_of::<crate::gltf::GltfGpuMaterial>() as u64 * MAX_GLTF_MATERIALS as u64;
     let gltf_material_layout = DeviceLayout::new(
         NonZero::new(gltf_material_buffer_size).unwrap(),
         DeviceAlignment::new(align_of::<crate::gltf::GltfGpuMaterial>() as u64).unwrap(),
-    ).expect("gltf material buffer layout exceeds device limits");
+    )
+    .expect("gltf material buffer layout exceeds device limits");
 
     let gltf_material_buffer_id = vk
         .resources
@@ -899,7 +910,8 @@ pub(super) fn setup_renderer(
                 ..Default::default()
             },
             &AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                    | MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
             gltf_material_layout,
@@ -912,7 +924,8 @@ pub(super) fn setup_renderer(
     let gltf_instance_layout = DeviceLayout::new(
         NonZero::new(gltf_instance_buffer_size).unwrap(),
         DeviceAlignment::new(align_of::<Mat4>() as u64).unwrap(),
-    ).expect("gltf instance buffer layout exceeds device limits");
+    )
+    .expect("gltf instance buffer layout exceeds device limits");
 
     let gltf_instance_buffer_id = vk
         .resources
@@ -922,7 +935,8 @@ pub(super) fn setup_renderer(
                 ..Default::default()
             },
             &AllocationCreateInfo {
-                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                    | MemoryTypeFilter::PREFER_DEVICE,
                 ..Default::default()
             },
             gltf_instance_layout,
@@ -1077,7 +1091,11 @@ pub(super) fn setup_renderer(
         virtual_depth_id,
         shared: Arc::clone(&shared),
     };
-    let mut gltf_node = task_graph.create_task_node("GltfModels", vulkano_taskgraph::QueueFamilyType::Graphics, gltf_task);
+    let mut gltf_node = task_graph.create_task_node(
+        "GltfModels",
+        vulkano_taskgraph::QueueFamilyType::Graphics,
+        gltf_task,
+    );
     let gltf_node_id = gltf_node
         .framebuffer(virtual_framebuffer_id)
         .color_attachment(
@@ -1177,8 +1195,18 @@ pub(super) fn setup_renderer(
     shared.write().unwrap().ui_pipeline = Some(ui_pipeline);
 
     // GLTF pipeline (create before moving subpass into effects_gpu)
-    let gltf_vs = unsafe { gltf_vs::load(&vk.device).unwrap().entry_point("main").unwrap() };
-    let gltf_fs = unsafe { gltf_fs::load(&vk.device).unwrap().entry_point("main").unwrap() };
+    let gltf_vs = unsafe {
+        gltf_vs::load(&vk.device)
+            .unwrap()
+            .entry_point("main")
+            .unwrap()
+    };
+    let gltf_fs = unsafe {
+        gltf_fs::load(&vk.device)
+            .unwrap()
+            .entry_point("main")
+            .unwrap()
+    };
 
     let gltf_vertex_input_state = GltfGpuVertex::per_vertex().definition(&gltf_vs).unwrap();
     let gltf_stages = [
@@ -1268,28 +1296,27 @@ pub(super) fn setup_renderer(
 
     // Four variants: {cull, nocull} x {opaque, blend}. Same shaders/layout,
     // so one descriptor set serves all four.
-    let build_gltf_pipeline = |raster: &RasterizationState,
-                               blend: &ColorBlendState,
-                               depth: &DepthStencilState| {
-        GraphicsPipeline::new(
-            &vk.device,
-            None,
-            &GraphicsPipelineCreateInfo {
-                stages: &gltf_stages,
-                vertex_input_state: Some(&gltf_vertex_input_state),
-                input_assembly_state: Some(&InputAssemblyState::default()),
-                viewport_state: Some(&ViewportState::default()),
-                rasterization_state: Some(raster),
-                multisample_state: Some(&MultisampleState::default()),
-                color_blend_state: Some(blend),
-                depth_stencil_state: Some(depth),
-                dynamic_state: &[DynamicState::Viewport],
-                subpass: Some((&subpass).into()),
-                ..GraphicsPipelineCreateInfo::new(&gltf_layout)
-            },
-        )
-        .unwrap()
-    };
+    let build_gltf_pipeline =
+        |raster: &RasterizationState, blend: &ColorBlendState, depth: &DepthStencilState| {
+            GraphicsPipeline::new(
+                &vk.device,
+                None,
+                &GraphicsPipelineCreateInfo {
+                    stages: &gltf_stages,
+                    vertex_input_state: Some(&gltf_vertex_input_state),
+                    input_assembly_state: Some(&InputAssemblyState::default()),
+                    viewport_state: Some(&ViewportState::default()),
+                    rasterization_state: Some(raster),
+                    multisample_state: Some(&MultisampleState::default()),
+                    color_blend_state: Some(blend),
+                    depth_stencil_state: Some(depth),
+                    dynamic_state: &[DynamicState::Viewport],
+                    subpass: Some((&subpass).into()),
+                    ..GraphicsPipelineCreateInfo::new(&gltf_layout)
+                },
+            )
+            .unwrap()
+        };
 
     let gltf_pipeline = build_gltf_pipeline(&gltf_raster_cull, &gltf_blend_off, &gltf_depth_write);
     let gltf_pipeline_nocull =
@@ -1311,8 +1338,16 @@ pub(super) fn setup_renderer(
             &vk.device,
             &Default::default(),
         ));
-        let instance_buf = vk.resources.buffer(gltf_instance_buffer_id).buffer().clone();
-        let material_buf = vk.resources.buffer(gltf_material_buffer_id).buffer().clone();
+        let instance_buf = vk
+            .resources
+            .buffer(gltf_instance_buffer_id)
+            .buffer()
+            .clone();
+        let material_buf = vk
+            .resources
+            .buffer(gltf_material_buffer_id)
+            .buffer()
+            .clone();
         let instance_info = DescriptorBufferInfo {
             buffer: Some(&instance_buf),
             offset: 0,
@@ -1333,8 +1368,7 @@ pub(super) fn setup_renderer(
             &[],
         ) {
             Ok(set) => {
-                shared.write().unwrap().gltf_descriptors =
-                    Some(GltfDescriptors { set, allocator });
+                shared.write().unwrap().gltf_descriptors = Some(GltfDescriptors { set, allocator });
             }
             Err(e) => {
                 bevy_log::warn!("gltf descriptor set failed: {e:?}");
@@ -1471,12 +1505,7 @@ pub(super) fn render_frame(
 
     // Get GLTF buffers, staged draws, and instance count from shared state
     // (staged by sync_gltf_instances earlier in the chain).
-    let (
-        gltf_instance_buffer_id,
-        gltf_instance_count,
-        gltf_material_buffer_id,
-        gltf_draws,
-    ) = {
+    let (gltf_instance_buffer_id, gltf_instance_count, gltf_material_buffer_id, gltf_draws) = {
         let shared = render_state.shared.read().unwrap();
         (
             shared.gltf_instance_buffer_id.unwrap(),

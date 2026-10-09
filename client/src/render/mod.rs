@@ -20,8 +20,8 @@ use bevy_ecs::prelude::*;
 
 use crate::texture::TexturePlugin;
 
-pub use gpu::RenderState;
 pub use allocator::{GpuMeshAllocation, MeshBufferAllocator};
+pub use gpu::RenderState;
 
 pub struct RendererPlugin;
 

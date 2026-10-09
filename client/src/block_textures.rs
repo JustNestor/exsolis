@@ -48,6 +48,9 @@ impl BlockTextures for BlockType {
                 side: "blocks/log_side",
             },
             BlockType::Leaves => TextureMapping::Single("blocks/leaves"),
+            // No dedicated chest art yet; planks read as a wooden crate and
+            // the block entity's container is what actually distinguishes it.
+            BlockType::Chest => TextureMapping::Single("blocks/cherry_planks"),
         })
     }
 

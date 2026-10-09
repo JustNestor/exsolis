@@ -76,7 +76,7 @@ pub struct GltfGpuVertex {
     #[format(R32G32B32A32_SFLOAT)]
     pub color: [f32; 4],
     #[format(R32G32B32A32_SFLOAT)]
-    pub tangent: [f32; 4],  // xyz = tangent, w = bitangent sign
+    pub tangent: [f32; 4], // xyz = tangent, w = bitangent sign
 }
 
 /// GPU-side mesh representation uploaded to vertex/index buffers.
@@ -122,7 +122,7 @@ pub struct Aabb {
 #[repr(C)]
 pub struct GltfGpuMaterial {
     pub base_color_factor: [f32; 4],
-    pub emissive: [f32; 4], // rgb = emissive color, a unused
+    pub emissive: [f32; 4],      // rgb = emissive color, a unused
     pub base_color_texture: u32, // bindless index, 0xFFFFFFFF = none
     pub normal_texture: u32,
     pub occlusion_texture: u32,
@@ -213,8 +213,7 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
             exsolis_common::GLB_MAX_BYTES
         ));
     }
-    let model = load_gltf_model(bytes)
-        .map_err(|e| format!("Failed to load GLTF model: {}", e))?;
+    let model = load_gltf_model(bytes).map_err(|e| format!("Failed to load GLTF model: {}", e))?;
 
     Ok(Arc::new(GltfAsset {
         model,
@@ -225,8 +224,8 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
 /// Load a GLTF model from raw bytes using `import_slice`, which resolves
 /// embedded (GLB BIN, base64 data URIs) buffers and decodes images.
 fn load_gltf_model(bytes: &[u8]) -> Result<GltfModel, String> {
-    let (document, buffers, images) = gltf::import_slice(bytes)
-        .map_err(|e| format!("Failed to parse GLTF: {}", e))?;
+    let (document, buffers, images) =
+        gltf::import_slice(bytes).map_err(|e| format!("Failed to parse GLTF: {}", e))?;
 
     // Load textures from already-decoded image data
     let mut textures = Vec::with_capacity(images.len());
@@ -329,16 +328,16 @@ fn load_gltf_texture(
 }
 
 /// Load a material from GLTF.
-fn load_gltf_material(
-    material: &gltf::Material,
-) -> Result<GltfMaterial, String> {
+fn load_gltf_material(material: &gltf::Material) -> Result<GltfMaterial, String> {
     let pbr = material.pbr_metallic_roughness();
-    
+
     let base_color_factor = pbr.base_color_factor();
     // NOTE: texture index != image index. Our texture list parallels
     // document.images(), so resolve through the texture's source image.
     let base_color_info = pbr.base_color_texture();
-    let base_color_texture = base_color_info.as_ref().map(|t| t.texture().source().index());
+    let base_color_texture = base_color_info
+        .as_ref()
+        .map(|t| t.texture().source().index());
     // Default to Nearest: every model we ship is pixel art, and a glTF
     // sampler that omits `magFilter` (Blockbench's usual export) would
     // otherwise fall back to Linear blur + atlas edge bleed. Only an
@@ -356,13 +355,13 @@ fn load_gltf_material(
     let emissive_texture = material
         .emissive_texture()
         .map(|t| t.texture().source().index());
-    
+
     let alpha_mode = match material.alpha_mode() {
         gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
         gltf::material::AlphaMode::Mask => AlphaMode::Mask,
         gltf::material::AlphaMode::Blend => AlphaMode::Blend,
     };
-    
+
     Ok(GltfMaterial {
         name: material.name().map(String::from),
         base_color_factor,
@@ -387,37 +386,36 @@ fn load_gltf_primitive(
 ) -> Result<GltfPrimitive, String> {
     let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
 
-    
     // Read positions (required)
     let positions: Vec<[f32; 3]> = reader
         .read_positions()
         .ok_or("Primitive missing positions")?
         .collect();
-    
+
     // Read normals (optional, default to up)
     let normals: Vec<[f32; 3]> = reader
         .read_normals()
         .map(|n| n.collect())
         .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
-    
+
     // Read UVs (optional, default to 0,0)
     let uvs: Vec<[f32; 2]> = reader
         .read_tex_coords(0)
         .map(|u| u.into_f32().collect())
         .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
-    
+
     // Read colors (optional, default to white)
     let colors: Vec<[f32; 4]> = reader
         .read_colors(0)
         .map(|c| c.into_rgba_f32().collect())
         .unwrap_or_else(|| vec![[1.0, 1.0, 1.0, 1.0]; positions.len()]);
-    
+
     // Read indices (optional)
     let indices: Vec<u32> = reader
         .read_indices()
         .map(|i| i.into_u32().collect())
         .unwrap_or_else(|| (0..positions.len() as u32).collect());
-    
+
     // Combine into vertices
     let mut vertices = Vec::with_capacity(positions.len());
     for i in 0..positions.len() {
@@ -428,7 +426,7 @@ fn load_gltf_primitive(
             color: colors.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]),
         });
     }
-    
+
     Ok(GltfPrimitive {
         vertices,
         indices,
@@ -491,9 +489,15 @@ fn compute_tangents(
         let r = 1.0 / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
         let tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
 
-        tan1[i0][0] += tangent.x; tan1[i0][1] += tangent.y; tan1[i0][2] += tangent.z;
-        tan1[i1][0] += tangent.x; tan1[i1][1] += tangent.y; tan1[i1][2] += tangent.z;
-        tan1[i2][0] += tangent.x; tan1[i2][1] += tangent.y; tan1[i2][2] += tangent.z;
+        tan1[i0][0] += tangent.x;
+        tan1[i0][1] += tangent.y;
+        tan1[i0][2] += tangent.z;
+        tan1[i1][0] += tangent.x;
+        tan1[i1][1] += tangent.y;
+        tan1[i1][2] += tangent.z;
+        tan1[i2][0] += tangent.x;
+        tan1[i2][1] += tangent.y;
+        tan1[i2][2] += tangent.z;
     }
 
     let mut tangents = Vec::with_capacity(vertex_count);
@@ -506,7 +510,11 @@ fn compute_tangents(
 
         // Calculate handedness
         let tan2_vec = glam::Vec3::from(tan2[i]);
-        let handedness = if n.cross(t).dot(tan2_vec) < 0.0 { -1.0 } else { 1.0 };
+        let handedness = if n.cross(t).dot(tan2_vec) < 0.0 {
+            -1.0
+        } else {
+            1.0
+        };
 
         tangents.push([t.x, t.y, t.z, handedness]);
     }
@@ -517,7 +525,10 @@ fn compute_tangents(
 /// Compute bounding sphere for a set of positions.
 fn compute_bounding_sphere(positions: &[[f32; 3]]) -> BoundingSphere {
     if positions.is_empty() {
-        return BoundingSphere { center: [0.0, 0.0, 0.0], radius: 0.0 };
+        return BoundingSphere {
+            center: [0.0, 0.0, 0.0],
+            radius: 0.0,
+        };
     }
 
     // Ritter's algorithm for approximate bounding sphere
@@ -550,7 +561,10 @@ fn compute_bounding_sphere(positions: &[[f32; 3]]) -> BoundingSphere {
 /// Compute AABB for a set of positions.
 fn compute_aabb(positions: &[[f32; 3]]) -> Aabb {
     if positions.is_empty() {
-        return Aabb { min: [0.0, 0.0, 0.0], max: [0.0, 0.0, 0.0] };
+        return Aabb {
+            min: [0.0, 0.0, 0.0],
+            max: [0.0, 0.0, 0.0],
+        };
     }
 
     let mut min = glam::Vec3::from(positions[0]);
@@ -562,7 +576,10 @@ fn compute_aabb(positions: &[[f32; 3]]) -> Aabb {
         max = max.max(p);
     }
 
-    Aabb { min: min.into(), max: max.into() }
+    Aabb {
+        min: min.into(),
+        max: max.into(),
+    }
 }
 
 /// Convert CPU GltfVertex to GPU GltfGpuVertex. Tangents are only computed
@@ -634,7 +651,12 @@ pub fn gltf_material_to_gpu_material(
 
     GltfGpuMaterial {
         base_color_factor: mat.base_color_factor,
-        emissive: [mat.emissive_factor[0], mat.emissive_factor[1], mat.emissive_factor[2], 0.0],
+        emissive: [
+            mat.emissive_factor[0],
+            mat.emissive_factor[1],
+            mat.emissive_factor[2],
+            0.0,
+        ],
         base_color_texture,
         normal_texture,
         occlusion_texture,
@@ -669,7 +691,6 @@ pub fn upload_gltf_model(
     model: &GltfModel,
     texture_indices: &[Option<SampledImageId>],
 ) -> Result<GltfUploadData, String> {
-
     // Convert materials to GPU format
     let mut gpu_materials = Vec::with_capacity(model.materials.len());
     for mat in &model.materials {
@@ -901,8 +922,8 @@ pub fn upload_gltf_assets(
                 // NOTE: GLTF stride (64 B), not ChunkVertex — hence slots.
                 let offset_v = data.mesh.allocation.vertex_slot() as u64
                     * std::mem::size_of::<GltfGpuVertex>() as u64;
-                let offset_i = data.mesh.allocation.index_slot() as u64
-                    * std::mem::size_of::<u32>() as u64;
+                let offset_i =
+                    data.mesh.allocation.index_slot() as u64 * std::mem::size_of::<u32>() as u64;
                 vertex_writes.push(PendingWrite {
                     offset_bytes: offset_v,
                     data: data.vertices,
@@ -1087,8 +1108,7 @@ pub fn handle_spawn_model_messages(
                 z,
                 scale,
             } => {
-                if !path.ends_with(".glb") || path.len() > exsolis_common::MODEL_PATH_MAX_LEN
-                {
+                if !path.ends_with(".glb") || path.len() > exsolis_common::MODEL_PATH_MAX_LEN {
                     warn!("spawn_model: rejected path {path:?}");
                     continue;
                 }
@@ -1152,15 +1172,16 @@ mod tests {
                 .join("../assets/models")
                 .join(model);
             let Ok(bytes) = std::fs::read(&path) else {
-                eprintln!("SKIPPED {model}: server-generated artifact absent (run server or server tests once)");
+                eprintln!(
+                    "SKIPPED {model}: server-generated artifact absent (run server or server tests once)"
+                );
                 continue;
             };
             let loaded = decode_gltf(&bytes).expect("decode failed");
             let asset = loaded.as_ref().downcast_ref::<GltfAsset>().unwrap();
 
             let glen = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
-            let doc: serde_json::Value =
-                serde_json::from_slice(&bytes[20..20 + glen]).unwrap();
+            let doc: serde_json::Value = serde_json::from_slice(&bytes[20..20 + glen]).unwrap();
             let accs = doc["accessors"].as_array().unwrap();
             let mut pmap: Vec<(&GltfPrimitive, usize)> = Vec::new();
             for mesh in &asset.model.meshes {
@@ -1185,7 +1206,10 @@ mod tests {
                 assert_eq!(prim.vertices.len(), acc["count"].as_u64().unwrap() as usize);
                 for v in &prim.vertices {
                     for k in 0..3 {
-                        let (lo, hi) = (mn[k].as_f64().unwrap() as f32, mx[k].as_f64().unwrap() as f32);
+                        let (lo, hi) = (
+                            mn[k].as_f64().unwrap() as f32,
+                            mx[k].as_f64().unwrap() as f32,
+                        );
                         assert!(
                             v.position[k] >= lo - 1e-3 && v.position[k] <= hi + 1e-3,
                             "{model}: position out of range"
@@ -1229,11 +1253,11 @@ mod tests {
             .as_ref()
             .downcast_ref::<GltfAsset>()
             .expect("wrong asset type");
-        assert!(
-            !asset.model.meshes.is_empty(),
-            "duck has no meshes"
-        );
-        let vert_count: usize = asset.model.meshes.iter()
+        assert!(!asset.model.meshes.is_empty(), "duck has no meshes");
+        let vert_count: usize = asset
+            .model
+            .meshes
+            .iter()
             .flat_map(|mesh| mesh.primitives.iter())
             .map(|prim| prim.vertices.len())
             .sum();

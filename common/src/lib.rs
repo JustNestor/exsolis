@@ -68,12 +68,15 @@ pub enum BlockType {
     Glass = 7,
     Log = 8,
     Leaves = 9,
+    /// Carries a `Container`. Placing one creates a block entity; breaking it
+    /// despawns that entity and spills its slots.
+    Chest = 10,
 }
 
 impl BlockType {
     /// Every variant, indexed by its `u8` discriminant (checked by a test in
     /// chunk_blocks.rs).
-    pub const ALL: [BlockType; 10] = [
+    pub const ALL: [BlockType; 11] = [
         BlockType::Air,
         BlockType::Stone,
         BlockType::Dirt,
@@ -84,6 +87,7 @@ impl BlockType {
         BlockType::Glass,
         BlockType::Log,
         BlockType::Leaves,
+        BlockType::Chest,
     ];
 
     pub fn from_u8(id: u8) -> Option<Self> {
