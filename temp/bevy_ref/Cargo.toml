@@ -1,0 +1,31 @@
+[package]
+name = "bevy_ref"
+version = "0.1.0"
+edition = "2021"
+
+# Standalone workspace: must NOT be pulled into the exsolis workspace root,
+# otherwise cargo aborts with "multiple workspace roots found".
+[workspace]
+
+[dependencies]
+bevy = { version = "0.19", default-features = false, features = [
+    "bevy_asset",
+    "bevy_core_pipeline",
+    "bevy_pbr",
+    "bevy_gltf",
+    "bevy_winit",
+    "bevy_window",
+    "bevy_render",
+    "bevy_log",
+    "png",
+    "ktx2",
+    "zstd_rust",
+    "multi_threaded",
+    "wayland",
+    "x11",
+    "bevy_ui",
+    "bevy_world_serialization",
+    "debug",
+    "default_font",
+    "tonemapping_luts",
+] }

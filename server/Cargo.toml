@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 exsolis_common.workspace = true
 fastpack.workspace = true
+tesjit-dwarf.workspace = true
 axum.workspace = true
 bytes.workspace = true
 tokio.workspace = true

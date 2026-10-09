@@ -185,17 +185,20 @@ pub mod gltf_fs {
 
         const float PI = 3.14159265359;
 
-        vec4 sample_texture(uint bindless_index, vec2 uv, float mip_level, uint mag_nearest) {
+        vec4 sample_texture(uint bindless_index, vec2 uv, uint mag_nearest) {
             if (bindless_index == 0xFFFFFFFFu) {
                 return vec4(1.0);
             }
             SampledImageId tex_id = SampledImageId(bindless_index, 256);
+            // Use texture() so the GPU computes the mip level automatically
+            // from fragment derivatives — textureLod(…, 0.0) was defeating
+            // mipmapping and causing harsh per-triangle sampling artifacts.
             // Honor the authored magnification filter: Nearest gives crisp
             // texels on pixel-art-ish assets instead of linear blur.
             if (mag_nearest != 0u) {
-                return textureLod(vko_sampler2D(tex_id, push_constants.sampler_id), uv, mip_level);
+                return texture(vko_sampler2D(tex_id, push_constants.sampler_id), uv);
             }
-            return textureLod(vko_sampler2D(tex_id, push_constants.linear_sampler_id), uv, mip_level);
+            return texture(vko_sampler2D(tex_id, push_constants.linear_sampler_id), uv);
         }
 
         float distribution_ggx(vec3 N, vec3 H, float roughness) {
@@ -246,7 +249,7 @@ pub mod gltf_fs {
 
             vec3 N = normalize(v_world_normal);
             if (mat.normal_texture != 0xFFFFFFFFu) {
-                vec3 tangent_normal = sample_texture(mat.normal_texture, v_uv, 0.0, 0u).xyz * 2.0 - 1.0;
+                vec3 tangent_normal = sample_texture(mat.normal_texture, v_uv, 0u).xyz * 2.0 - 1.0;
                 vec3 T = normalize(v_tangent.xyz);
                 vec3 B = cross(N, T) * v_tangent.w;
                 mat3 TBN = mat3(T, B, N);
@@ -257,7 +260,7 @@ pub mod gltf_fs {
             float alpha = mat.base_color_factor.a * v_color.a;
 
             if (mat.base_color_texture != 0xFFFFFFFFu) {
-                vec4 tex_color = sample_texture(mat.base_color_texture, v_uv, 0.0, mat.mag_nearest);
+                vec4 tex_color = sample_texture(mat.base_color_texture, v_uv, mat.mag_nearest);
                 base_color *= tex_color.rgb;
                 alpha *= tex_color.a;
             }
@@ -286,7 +289,7 @@ pub mod gltf_fs {
 
             vec3 emissive = mat.emissive.rgb;
             if (mat.emissive_texture != 0xFFFFFFFFu) {
-                emissive *= sample_texture(mat.emissive_texture, v_uv, 0.0, 0u).rgb;
+                emissive *= sample_texture(mat.emissive_texture, v_uv, 0u).rgb;
             }
             emissive = srgb_to_linear(emissive);
             Lo += emissive;
@@ -317,7 +320,7 @@ pub mod gltf_fs {
             }
 
             if (mat.occlusion_texture != 0xFFFFFFFFu) {
-                float ao = sample_texture(mat.occlusion_texture, v_uv, 0.0, 0u).r;
+                float ao = sample_texture(mat.occlusion_texture, v_uv, 0u).r;
                 Lo *= ao;
             }
 

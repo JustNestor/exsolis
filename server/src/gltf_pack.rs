@@ -33,11 +33,11 @@ fn err(what: &str) -> String {
 
 /// Convert a `.gltf` file to self-contained GLB bytes. Sibling files
 /// (`.bin`, images) resolve against the `.gltf`'s parent directory.
-pub fn convert_gltf_file(gltf_path: &Path) -> Result<Vec<u8>, String> {    let dir = gltf_path
+pub fn convert_gltf_file(gltf_path: &Path) -> Result<Vec<u8>, String> {
+    let dir = gltf_path
         .parent()
         .ok_or_else(|| err("gltf path has no parent"))?;
-    let text =
-        std::fs::read_to_string(gltf_path).map_err(|e| err(&format!("read failed: {e}")))?;
+    let text = std::fs::read_to_string(gltf_path).map_err(|e| err(&format!("read failed: {e}")))?;
     let doc: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| err(&format!("json parse failed: {e}")))?;
     let version = doc
@@ -67,7 +67,9 @@ pub fn ensure_converted_glb(gltf_path: &Path) -> Result<PathBuf, String> {
                 }
             }
             match latest {
-                Some(t) => t > glb_mtime || glb_converter_version(&glb_path) != Some(CONVERTER_VERSION),
+                Some(t) => {
+                    t > glb_mtime || glb_converter_version(&glb_path) != Some(CONVERTER_VERSION)
+                }
                 None => true,
             }
         }
@@ -101,8 +103,7 @@ fn referenced_files(gltf_path: &Path) -> Result<Vec<PathBuf>, String> {
     let dir = gltf_path
         .parent()
         .ok_or_else(|| err("gltf path has no parent"))?;
-    let text =
-        std::fs::read_to_string(gltf_path).map_err(|e| err(&format!("read failed: {e}")))?;
+    let text = std::fs::read_to_string(gltf_path).map_err(|e| err(&format!("read failed: {e}")))?;
     let doc: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| err(&format!("json parse failed: {e}")))?;
     let mut out = vec![gltf_path.to_path_buf()];
@@ -114,12 +115,11 @@ fn referenced_files(gltf_path: &Path) -> Result<Vec<PathBuf>, String> {
     };
     if let Some(buffers) = doc.get("buffers") {
         // v1: map, v2: array.
-        let iter: Box<dyn Iterator<Item = &serde_json::Value>> =
-            match buffers {
-                serde_json::Value::Object(m) => Box::new(m.values()),
-                serde_json::Value::Array(a) => Box::new(a.iter()),
-                _ => return Err(err("bad buffers")),
-            };
+        let iter: Box<dyn Iterator<Item = &serde_json::Value>> = match buffers {
+            serde_json::Value::Object(m) => Box::new(m.values()),
+            serde_json::Value::Array(a) => Box::new(a.iter()),
+            _ => return Err(err("bad buffers")),
+        };
         for buf in iter {
             if let Some(uri) = buf.get("uri").and_then(|u| u.as_str()) {
                 push_uri(uri);
@@ -127,12 +127,11 @@ fn referenced_files(gltf_path: &Path) -> Result<Vec<PathBuf>, String> {
         }
     }
     if let Some(images) = doc.get("images") {
-        let iter: Box<dyn Iterator<Item = &serde_json::Value>> =
-            match images {
-                serde_json::Value::Object(m) => Box::new(m.values()),
-                serde_json::Value::Array(a) => Box::new(a.iter()),
-                _ => return Err(err("bad images")),
-            };
+        let iter: Box<dyn Iterator<Item = &serde_json::Value>> = match images {
+            serde_json::Value::Object(m) => Box::new(m.values()),
+            serde_json::Value::Array(a) => Box::new(a.iter()),
+            _ => return Err(err("bad images")),
+        };
         for img in iter {
             if let Some(uri) = img.get("uri").and_then(|u| u.as_str()) {
                 push_uri(uri);
@@ -165,13 +164,20 @@ fn write_glb(json: &serde_json::Value, bin: &[u8]) -> Vec<u8> {
     glb
 }
 
-fn obj<'a>(v: &'a serde_json::Value, key: &str) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
+fn obj<'a>(
+    v: &'a serde_json::Value,
+    key: &str,
+) -> Result<&'a serde_json::Map<String, serde_json::Value>, String> {
     v.get(key)
         .and_then(|v| v.as_object())
         .ok_or_else(|| err(&format!("missing object {key:?}")))
 }
 
-fn index_of(map: &serde_json::Map<String, serde_json::Value>, key: &str, what: &str) -> Result<usize, String> {
+fn index_of(
+    map: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    what: &str,
+) -> Result<usize, String> {
     map.keys()
         .position(|k| k == key)
         .ok_or_else(|| err(&format!("unknown {what} {key:?}")))
@@ -203,10 +209,7 @@ fn mime_for(uri: &str) -> &'static str {
 
 // ---------------------------------------------------------------- v1.0 ---
 
-fn convert_v1(
-    doc: &serde_json::Value,
-    dir: &Path,
-) -> Result<(serde_json::Value, Vec<u8>), String> {
+fn convert_v1(doc: &serde_json::Value, dir: &Path) -> Result<(serde_json::Value, Vec<u8>), String> {
     use serde_json::{Map, Value};
 
     let buffers = obj(doc, "buffers")?;
@@ -294,8 +297,8 @@ fn convert_v1(
                 s.get(k).and_then(|v| v.as_u64()).unwrap_or(dflt as u64) as u32
             };
             samplers_out.push(serde_json::json!({
-                "magFilter": get("magFilter", 9729),
-                "minFilter": get("minFilter", 9729),
+                "magFilter": get("magFilter", 9728),
+                "minFilter": get("minFilter", 9728),
                 "wrapS": get("wrapS", 10497),
                 "wrapT": get("wrapT", 10497),
             }));
@@ -488,14 +491,13 @@ fn convert_v1(
 /// Embed external buffers/images of a 2.0 `.gltf` into one BIN chunk.
 /// Files already embedded (GLB BIN section, `data:` URIs) are rejected with
 /// a clear message — pass those straight to the client as `.glb` instead.
-fn convert_v2(
-    doc: &serde_json::Value,
-    dir: &Path,
-) -> Result<(serde_json::Value, Vec<u8>), String> {
+fn convert_v2(doc: &serde_json::Value, dir: &Path) -> Result<(serde_json::Value, Vec<u8>), String> {
     use serde_json::{Map, Value};
 
     let mut json = doc.clone();
-    let root = json.as_object_mut().ok_or_else(|| err("v2: bad document"))?;
+    let root = json
+        .as_object_mut()
+        .ok_or_else(|| err("v2: bad document"))?;
 
     // Buffers -> concatenated BIN.
     let buffers = root

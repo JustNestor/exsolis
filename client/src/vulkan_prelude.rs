@@ -174,7 +174,7 @@ pub fn setup_vulkan(
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
                 mipmap_mode: SamplerMipmapMode::Linear,
-                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                address_mode: [SamplerAddressMode::Repeat; 3],
                 anisotropy: Some(16.0),
                 ..Default::default()
             })

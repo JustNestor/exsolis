@@ -234,12 +234,11 @@ impl TypeDb {
         // trait-qualification strip.
         for _ in 0..2 {
             let Some(def) = self.types.get(&current) else {
-                if let Some(next) = self.aliases.get(&current) {
-                    if *next != current {
+                if let Some(next) = self.aliases.get(&current)
+                    && *next != current {
                         current = next.clone();
                         continue;
                     }
-                }
                 return current;
             };
             if let TypeArgs::Struct(_) | TypeArgs::Enum(_) = &def.args {
@@ -355,7 +354,7 @@ impl TypeDb {
                 let mut leaves = Vec::new();
                 for field in &s.fields {
                     let base = if s.is_union { 0 } else { field.offset };
-                    let nested = self.layout_inner(&field.ty.as_str(), stack)?;
+                    let nested = self.layout_inner(field.ty.as_str(), stack)?;
                     if nested.is_empty() {
                         leaves.push(LeafField {
                             name: field.name.clone(),
@@ -376,7 +375,7 @@ impl TypeDb {
                 let mut leaves = Vec::new();
                 for variant in &e.variants {
                     for field in &variant.fields {
-                        let nested = self.layout_inner(&field.ty.as_str(), stack)?;
+                        let nested = self.layout_inner(field.ty.as_str(), stack)?;
                         let path = format!("{}::{}", variant.name, field.name);
                         if nested.is_empty() {
                             leaves.push(LeafField {

@@ -49,6 +49,15 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    if db.types.is_empty() {
+        eprintln!(
+            "tesjit-dwarf: `{}` has no exported types; walked {} CUs / {} DIEs (stats: {stats:?})",
+            input.display(),
+            stats.compilation_units,
+            stats.dies
+        );
+        return ExitCode::FAILURE;
+    }
 
     let output = output.unwrap_or_else(|| PathBuf::from("types.tdb"));
     if let Some(parent) = output.parent() {

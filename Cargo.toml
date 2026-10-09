@@ -71,6 +71,7 @@ bevy_picking ="0.19"
 naga = {version="30.0.1", features = ["spv-out", "wgsl-in"]}
 zrip = "0.8.11"
 fastpack = { package = "fastpak", path = "./crates/fastpak" }
+tesjit-dwarf = { path = "./crates/tesjit-dwarf" }
 
 
 # [workspace.dependencies.bevy_mod_scripting]

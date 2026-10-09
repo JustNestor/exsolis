@@ -29,6 +29,7 @@ mod movement;
 mod net;
 mod network;
 mod scripting;
+mod typedb;
 mod ui;
 mod ui_template;
 
@@ -84,6 +85,20 @@ pub fn connection_config() -> ConnectionConfig {
     config
 }
 
+/// Inserts the resource when present (used for the optional type database).
+trait InsertIfPresent {
+    fn insert_resource_or_web<T: Resource>(&mut self, value: Option<T>) -> &mut Self;
+}
+
+impl InsertIfPresent for App {
+    fn insert_resource_or_web<T: Resource>(&mut self, value: Option<T>) -> &mut Self {
+        if let Some(value) = value {
+            self.insert_resource(value);
+        }
+        self
+    }
+}
+
 fn main() {
     // Headless server: no window / renderer, and the main loop is paced to
     // TICK_RATE (20 TPS) instead of spinning as fast as the CPU allows.
@@ -108,6 +123,7 @@ fn main() {
         .insert_resource(RenetServer::new(connection_config()))
         .insert_resource(new_transport())
         .init_resource::<PlayerMap>()
+        .insert_resource_or_web(typedb::ServerTypes::load())
         .add_observer(log_netcode_error)
         .run();
 }

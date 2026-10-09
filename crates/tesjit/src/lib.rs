@@ -12,7 +12,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, Value, types};
@@ -787,15 +786,14 @@ impl<'a, 'f, 's> Cg<'a, 'f, 's> {
             let (val, ty) = match &decl.init {
                 Some(init) => {
                     let v = self.expr(init, declared)?;
-                    if let Some(t) = declared {
-                        if t != v.ty {
+                    if let Some(t) = declared
+                        && t != v.ty {
                             return Err(err(
                                 self.src,
                                 decl.span,
                                 format!("cannot assign {:?} to {:?} (use `as`)", v.ty, t),
                             ));
                         }
-                    }
                     (v.v, v.ty)
                 }
                 None => {
@@ -863,7 +861,8 @@ impl<'a, 'f, 's> Cg<'a, 'f, 's> {
                     (UnaryOperator::BitwiseNot, Ty::I32) => self.b.ins().bnot(a.v),
                     (UnaryOperator::LogicalNot, Ty::Bool) => {
                         // modern cranelift: prefer icmp_imm_s / icmp_imm_u
-                        let v = self.b.ins().icmp_imm(IntCC::Equal, a.v, 0);
+                        // modern cranelift: prefer icmp_imm_s / icmp_imm_u
+                        let v = self.b.ins().icmp_imm_s(IntCC::Equal, a.v, 0);
                         return Ok(Val { v, ty: Ty::Bool });
                     }
                     _ => {

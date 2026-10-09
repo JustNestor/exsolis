@@ -81,11 +81,6 @@ pub fn export(data: &[u8], source_name: &str) -> Result<(TypeDb, ExportStats), E
     let mut builder = Builder::new(&dwarf);
     builder.walk()?;
     let db = builder.finish(source_name, data.len() as u64);
-    if db.types.is_empty() {
-        return Err(ExportError::NoDebugInfo {
-            path: source_name.to_owned(),
-        });
-    }
     Ok((db, builder.stats))
 }
 
@@ -103,6 +98,8 @@ struct DieRec {
     location: Option<u64>,
     count: Option<u64>,
     const_value: Option<i128>,
+    /// `DW_AT_discr_value` on `DW_TAG_variant` DIEs.
+    discr_value: Option<i128>,
 }
 
 /// Where a `DW_AT_type`-style reference points to.
@@ -204,20 +201,22 @@ impl<'a, 'b> Builder<'a, 'b> {
             let mut stack: Vec<usize> = Vec::new();
             while let Some((delta, entry)) = cursor.next_dfs()? {
                 depth += delta;
+                // Deltas go negative while the traversal climbs back out of a
+                // subtree; the iterator itself ends at the unit's end.
+                let local = depth.max(0) as usize;
                 let rec = self.record(&unit, unit_index, entry)?;
                 let die = collected.order.len();
                 collected.parents.push(usize::MAX);
                 collected.children.push(Vec::new());
                 collected.dies.insert(entry.offset(), rec);
                 collected.order.push(entry.offset());
-                if depth >= 2 {
-                    if let Some(&parent) = stack.get(depth as usize - 2) {
+                if local >= 2
+                    && let Some(&parent) = stack.get(local - 2) {
                         collected.parents[die] = parent;
                         collected.children[parent].push(die);
                     }
-                }
-                stack.resize(depth.max(1) as usize, usize::MAX);
-                stack[depth as usize - 1] = die;
+                stack.resize(local.max(1), usize::MAX);
+                stack[local.max(1) - 1] = die;
             }
             for (die, offset) in collected.order.iter().enumerate() {
                 self.abs_index
@@ -245,6 +244,7 @@ impl<'a, 'b> Builder<'a, 'b> {
             location: None,
             count: None,
             const_value: None,
+            discr_value: None,
         };
         let mut attrs = entry.attrs();
         while let Some(attr) = attrs.next()? {
@@ -274,11 +274,16 @@ impl<'a, 'b> Builder<'a, 'b> {
                         .or_else(|| attr.sdata_value().and_then(|v| u64::try_from(v).ok()));
                 }
                 gimli::DW_AT_count => rec.count = attr.udata_value(),
-                gimli::DW_AT_const_value => {
+                gimli::DW_AT_const_value | gimli::DW_AT_discr_value => {
                     let value: Option<i64> = attr
                         .sdata_value()
                         .or_else(|| attr.udata_value().map(|v| v as i64));
-                    rec.const_value = value.map(i128::from);
+                    let value = value.map(i128::from);
+                    if attr.name() == gimli::DW_AT_discr_value {
+                        rec.discr_value = value;
+                    } else {
+                        rec.const_value = value;
+                    }
                 }
                 _ => {}
             }
@@ -463,11 +468,6 @@ fn emit_die(
             name
         }
         gimli::DW_TAG_array_type => {
-            let name = name_for(units, idx)?;
-            emitted.insert(idx, name.clone());
-            if db.types.contains_key(name.as_str()) {
-                return Some(name);
-            }
             let elem = rec
                 .type_ref
                 .and_then(|r| resolve_index(units, r))
@@ -478,12 +478,14 @@ fn emit_die(
                 .find(|c| c.tag == gimli::DW_TAG_subrange_type)
                 .and_then(|c| c.count)
                 .unwrap_or(0);
+            // rustc leaves `DW_AT_name` off array types: synthesize `[T; N]`.
+            let name = name_for(units, idx)
+                .unwrap_or_else(|| TypeName::from(format!("[{elem}; {len}]")));
+            emitted.insert(idx, name.clone());
+            if db.types.contains_key(name.as_str()) {
+                return Some(name);
+            }
             stats.arrays += 1;
-            let name = if name.0.is_empty() {
-                TypeName::from(format!("[{elem}; {len}]"))
-            } else {
-                TypeName::from(format!("[{}; {len}]", name.0))
-            };
             db.types.insert(
                 name.0.clone(),
                 TypeDef {
@@ -500,8 +502,10 @@ fn emit_die(
                 .type_ref
                 .and_then(|r| resolve_index(units, r))
                 .and_then(|p| emit_die(units, p, db, emitted, stats));
-            let name = name_for(units, idx)
-                .unwrap_or_else(|| TypeName::from(format!("&{}", pointee.as_ref().map(|p| p.0.as_str()).unwrap_or("?"))));
+            let name = name_for(units, idx).unwrap_or_else(|| {
+                let pointee = pointee.as_ref().map(|p| p.0.as_str()).unwrap_or("?");
+                TypeName::from(format!("&{pointee}"))
+            });
             emitted.insert(idx, name.clone());
             if db.types.contains_key(name.as_str()) {
                 return Some(name);
@@ -573,17 +577,12 @@ fn emit_die(
         | gimli::DW_TAG_volatile_type
         | gimli::DW_TAG_restrict_type
         | gimli::DW_TAG_atomic_type => {
-            let Some(name) = name_for(units, idx) else {
-                return None;
-            };
+            let name = name_for(units, idx)?;
             emitted.insert(idx, name.clone());
-            let Some(target) = rec
+            let target = rec
                 .type_ref
                 .and_then(|r| resolve_index(units, r))
-                .and_then(|t| emit_die(units, t, db, emitted, stats))
-            else {
-                return None;
-            };
+                .and_then(|t| emit_die(units, t, db, emitted, stats))?;
             if name != target && !db.aliases.contains_key(name.as_str()) {
                 db.aliases.insert(name.0.clone(), target.0.clone());
                 stats.aliases += 1;
@@ -650,33 +649,33 @@ fn emit_enum(
         if rec.tag != gimli::DW_TAG_variant {
             continue;
         }
-        let mut fields = Vec::new();
-        for (ordinal, member) in children_of(units, *child).iter().enumerate() {
-            let crec = units[member.unit].rec(*member);
-            if crec.tag != gimli::DW_TAG_member {
-                continue;
-            }
-            let Some(tref) = crec.type_ref.and_then(|r| resolve_index(units, r)) else {
-                continue;
-            };
-            let Some(ty) = emit_die(units, tref, db, emitted, stats) else {
-                continue;
-            };
-            fields.push(Field {
-                name: crec
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__field{ordinal}")),
-                ty,
-                offset: crec.location.unwrap_or(0),
-            });
-        }
+        // rustc emits the variant payload as a `DW_TAG_member` inside the
+        // variant, named after the variant, whose type is the payload struct.
+        // Its member offsets are relative to the whole enum value.
+        let payload = children_of(units, *child)
+            .into_iter()
+            .map(|m| units[m.unit].rec(m))
+            .find(|crec| crec.tag == gimli::DW_TAG_member);
+        let (variant_name, payload_ty) = payload
+            .map(|crec| {
+                let name = crec.name.clone().unwrap_or_default();
+                let ty = crec
+                    .type_ref
+                    .and_then(|r| resolve_index(units, r))
+                    .and_then(|t| emit_die(units, t, db, emitted, stats));
+                (name, ty)
+            })
+            .unwrap_or_default();
+        let fields = payload_ty
+            .as_ref()
+            .and_then(|ty| match db.get_raw(ty.as_str()).map(|d| &d.args) {
+                Some(TypeArgs::Struct(s)) => Some(s.fields.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
         variants.push(Variant {
-            name: rec
-                .name
-                .clone()
-                .unwrap_or_else(|| format!("__v{}", variants.len())),
-            discr: rec.const_value.unwrap_or(0),
+            name: variant_name,
+            discr: rec.discr_value.or(rec.const_value).unwrap_or(0),
             fields,
         });
     }
@@ -699,25 +698,42 @@ fn child_with_tag(units: &[UnitDies], idx: DieIndex, tag: gimli::DwTag) -> Optio
         .find(|child| units[child.unit].rec(*child).tag == tag)
 }
 
-/// Name of a DIE, synthesized from the parent when the DIE is anonymous.
+/// Qualified name of a DIE.
+///
+/// rustc emits only the short name in `DW_AT_name`; module/crate context lives
+/// in the enclosing `DW_TAG_namespace` chain, so `Block` inside namespace
+/// `dwarf_fix` becomes `dwarf_fix::Block`.
 fn name_for(units: &[UnitDies], idx: DieIndex) -> Option<TypeName> {
     let rec = units[idx.unit].rec(idx);
-    if let Some(name) = &rec.name {
-        if !name.is_empty() {
-            return Some(TypeName::from(name.clone()));
+    if let Some(name) = &rec.name
+        && !name.is_empty() {
+            let mut path = name.clone();
+            let mut parent = units[idx.unit].parents[idx.die];
+            let mut depth = 0;
+            while parent != usize::MAX && depth < 32 {
+                let prec = units[idx.unit].rec(DieIndex { unit: idx.unit, die: parent });
+                if prec.tag == gimli::DW_TAG_namespace
+                    && let Some(ns) = &prec.name {
+                        // Skip anonymous namespaces (`{impl#0}`, etc).
+                        if !ns.starts_with('{') {
+                            path = format!("{ns}::{path}");
+                        }
+                    }
+                depth += 1;
+                parent = units[idx.unit].parents[parent];
+            }
+            return Some(TypeName::from(path));
         }
-    }
     // Anonymous: derive from the enclosing declaration.
     let mut parent = units[idx.unit].parents[idx.die];
     let mut suffix = idx.die.to_string();
     while parent != usize::MAX {
         let prec = units[idx.unit].rec(DieIndex { unit: idx.unit, die: parent });
-        if let Some(name) = &prec.name {
-            if !name.is_empty() {
+        if let Some(name) = &prec.name
+            && !name.is_empty() {
                 return Some(TypeName::from(format!("{name}::{{anon{suffix}}}")));
             }
-        }
-        suffix = format!("{}{}", parent, idx.die);
+        suffix = format!("{parent}{}", idx.die);
         parent = units[idx.unit].parents[parent];
     }
     None
@@ -751,15 +767,14 @@ fn resolve_index(units: &[UnitDies], tref: TypeRef) -> Option<DieIndex> {
             // before this offset, then the DIE inside it.
             let mut containing = None;
             for (index, unit) in units.iter().enumerate() {
-                if unit.start <= tref.offset {
-                    if let Some(die) = unit
+                if unit.start <= tref.offset
+                    && let Some(die) = unit
                         .order
                         .iter()
                         .position(|o| unit.start + o.0 as u64 == tref.offset)
                     {
                         containing = Some(DieIndex { unit: index, die });
                     }
-                }
             }
             containing
         }
@@ -799,11 +814,10 @@ fn infer_alignments(db: &mut TypeDb) {
             break;
         }
         for (name, align) in updates {
-            if let Some(def) = db.types.get_mut(&name) {
-                if def.align == 0 {
+            if let Some(def) = db.types.get_mut(&name)
+                && def.align == 0 {
                     def.align = align;
                 }
-            }
         }
     }
 }

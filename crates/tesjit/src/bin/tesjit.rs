@@ -20,8 +20,9 @@ fn main() -> miette::Result<()> {
     let first = args
         .next()
         .ok_or_else(|| miette::miette!("usage: tesjit <file.ts> | tesjit bench <file.ts>"))?;
+    let run_bench = first == "bench";
 
-    let path = if first == "bench" {
+    let path = if run_bench {
         args.next()
             .ok_or_else(|| miette::miette!("usage: tesjit bench <file.ts>"))?
     } else {
@@ -36,7 +37,7 @@ fn main() -> miette::Result<()> {
     jit.compile(&src)?;
     let compiled = jit.finish()?;
 
-    if first == "bench" {
+    if run_bench {
         bench(&compiled)
     } else {
         run(compiled)
@@ -67,7 +68,7 @@ fn run(compiled: Compiled) -> miette::Result<()> {
 
 /// Fib benchmark driver (the historical CLI behaviour).
 fn bench(c: &Compiled) -> miette::Result<()> {
-    let fib: extern "C" fn(i32) -> i32 = unsafe { c.get("fib").ok_or_else(|| no_fib())? };
+    let fib: extern "C" fn(i32) -> i32 = unsafe { c.get("fib").ok_or_else(no_fib)? };
     let fib2: extern "C" fn(i32, i32) -> i32 = unsafe { c.get("fib2").ok_or_else(no_fib)? };
 
     let inst = Instant::now();

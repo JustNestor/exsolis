@@ -2463,6 +2463,7 @@ dependencies = [
  "rustc-hash 2.1.3",
  "serde_json",
  "smallvec",
+ "tesjit-dwarf",
  "tokio",
 ]
 

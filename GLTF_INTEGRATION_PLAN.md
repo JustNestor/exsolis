@@ -611,6 +611,73 @@ Investigation verdict stands: attribute reading (float/normalized ints),
 TEXCOORD handling, image upload, mipmaps, and sampling are equivalent to
 bevy_gltf for our data; the remaining blur is asset UV quality.
 
+Applied: per-model Nearest forcing for the assimp-sourced models. The
+mechanism already existed end-to-end (source sampler → converter
+passthrough → loader `mag_nearest` → block-sampler select); dragon/girl
+sources had assimp-default `magFilter: 9729` (no artistic intent), so their
+samplers were set to 9728 (Nearest). This is per-model, NOT a global
+default — the authored Linear on Khronos models (duck) is still honored.
+Mip-chain surgery was correctly skipped: the shader forces lod 0, so mip
+count is visually irrelevant. Converter version intentionally NOT bumped
+(mtime freshness picks up source edits).
+
+### Screenshot forensics after "the fix didn't help"
+
+Measured instead of guessed. Findings, in order of importance:
+
+1. **The screenshots predate the fix.** `20261009_224055.png` / `_224101.png`
+   are timestamped 22:40:55 / 22:41:02. The `magFilter: 9728` edit landed at
+   22:45:43 and the regenerated GLBs at 22:46:15 (dragon) / 22:48:21 (girl).
+   The images therefore show the *pre-fix* linear-magnified render and cannot
+   be evidence about the fix. Needs a fresh capture.
+
+2. **The render is smooth-shaded, not texture-magnified.** Pixel inspection
+   (nearest-neighbour zoom of the dragon torso) shows continuous gradients
+   across facets with zero texel structure, and flat per-facet greys. Real
+   magnification of the 512² atlas — even linear at the measured 7.6x median —
+   would still resolve individual texel boundaries. Consistent with the
+   texture contributing an almost-uniform colour per facet, not with a
+   sampling/filter defect.
+
+3. **Magnification is real but not extreme, and differs per model.**
+   texel-footprint vs on-screen size (median over primitives):
+   dragon 7.6x (p90 18x, max 32x) over a 512² atlas; girl 0.17x, i.e. the
+   girl is *minified*, not magnified — her softness is mip/atlas-density, and
+   Nearest cannot affect a minified surface at all (that is why she looks
+   unchanged). This alone explains "no visible change" for the girl.
+
+4. **Both atlases are mostly transparent cutouts**: dragon 56.2% alpha=0,
+   girl 78.5%. Under `MASK` cutoff 0.5 those texels are discarded, so the
+   surviving area is a small fraction of the atlas and the effective texel
+   density of the visible parts is lower still. The dragon has 0.0%
+   white-and-opaque texels, so the pale body is *not* white texels being
+   stretched — it is lighting on near-black geometry (`metallic 0,
+   roughness 1.0`, single hard directional light, ambient 0.03). The pale
+   look is a lighting/material response, which no filter change alters.
+
+5. **Ruled out with evidence, not inspection:**
+   - UV range: all UVs within [0,1]; accessor declared min/max matches the
+     raw bytes exactly (verified against the BIN chunk), so no V-flip or
+     out-of-range UVs. An earlier alarming "UVs up to 10.9" reading was a bug
+     in the throwaway analysis script (double-applied stride), not in data.
+   - Mip chain: `mip_levels = floor(log2(max(w,h)))+1` gives the correct full
+     chain for both 512² and 256².
+   - Bindless plumbing: `SampledImageId(index, 256)` matches `mesh.rs`/
+     `ui_pass.rs`; `sampled_image_index` reads `raw[0]`, the same field the
+     GLSL `_vko_sampled_image_index` uses.
+   - Loader output (verified by temporary diagnostic test, since removed):
+     1 texture decoded at the right size and full RGBA length, material 0
+     bound to it with `mag_nearest = true`, `alpha_mode = Mask`,
+     `base_tex = Some(0)` — the binding path is intact end to end.
+
+**Conclusion:** the pipeline is behaving correctly. The dragon's pale,
+smooth look is (a) genuinely magnified ~7.6x sampling of a mostly-empty
+cutout atlas and (b) hard single-light shading of dark geometry. Nearest
+magnification can only make already-enlarged texels blockier, not sharper in
+any meaningful sense. Remaining work is asset-side (tighter UV islands, denser
+atlas) and shading-side (softer/ambient-balanced lighting), and a fresh
+screenshot is required before judging the Nearest change at all.
+
 ---
 
 ---
