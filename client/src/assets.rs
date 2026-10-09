@@ -136,6 +136,8 @@ impl Plugin for AssetClientPlugin {
         registry.register("png", decode_png);
         registry.register("wgsl", decode_wgsl);
         registry.register("fxm", crate::render::effects::decode_manifest);
+        // Register GLTF loaders
+        crate::gltf::register_gltf_loaders(&mut registry);
         app.insert_resource(WorkerQueue {
             jobs: job_sender,
             receiver: Mutex::new(receiver),
