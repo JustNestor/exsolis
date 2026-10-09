@@ -182,7 +182,7 @@ pub struct UiDrawList {
 }
 
 /// Render-side state for the UI pass.
-pub(super) struct UiPassGpu {
+pub(crate) struct UiPassGpu {
     pub buffer_id: Id<Buffer>,
     pub count: u32,
     generation: u64,

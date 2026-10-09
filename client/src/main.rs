@@ -35,6 +35,7 @@ mod assets;
 mod block_textures;
 mod chunk;
 mod chunk_registry;
+mod gltf;
 mod interaction;
 mod keybinds;
 mod mesh;

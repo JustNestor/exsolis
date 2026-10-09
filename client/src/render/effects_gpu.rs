@@ -108,7 +108,7 @@ struct EffectInstanceState {
     started_at: f32,
 }
 
-pub(super) struct EffectGpuState {
+pub(crate) struct EffectGpuState {
     pub arena_id: Id<Buffer>,
     arena: Arc<Buffer>,
     capacity: u64,

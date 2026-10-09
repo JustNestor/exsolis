@@ -27,7 +27,9 @@ use vulkano::memory::DeviceAlignment;
 use vulkano::memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter};
 use vulkano_taskgraph::Id;
 use vulkano_taskgraph::command_buffer::{BlitImageInfo, CopyBufferToImageInfo, ImageBlit};
-use vulkano_taskgraph::descriptor_set::{SampledImageId, SamplerId};
+use vulkano_taskgraph::descriptor_set::{SamplerId};
+
+pub use vulkano_taskgraph::descriptor_set::SampledImageId;
 use vulkano_taskgraph::resource::{HostAccessType, ImageLayoutType};
 
 use crate::vulkan_prelude::VulkanContext;
@@ -84,6 +86,186 @@ impl TextureManager {
         self.fallback.is_some()
     }
 
+    /// Load GLTF embedded textures from memory and upload to GPU.
+    /// Returns a vector of bindless texture indices (or None if failed).
+    pub fn load_gltf_textures(
+        &mut self,
+        vk: &VulkanContext,
+        gltf_textures: &[crate::gltf::GltfTexture],
+    ) -> Vec<Option<SampledImageId>> {
+        let mut results = Vec::with_capacity(gltf_textures.len());
+        let mut pending = Vec::new();
+
+        for (idx, tex) in gltf_textures.iter().enumerate() {
+            // GltfTexture.image_data is already decoded RGBA8 pixels.
+            if tex.width == 0 || tex.height == 0 || tex.image_data.is_empty() {
+                results.push(None);
+                continue;
+            }
+            let width = tex.width;
+            let height = tex.height;
+            let image_data = tex.image_data.clone();
+            let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+
+            let Ok(image_id) = vk.resources.create_image(
+                &ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: vulkano::format::Format::R8G8B8A8_UNORM,
+                    extent: [width, height, 1],
+                    mip_levels,
+                    usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo::default(),
+            ) else {
+                results.push(None);
+                continue;
+            };
+
+            let Some(layout) = DeviceLayout::new(
+                NonZero::new(image_data.len() as u64).unwrap(),
+                DeviceAlignment::new(4).unwrap(),
+            ) else {
+                results.push(None);
+                continue;
+            };
+
+            let Ok(staging_id) = vk.resources.create_buffer(
+                &BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                layout,
+            ) else {
+                results.push(None);
+                continue;
+            };
+
+            pending.push(PendingGltfTexture {
+                key: format!("gltf_embedded_{}", idx),
+                image_data,
+                width,
+                height,
+                image_id,
+                staging_id,
+                mip_levels,
+                result_idx: idx,
+            });
+            results.push(None); // placeholder
+        }
+
+        if pending.is_empty() {
+            return results;
+        }
+
+        let host_accesses: Vec<_> = pending
+            .iter()
+            .map(|p| (p.staging_id, HostAccessType::Write))
+            .collect();
+        vk.resources.flight(vk.flight_id).wait(None).unwrap();
+
+        unsafe {
+            vulkano_taskgraph::execute(
+                &vk.queue,
+                &vk.resources,
+                vk.flight_id,
+                |cbf, tcx| {
+                    for p in &pending {
+                        tcx.try_write_buffer::<[u8]>(p.staging_id, 0..p.image_data.len() as u64)?
+                            .copy_from_slice(&p.image_data);
+
+                        cbf.copy_buffer_to_image(&CopyBufferToImageInfo {
+                            src_buffer: p.staging_id,
+                            dst_image: p.image_id,
+                            ..Default::default()
+                        });
+
+                        let mut mip_w = p.width as i32;
+                        let mut mip_h = p.height as i32;
+                        for mip in 1..p.mip_levels {
+                            let next_w = (mip_w / 2).max(1);
+                            let next_h = (mip_h / 2).max(1);
+
+                            cbf.blit_image(&BlitImageInfo {
+                                src_image: p.image_id,
+                                src_image_layout: ImageLayoutType::Optimal,
+                                dst_image: p.image_id,
+                                dst_image_layout: ImageLayoutType::Optimal,
+                                regions: &[ImageBlit {
+                                    src_subresource: vulkano::image::ImageSubresourceLayers {
+                                        aspects: ImageAspects::COLOR,
+                                        mip_level: mip - 1,
+                                        base_array_layer: 0,
+                                        layer_count: Some(1),
+                                    },
+                                    src_offsets: [[0, 0, 0], [mip_w as u32, mip_h as u32, 1]],
+                                    dst_subresource: vulkano::image::ImageSubresourceLayers {
+                                        aspects: ImageAspects::COLOR,
+                                        mip_level: mip,
+                                        base_array_layer: 0,
+                                        layer_count: Some(1),
+                                    },
+                                    dst_offsets: [[0, 0, 0], [next_w as u32, next_h as u32, 1]],
+                                    ..Default::default()
+                                }],
+                                filter: vulkano::image::sampler::Filter::Linear,
+                                ..Default::default()
+                            });
+
+                            mip_w = next_w;
+                            mip_h = next_h;
+                        }
+                    }
+                    Ok(())
+                },
+                host_accesses,
+                [],
+                [],
+            )
+            .unwrap();
+        }
+
+        let global_set = vk.resources.bindless_context().unwrap().global_set();
+
+        let mut loaded = (*self.textures).clone();
+        let mut fallback = self.fallback;
+
+        for p in pending {
+            let Ok(bindless_id) = global_set.create_sampled_image(
+                p.image_id,
+                &ImageViewCreateInfo {
+                    format: vulkano::format::Format::R8G8B8A8_UNORM,
+                    subresource_range: ImageSubresourceRange {
+                        aspects: ImageAspects::COLOR,
+                        base_mip_level: 0,
+                        level_count: Some(p.mip_levels),
+                        base_array_layer: 0,
+                        layer_count: Some(1),
+                    },
+                    ..Default::default()
+                },
+                ImageLayout::ShaderReadOnlyOptimal,
+            ) else {
+                continue;
+            };
+
+            if fallback.is_none() {
+                fallback = Some(bindless_id);
+            }
+            loaded.insert(p.key.clone(), bindless_id);
+            results[p.result_idx] = Some(bindless_id);
+        }
+
+        self.textures = Arc::new(loaded);
+        self.fallback = fallback;
+
+        results
+    }
+
     fn discover_pngs(dir: &Path, base_dir: &Path, out: &mut Vec<(String, PathBuf)>) {
         let Ok(entries) = fs::read_dir(dir) else {
             return;
@@ -136,6 +318,17 @@ struct PendingTexture {
     image_id: Id<vulkano::image::Image>,
     staging_id: Id<vulkano::buffer::Buffer>,
     mip_levels: u32,
+}
+
+struct PendingGltfTexture {
+    key: String,
+    image_data: Vec<u8>,
+    width: u32,
+    height: u32,
+    image_id: Id<vulkano::image::Image>,
+    staging_id: Id<vulkano::buffer::Buffer>,
+    mip_levels: u32,
+    result_idx: usize,
 }
 
 /// Scans `assets/` for every `.png`, uploads the whole batch (mip-chain

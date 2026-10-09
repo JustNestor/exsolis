@@ -14,7 +14,7 @@ use bevy_window::{PrimaryWindow, Window};
 use glam::{Mat4, Quat, Vec3};
 use vulkano::{
     DeviceSize, VulkanError,
-    buffer::{Buffer, BufferCreateInfo, BufferUsage},
+    buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents},
     format::{ClearValue, Format},
     image::{Image, ImageCreateInfo, ImageUsage},
     memory::{
@@ -55,6 +55,282 @@ use crate::{
 use super::allocator::{GpuMeshAllocation, MeshBufferAllocator};
 use super::ui_pass::{self, UiDrawList, UiPassGpu};
 
+// GLTF shader modules (inline like mesh.rs)
+pub mod gltf_vs {
+    vulkano_shaders::shader! {
+        ty: "vertex",
+        root_path_env: "CARGO_MANIFEST_DIR",
+        src: r"
+        #version 450
+        #include <vulkano.glsl>
+
+        struct GltfMaterial {
+            vec4 base_color_factor;
+            uint base_color_texture;
+            vec2 metallic_roughness;
+            uint normal_texture;
+            uint occlusion_texture;
+            vec3 emissive_factor;
+            uint emissive_texture;
+            uint alpha_mode;
+            float alpha_cutoff;
+            uint double_sided;
+            uint _pad0;
+            uint _pad1;
+        };
+
+        layout(push_constant) uniform PushConstants {
+            mat4 view_proj;
+            SamplerId sampler_id;
+            SamplerId linear_sampler_id;
+            vec4 camera_position;
+            uint material_index;
+            float time_seconds;
+            vec2 _pad;
+        } push_constants;
+
+        layout(location = 0) in vec3 in_position;
+        layout(location = 1) in vec3 in_normal;
+        layout(location = 2) in vec2 in_uv;
+        layout(location = 3) in vec4 in_color;
+        layout(location = 4) in vec4 in_tangent;
+
+        layout(set = 0, binding = 0, std430) readonly buffer InstanceData {
+            mat4 model_matrices[];
+        } instances;
+
+        layout(set = 0, binding = 1, std430) readonly buffer MaterialData {
+            GltfMaterial materials[];
+        } materials;
+
+        layout(location = 0) out vec3 v_world_pos;
+        layout(location = 1) out vec3 v_world_normal;
+        layout(location = 2) out vec2 v_uv;
+        layout(location = 3) out vec4 v_color;
+        layout(location = 4) out vec4 v_tangent;
+        layout(location = 5) out flat uint v_material_index;
+
+        void main() {
+            uint instance_id = gl_InstanceIndex;
+            mat4 model = instances.model_matrices[instance_id];
+            mat3 normal_matrix = transpose(inverse(mat3(model)));
+
+            vec4 world_pos = model * vec4(in_position, 1.0);
+            v_world_pos = world_pos.xyz;
+            v_world_normal = normalize(normal_matrix * in_normal);
+            v_uv = in_uv;
+            v_color = in_color;
+            v_tangent = in_tangent;
+            v_material_index = 0;
+
+            gl_Position = push_constants.view_proj * world_pos;
+        }
+        ",
+    }
+}
+
+pub mod gltf_fs {
+    vulkano_shaders::shader! {
+        ty: "fragment",
+        root_path_env: "CARGO_MANIFEST_DIR",
+        src: r"
+        #version 450
+        #include <vulkano.glsl>
+
+        struct GltfMaterial {
+            vec4 base_color_factor;
+            uint base_color_texture;
+            vec2 metallic_roughness;
+            uint normal_texture;
+            uint occlusion_texture;
+            vec3 emissive_factor;
+            uint emissive_texture;
+            uint alpha_mode;
+            float alpha_cutoff;
+            uint double_sided;
+            uint _pad0;
+            uint _pad1;
+        };
+
+        layout(push_constant) uniform PushConstants {
+            mat4 view_proj;
+            SamplerId sampler_id;
+            SamplerId linear_sampler_id;
+            vec4 camera_position;
+            uint material_index;
+            float time_seconds;
+            vec2 _pad;
+        } push_constants;
+
+        layout(set = 0, binding = 1, std430) readonly buffer MaterialData {
+            GltfMaterial materials[];
+        } materials;
+
+        layout(location = 0) in vec3 v_world_pos;
+        layout(location = 1) in vec3 v_world_normal;
+        layout(location = 2) in vec2 v_uv;
+        layout(location = 3) in vec4 v_color;
+        layout(location = 4) in vec4 v_tangent;
+        layout(location = 5) in flat uint v_material_index;
+
+        layout(location = 0) out vec4 f_color;
+
+        const float PI = 3.14159265359;
+
+        vec4 sample_texture(uint bindless_index, vec2 uv, float mip_level) {
+            if (bindless_index == 0xFFFFFFFFu) {
+                return vec4(1.0);
+            }
+            SampledImageId tex_id = SampledImageId(bindless_index, 256);
+            return textureLod(vko_sampler2D(tex_id, push_constants.linear_sampler_id), uv, mip_level);
+        }
+
+        float distribution_ggx(vec3 N, vec3 H, float roughness) {
+            float a = roughness * roughness;
+            float a2 = a * a;
+            float NdotH = max(dot(N, H), 0.0);
+            float NdotH2 = NdotH * NdotH;
+            float denom = (NdotH2 * (a2 - 1.0) + 1.0);
+            denom = PI * denom * denom;
+            return a2 / denom;
+        }
+
+        float geometry_schlick_ggx(float NdotV, float roughness) {
+            float r = roughness + 1.0;
+            float k = (r * r) / 8.0;
+            float denom = NdotV * (1.0 - k) + k;
+            return NdotV / denom;
+        }
+
+        float geometry_smith(vec3 N, vec3 V, vec3 L, float roughness) {
+            float NdotV = max(dot(N, V), 0.0);
+            float NdotL = max(dot(N, L), 0.0);
+            float ggx2 = geometry_schlick_ggx(NdotV, roughness) * geometry_schlick_ggx(NdotL, roughness);
+            return ggx2;
+        }
+
+        vec3 fresnel_schlick(float cosTheta, vec3 F0) {
+            return F0 + (1.0 - F0) * pow(clamp(1.0 - cosTheta, 0.0, 1.0), 5.0);
+        }
+
+        vec3 aces_tonemap(vec3 color) {
+            vec3 a = color * (2.51 * color + 0.03);
+            vec3 b = color * (2.43 * color + 0.59) + 0.14;
+            return clamp(a / b, 0.0, 1.0);
+        }
+
+        vec3 srgb_to_linear(vec3 c) {
+            return pow(c, vec3(2.2));
+        }
+
+        vec3 linear_to_srgb(vec3 c) {
+            return pow(c, vec3(1.0 / 2.2));
+        }
+
+        void main() {
+            uint mat_idx = v_material_index;
+            if (push_constants.material_index != 0xFFFFFFFFu) {
+                mat_idx = push_constants.material_index;
+            }
+            GltfMaterial mat = materials.materials[mat_idx];
+
+            vec3 N = normalize(v_world_normal);
+            if (mat.normal_texture != 0xFFFFFFFFu) {
+                vec3 tangent_normal = sample_texture(mat.normal_texture, v_uv, 0.0).xyz * 2.0 - 1.0;
+                vec3 T = normalize(v_tangent.xyz);
+                vec3 B = cross(N, T) * v_tangent.w;
+                mat3 TBN = mat3(T, B, N);
+                N = normalize(TBN * tangent_normal);
+            }
+
+            vec3 base_color = mat.base_color_factor.rgb * v_color.rgb;
+            float alpha = mat.base_color_factor.a * v_color.a;
+
+            if (mat.base_color_texture != 0xFFFFFFFFu) {
+                vec4 tex_color = sample_texture(mat.base_color_texture, v_uv, 0.0);
+                base_color *= tex_color.rgb;
+                alpha *= tex_color.a;
+            }
+
+            base_color = srgb_to_linear(base_color);
+
+            float metallic = mat.metallic_roughness.x;
+            float roughness = clamp(mat.metallic_roughness.y, 0.04, 1.0);
+
+            if (mat.alpha_mode == 1u) {
+                if (alpha < mat.alpha_cutoff) {
+                    discard;
+                }
+            }
+
+            vec3 V = normalize(push_constants.camera_position.xyz - v_world_pos);
+            vec3 F0 = mix(vec3(0.04), base_color, metallic);
+
+            vec3 ambient = vec3(0.03) * mix(vec3(1.0), F0, metallic);
+            vec3 Lo = ambient * base_color;
+
+            vec3 emissive = mat.emissive_factor;
+            if (mat.emissive_texture != 0xFFFFFFFFu) {
+                emissive *= sample_texture(mat.emissive_texture, v_uv, 0.0).rgb;
+            }
+            emissive = srgb_to_linear(emissive);
+            Lo += emissive;
+
+            vec3 light_dir = normalize(vec3(0.5, 1.0, 0.3));
+            vec3 light_color = vec3(1.0, 0.95, 0.9) * 3.0;
+
+            vec3 L = light_dir;
+            vec3 H = normalize(V + L);
+
+            float NdotL = max(dot(N, L), 0.0);
+            float NdotV = max(dot(N, V), 0.0);
+
+            if (NdotL > 0.0) {
+                float D = distribution_ggx(N, H, roughness);
+                float G = geometry_smith(N, V, L, roughness);
+                vec3 F = fresnel_schlick(max(dot(H, V), 0.0), F0);
+
+                vec3 nominator = D * G * F;
+                float denominator = 4.0 * NdotV * NdotL + 0.001;
+                vec3 specular = nominator / denominator;
+
+                vec3 kS = F;
+                vec3 kD = vec3(1.0) - kS;
+                kD *= 1.0 - metallic;
+
+                Lo += (kD * base_color / PI + specular) * light_color * NdotL;
+            }
+
+            if (mat.occlusion_texture != 0xFFFFFFFFu) {
+                float ao = sample_texture(mat.occlusion_texture, v_uv, 0.0).r;
+                Lo *= ao;
+            }
+
+            Lo = aces_tonemap(Lo);
+            Lo = linear_to_srgb(Lo);
+
+            f_color = vec4(Lo, alpha);
+        }
+        ",
+    }
+}
+
+/// GLTF vertex format for pipeline creation
+#[derive(BufferContents, Vertex, Clone, Copy)]
+#[repr(C)]
+pub struct GltfGpuVertex {
+    #[format(R32G32B32_SFLOAT)]
+    pub position: [f32; 3],
+    #[format(R32G32B32_SFLOAT)]
+    pub normal: [f32; 3],
+    #[format(R32G32_SFLOAT)]
+    pub uv: [f32; 2],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub color: [f32; 4],
+    #[format(R32G32B32A32_SFLOAT)]
+    pub tangent: [f32; 4],
+}
+
 // 32^3 chunks pack more geometry per chunk than the old 16x16x256 columns
 // did on average once boundary culling removes most internal faces, and
 // with no textures/AO there's less per-vertex bandwidth pressure, so this
@@ -62,7 +338,7 @@ use super::ui_pass::{self, UiDrawList, UiPassGpu};
 pub(super) const MAX_VERTICES: u64 = 40_000_000;
 pub(super) const MAX_INDICES: u64 = 60_000_000;
 
-pub(super) struct RenderStateShared {
+pub(crate) struct RenderStateShared {
     pub pipeline: Option<Arc<GraphicsPipeline>>,
     /// UI quads (boxes + glyphs). Drawn after world/avatars in the same
     /// subpass with alpha blending and depth test/write disabled.
@@ -72,9 +348,17 @@ pub(super) struct RenderStateShared {
     pub allocations: HashMap<Entity, GpuMeshAllocation>,
     pub avatar: Option<GpuMeshAllocation>,
     pub effects_gpu: Option<super::effects_gpu::EffectGpuState>,
+    /// GLTF model pipeline
+    pub gltf_pipeline: Option<Arc<GraphicsPipeline>>,
+    /// GLTF material storage buffer
+    pub gltf_material_buffer_id: Option<Id<Buffer>>,
+    /// GLTF instance buffer (model matrices)
+    pub gltf_instance_buffer_id: Option<Id<Buffer>>,
+    /// Number of GLTF instances to draw
+    pub gltf_instance_count: u32,
 }
 
-pub(super) struct FrameData {
+pub(crate) struct FrameData {
     pub frame_index: u64,
     pub time_seconds: f32,
     pub delta_seconds: f32,
@@ -99,6 +383,12 @@ pub(super) struct FrameData {
     /// UI instance buffer + live count (synced from `UiDrawList` each frame).
     pub ui_buffer_id: Id<Buffer>,
     pub ui_count: u32,
+    /// GLTF instance data
+    pub gltf_instance_buffer_id: Id<Buffer>,
+    pub gltf_instance_count: u32,
+    pub gltf_material_buffer_id: Id<Buffer>,
+    /// GLTF primitive draws for this frame
+    pub gltf_draws: Vec<GltfDrawCall>,
 }
 
 struct ChunkRenderTask {
@@ -214,21 +504,109 @@ impl Task for ChunkRenderTask {
     }
 }
 
-#[derive(Resource)]
-pub struct RenderState {
-    pub(super) vertex_buffer_id: Id<Buffer>,
-    pub(super) index_buffer_id: Id<Buffer>,
-    pub(super) depth_image_id: Id<Image>,
-    pub(super) virtual_swapchain_id: Id<Swapchain>,
-    pub(super) virtual_depth_id: Id<Image>,
-    pub(super) task_graph: Mutex<ExecutableTaskGraph<FrameData>>,
-    pub(super) shared: Arc<RwLock<RenderStateShared>>,
-    pub(super) allocator: MeshBufferAllocator,
-    pub(super) ui_gpu: UiPassGpu,
-    pub(super) frame_index: u64,
+// One GLTF primitive draw: indexes into the dedicated GLTF buffers.
+#[derive(Clone, Copy)]
+pub(crate) struct GltfDrawCall {
+    pub index_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub material_index: u32,
 }
 
-pub(super) struct PendingWrite<T> {
+// GLTF render task for drawing instanced GLTF models
+struct GltfRenderTask {
+    vertex_buffer_id: Id<Buffer>,
+    index_buffer_id: Id<Buffer>,
+    virtual_swapchain_id: Id<Swapchain>,
+    virtual_depth_id: Id<Image>,
+    shared: Arc<RwLock<RenderStateShared>>,
+}
+
+impl Task for GltfRenderTask {
+    type World = FrameData;
+
+    fn clear_values(&self, _clear_values: &mut ClearValues<'_>, _world: &Self::World) {
+        // No clears - we draw on top of the existing framebuffer
+    }
+
+    unsafe fn execute(
+        &self,
+        cbf: &mut RecordingCommandBuffer<'_>,
+        _tcx: &mut TaskContext<'_>,
+        world: &Self::World,
+    ) -> TaskResult {
+        if world.gltf_draws.is_empty() || world.gltf_instance_count == 0 {
+            return Ok(());
+        }
+
+        let shared = self.shared.read().unwrap();
+        if let Some(pipeline) = shared.gltf_pipeline.as_ref() {
+            cbf.set_viewport(0, std::slice::from_ref(&world.viewport));
+            cbf.bind_pipeline(pipeline);
+
+            cbf.bind_index_buffer(
+                self.index_buffer_id,
+                0,
+                None,
+                vulkano::buffer::IndexType::U32,
+            );
+            cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[]);
+
+            // NOTE: instance/material storage buffers (set 0, bindings 0/1)
+            // still need descriptor-set binding before real draws work.
+            // Until then, issue the draws so pipeline/vertex-format errors
+            // surface early; they will render once descriptors are wired.
+            for draw in &world.gltf_draws {
+                cbf.push_constants(
+                    pipeline.layout(),
+                    0,
+                    &gltf_vs::PushConstants {
+                        view_proj: world.view_proj.to_cols_array_2d(),
+                        sampler_id: world.sampler_id,
+                        linear_sampler_id: world.linear_sampler_id,
+                        camera_position: [world.camera_position.x, world.camera_position.y, world.camera_position.z, 1.0],
+                        material_index: draw.material_index,
+                        time_seconds: world.time_seconds,
+                        _pad: [0.0, 0.0],
+                    },
+                );
+                unsafe {
+                    cbf.draw_indexed(
+                        draw.index_count,
+                        world.gltf_instance_count,
+                        draw.first_index,
+                        draw.vertex_offset,
+                        0,
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Resource)]
+pub struct RenderState {
+    pub(crate) vertex_buffer_id: Id<Buffer>,
+    pub(crate) index_buffer_id: Id<Buffer>,
+    pub(crate) gltf_vertex_buffer_id: Id<Buffer>,
+    pub(crate) gltf_index_buffer_id: Id<Buffer>,
+    pub(crate) depth_image_id: Id<Image>,
+    pub(crate) virtual_swapchain_id: Id<Swapchain>,
+    pub(crate) virtual_depth_id: Id<Image>,
+    pub(crate) task_graph: Mutex<ExecutableTaskGraph<FrameData>>,
+    pub(crate) shared: Arc<RwLock<RenderStateShared>>,
+    pub(crate) allocator: MeshBufferAllocator,
+    pub(crate) gltf_allocator: MeshBufferAllocator,
+    pub(crate) ui_gpu: UiPassGpu,
+    pub(crate) frame_index: u64,
+}
+
+/// Max GLTF vertices/indices in dedicated buffers (GltfGpuVertex = 64B).
+pub(super) const MAX_GLTF_VERTICES: u64 = 2_000_000;
+pub(super) const MAX_GLTF_INDICES: u64 = 4_000_000;
+
+pub(crate) struct PendingWrite<T> {
     pub offset_bytes: u64,
     pub data: Vec<T>,
 }
@@ -272,6 +650,81 @@ pub(super) fn upload_writes(
             [
                 (vertex_buffer_id, HostAccessType::Write),
                 (index_buffer_id, HostAccessType::Write),
+            ],
+            [],
+            [],
+        )
+        .unwrap();
+    }
+}
+
+/// One wait + one batched host write for GLTF vertex/index/material/instance data.
+pub(crate) fn upload_gltf_writes(
+    vk: &VulkanContext,
+    vertex_buffer_id: Id<Buffer>,
+    index_buffer_id: Id<Buffer>,
+    material_buffer_id: Id<Buffer>,
+    instance_buffer_id: Id<Buffer>,
+    vertex_writes: &[PendingWrite<GltfGpuVertex>],
+    index_writes: &[PendingWrite<u32>],
+    material_writes: &[PendingWrite<crate::gltf::GltfGpuMaterial>],
+    instance_writes: &[PendingWrite<Mat4>],
+) {
+    if vertex_writes.is_empty()
+        && index_writes.is_empty()
+        && material_writes.is_empty()
+        && instance_writes.is_empty()
+    {
+        return;
+    }
+
+    vk.resources.flight(vk.flight_id).wait(None).unwrap();
+
+    unsafe {
+        vulkano_taskgraph::execute(
+            &vk.queue,
+            &vk.resources,
+            vk.flight_id,
+            |_cbf, tcx| {
+                for write in vertex_writes {
+                    let end =
+                        write.offset_bytes + (write.data.len() * size_of::<GltfGpuVertex>()) as u64;
+                    tcx.try_write_buffer::<[GltfGpuVertex]>(
+                        vertex_buffer_id,
+                        write.offset_bytes..end,
+                    )?
+                    .copy_from_slice(&write.data);
+                }
+                for write in index_writes {
+                    let end = write.offset_bytes + (write.data.len() * size_of::<u32>()) as u64;
+                    tcx.try_write_buffer::<[u32]>(index_buffer_id, write.offset_bytes..end)?
+                        .copy_from_slice(&write.data);
+                }
+                for write in material_writes {
+                    let end = write.offset_bytes
+                        + (write.data.len() * size_of::<crate::gltf::GltfGpuMaterial>()) as u64;
+                    tcx.try_write_buffer::<[crate::gltf::GltfGpuMaterial]>(
+                        material_buffer_id,
+                        write.offset_bytes..end,
+                    )?
+                    .copy_from_slice(&write.data);
+                }
+                for write in instance_writes {
+                    let end =
+                        write.offset_bytes + (write.data.len() * size_of::<Mat4>()) as u64;
+                    tcx.try_write_buffer::<[Mat4]>(
+                        instance_buffer_id,
+                        write.offset_bytes..end,
+                    )?
+                    .copy_from_slice(&write.data);
+                }
+                Ok(())
+            },
+            [
+                (vertex_buffer_id, HostAccessType::Write),
+                (index_buffer_id, HostAccessType::Write),
+                (material_buffer_id, HostAccessType::Write),
+                (instance_buffer_id, HostAccessType::Write),
             ],
             [],
             [],
@@ -362,12 +815,113 @@ pub(super) fn setup_renderer(
     let effect_arena_id = super::effects_gpu::create_effect_arena(&vk)
         .expect("failed to create mod-effect buffer arena");
 
+    // Create GLTF material storage buffer (max 256 materials)
+    const MAX_GLTF_MATERIALS: u32 = 256;
+    let gltf_material_buffer_size = size_of::<crate::gltf::GltfGpuMaterial>() as u64 * MAX_GLTF_MATERIALS as u64;
+    let gltf_material_layout = DeviceLayout::new(
+        NonZero::new(gltf_material_buffer_size).unwrap(),
+        DeviceAlignment::new(align_of::<crate::gltf::GltfGpuMaterial>() as u64).unwrap(),
+    ).expect("gltf material buffer layout exceeds device limits");
+
+    let gltf_material_buffer_id = vk
+        .resources
+        .create_buffer(
+            &BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            gltf_material_layout,
+        )
+        .unwrap();
+
+    // Create GLTF instance buffer (max 1024 instances)
+    const MAX_GLTF_INSTANCES: u32 = 1024;
+    let gltf_instance_buffer_size = size_of::<Mat4>() as u64 * MAX_GLTF_INSTANCES as u64;
+    let gltf_instance_layout = DeviceLayout::new(
+        NonZero::new(gltf_instance_buffer_size).unwrap(),
+        DeviceAlignment::new(align_of::<Mat4>() as u64).unwrap(),
+    ).expect("gltf instance buffer layout exceeds device limits");
+
+    let gltf_instance_buffer_id = vk
+        .resources
+        .create_buffer(
+            &BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE | MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            gltf_instance_layout,
+        )
+        .unwrap();
+
+    // Dedicated GLTF vertex/index buffers (GltfGpuVertex stride differs from ChunkVertex)
+    let gltf_vertex_buffer_size: DeviceSize = MAX_GLTF_VERTICES * size_of::<GltfGpuVertex>() as u64;
+    let gltf_index_buffer_size: DeviceSize = MAX_GLTF_INDICES * size_of::<u32>() as u64;
+
+    let gltf_vertex_layout = DeviceLayout::new(
+        NonZero::new(gltf_vertex_buffer_size).expect("gltf vertex buffer size must be non-zero"),
+        DeviceAlignment::new(align_of::<GltfGpuVertex>() as u64).unwrap(),
+    )
+    .expect("gltf vertex layout exceeds device limits");
+
+    let gltf_index_layout = DeviceLayout::new(
+        NonZero::new(gltf_index_buffer_size).expect("gltf index buffer size must be non-zero"),
+        DeviceAlignment::new(align_of::<u32>() as u64).unwrap(),
+    )
+    .expect("gltf index layout exceeds device limits");
+
+    let gltf_vertex_buffer_id = vk
+        .resources
+        .create_buffer(
+            &BufferCreateInfo {
+                usage: BufferUsage::VERTEX_BUFFER,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                    | MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            gltf_vertex_layout,
+        )
+        .unwrap();
+
+    let gltf_index_buffer_id = vk
+        .resources
+        .create_buffer(
+            &BufferCreateInfo {
+                usage: BufferUsage::INDEX_BUFFER,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                    | MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            gltf_index_layout,
+        )
+        .unwrap();
+
+    // Host writes for GLTF buffers + material/instance storage buffers
+    // (declared as host accesses once the task graph exists below).
+
     let shared = Arc::new(RwLock::new(RenderStateShared {
         pipeline: None,
         ui_pipeline: None,
         allocations: HashMap::new(),
         avatar: None,
         effects_gpu: None,
+        gltf_pipeline: None,
+        gltf_material_buffer_id: Some(gltf_material_buffer_id),
+        gltf_instance_buffer_id: Some(gltf_instance_buffer_id),
+        gltf_instance_count: 0,
     }));
 
     let mut task_graph: TaskGraph<FrameData> = TaskGraph::new(&vk.resources);
@@ -384,6 +938,10 @@ pub(super) fn setup_renderer(
     });
 
     task_graph.add_host_buffer_access(effect_arena_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(gltf_vertex_buffer_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(gltf_index_buffer_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(gltf_material_buffer_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(gltf_instance_buffer_id, HostAccessType::Write);
     let compute_task = super::effects_gpu::EffectComputeTask {
         shared: Arc::clone(&shared),
         arena_id: effect_arena_id,
@@ -437,6 +995,44 @@ pub(super) fn setup_renderer(
     // Both nodes access the effect arena, so make the compute-to-draw order
     // explicit. TaskGraph does not infer an edge from shared resource IDs.
     task_graph.add_edge(compute_node_id, chunk_node_id).unwrap();
+
+    // GLTF render task - draws after chunks
+    let gltf_task = GltfRenderTask {
+        vertex_buffer_id: gltf_vertex_buffer_id,
+        index_buffer_id: gltf_index_buffer_id,
+        virtual_swapchain_id,
+        virtual_depth_id,
+        shared: Arc::clone(&shared),
+    };
+    let mut gltf_node = task_graph.create_task_node("GltfModels", vulkano_taskgraph::QueueFamilyType::Graphics, gltf_task);
+    let gltf_node_id = gltf_node
+        .framebuffer(virtual_framebuffer_id)
+        .color_attachment(
+            virtual_swapchain_id.current_image_id(),
+            AccessTypes::COLOR_ATTACHMENT_WRITE,
+            Optimal,
+            &AttachmentInfo {
+                clear: false, // Don't clear - draw on top of chunks
+                ..Default::default()
+            },
+        )
+        .depth_stencil_attachment(
+            virtual_depth_id,
+            AccessTypes::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            Optimal,
+            &AttachmentInfo {
+                clear: false,
+                ..Default::default()
+            },
+        )
+        .buffer_access(gltf_vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
+        .buffer_access(gltf_index_buffer_id, AccessTypes::INDEX_READ)
+        .buffer_access(gltf_material_buffer_id, effect_storage_access())
+        .buffer_access(gltf_instance_buffer_id, effect_storage_access())
+        .build();
+
+    // GLTF draws after chunks
+    task_graph.add_edge(chunk_node_id, gltf_node_id).unwrap();
 
     let task_graph = unsafe {
         task_graph
@@ -506,6 +1102,53 @@ pub(super) fn setup_renderer(
     // UI pipeline shares the same subpass; alpha blend, no depth.
     let ui_pipeline = ui_pass::create_pipeline(&vk, &subpass);
     shared.write().unwrap().ui_pipeline = Some(ui_pipeline);
+
+    // GLTF pipeline (create before moving subpass into effects_gpu)
+    let gltf_vs = unsafe { gltf_vs::load(&vk.device).unwrap().entry_point("main").unwrap() };
+    let gltf_fs = unsafe { gltf_fs::load(&vk.device).unwrap().entry_point("main").unwrap() };
+
+    let gltf_vertex_input_state = GltfGpuVertex::per_vertex().definition(&gltf_vs).unwrap();
+    let gltf_stages = [
+        PipelineShaderStageCreateInfo::new(&gltf_vs),
+        PipelineShaderStageCreateInfo::new(&gltf_fs),
+    ];
+
+    let gltf_layout = vk.resources.bindless_context().unwrap().pipeline_layout_from_stages(&gltf_stages).unwrap();
+
+    let gltf_pipeline = GraphicsPipeline::new(
+        &vk.device,
+        None,
+        &GraphicsPipelineCreateInfo {
+            stages: &gltf_stages,
+            vertex_input_state: Some(&gltf_vertex_input_state),
+            input_assembly_state: Some(&InputAssemblyState::default()),
+            viewport_state: Some(&ViewportState::default()),
+            rasterization_state: Some(&RasterizationState {
+                cull_mode: CullMode::Back,
+                front_face: FrontFace::Clockwise,
+                ..Default::default()
+            }),
+            multisample_state: Some(&MultisampleState::default()),
+            color_blend_state: Some(&ColorBlendState {
+                attachments: &[ColorBlendAttachmentState::default()],
+                ..Default::default()
+            }),
+            depth_stencil_state: Some(&DepthStencilState {
+                depth: Some(DepthState {
+                    write_enable: true,
+                    compare_op: CompareOp::Less,
+                }),
+                ..Default::default()
+            }),
+            dynamic_state: &[DynamicState::Viewport],
+            subpass: Some((&subpass).into()),
+            ..GraphicsPipelineCreateInfo::new(&gltf_layout)
+        },
+    )
+    .unwrap();
+
+    shared.write().unwrap().gltf_pipeline = Some(gltf_pipeline);
+
     shared.write().unwrap().effects_gpu = Some(super::effects_gpu::EffectGpuState::new(
         &vk,
         effect_arena_id,
@@ -515,12 +1158,15 @@ pub(super) fn setup_renderer(
     commands.insert_resource(RenderState {
         vertex_buffer_id,
         index_buffer_id,
+        gltf_vertex_buffer_id,
+        gltf_index_buffer_id,
         depth_image_id,
         virtual_swapchain_id,
         virtual_depth_id,
         task_graph: Mutex::new(task_graph),
         shared,
         allocator: MeshBufferAllocator::new(),
+        gltf_allocator: MeshBufferAllocator::new(),
         ui_gpu,
         frame_index: 0,
     });
@@ -630,6 +1276,19 @@ pub(super) fn render_frame(
     let ui_count = render_state.ui_gpu.count;
     let ui_buffer_id = render_state.ui_gpu.buffer_id;
 
+    // Get GLTF buffers from shared state
+    let (gltf_instance_buffer_id, gltf_instance_count, gltf_material_buffer_id) = {
+        let shared = render_state.shared.read().unwrap();
+        (
+            shared.gltf_instance_buffer_id.unwrap(),
+            shared.gltf_instance_count,
+            shared.gltf_material_buffer_id.unwrap(),
+        )
+    };
+
+    // TODO(phase-1b): populate from GltfModels resource (draws + instances).
+    let gltf_draws = Vec::new();
+
     let frame = FrameData {
         frame_index: render_state.frame_index,
         time_seconds: time.elapsed_secs(),
@@ -647,6 +1306,10 @@ pub(super) fn render_frame(
         mod_actions,
         ui_buffer_id,
         ui_count,
+        gltf_instance_buffer_id,
+        gltf_instance_count,
+        gltf_material_buffer_id,
+        gltf_draws,
     };
     render_state.frame_index = render_state.frame_index.wrapping_add(1);
 

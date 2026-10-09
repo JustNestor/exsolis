@@ -7,11 +7,11 @@
 //! - [`meshing`] — invalidate / queue / poll / upload
 //! - [`avatars`] — one local-space head, instanced by model matrix
 
-mod allocator;
+pub mod allocator;
 mod avatars;
 pub(crate) mod effects;
 mod effects_gpu;
-mod gpu;
+pub mod gpu;
 mod meshing;
 pub mod ui_pass;
 
@@ -21,12 +21,14 @@ use bevy_ecs::prelude::*;
 use crate::texture::TexturePlugin;
 
 pub use gpu::RenderState;
+pub use allocator::{GpuMeshAllocation, MeshBufferAllocator};
 
 pub struct RendererPlugin;
 
 impl Plugin for RendererPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TexturePlugin)
+            .init_resource::<crate::gltf::GltfModels>()
             .add_message::<effects::ModActionEvent>()
             .add_systems(
                 Update,
@@ -41,6 +43,8 @@ impl Plugin for RendererPlugin {
                     meshing::upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
                     avatars::ensure_avatar_mesh.run_if(resource_exists::<RenderState>),
                     meshing::cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
+                    crate::gltf::upload_gltf_assets.run_if(resource_exists::<RenderState>),
+                    crate::gltf::sync_gltf_instances.run_if(resource_exists::<RenderState>),
                     gpu::render_frame.run_if(resource_exists::<RenderState>),
                 )
                     .chain()
