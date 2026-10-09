@@ -20,6 +20,7 @@ use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
 use exsolis_common::{BlockPos, BlockType, ChunkCoord, PlayerId, ServerMessage};
+use exsolis_common::{EntityKind, EntityState};
 use glam::Vec3;
 
 use crate::Inventory;
@@ -174,6 +175,7 @@ fn handle_place_block(
     mut inventories: Query<&mut Inventory>,
     mut world: ResMut<ChunkWorld>,
     mut outgoing: MessageWriter<OutgoingPacket>,
+    mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
 ) {
     for ev in events.read() {
@@ -255,7 +257,35 @@ fn handle_place_block(
         } else {
             let selected_index = inventory.selected_index();
             inventory.remove_one(selected_index, ev.kind);
+            // Placing a container block brings its block entity into being.
+            // Keyed by position, so replacing the block at a position that
+            // already has an entity is handled by the break path first.
+            if crate::entities::is_block_entity(ev.kind) {
+                spawns.write(crate::entities::SpawnEntityRequest {
+                    kind: EntityKind::Block,
+                    state: block_entity_state(ev.pos),
+                    // A block entity renders through its block, not a model.
+                    model: None,
+                    scale: 1.0,
+                    block_pos: Some(ev.pos),
+                    extra: crate::entities::SpawnExtra::BlockEntity(ev.kind),
+                    player_token: None,
+                });
+            }
         }
+    }
+}
+
+/// A block entity's transform is the block's own position. Yaw is derived
+/// from the position hash so a chest consistently faces one of four
+/// directions instead of every chest pointing the same way.
+fn block_entity_state(pos: exsolis_common::BlockPos) -> EntityState {
+    EntityState {
+        x: pos.x as f32 + 0.5,
+        y: pos.y as f32,
+        z: pos.z as f32 + 0.5,
+        yaw: ((pos.x * 7 + pos.z * 13) & 3) as f32 * std::f32::consts::FRAC_PI_2,
+        ..Default::default()
     }
 }
 
@@ -264,6 +294,9 @@ fn handle_break_block(
     player_map: Res<PlayerMap>,
     positions: Query<&PlayerPosition>,
     mut inventories: Query<&mut Inventory>,
+    mut containers: Query<&mut crate::Container>,
+    registry: Res<crate::entities::EntityRegistry>,
+    mut despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     mut world: ResMut<ChunkWorld>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
@@ -323,8 +356,31 @@ fn handle_break_block(
                 "[BreakBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
                 coord, ev.pos
             );
-        } else if let Ok(mut inventory) = inventories.get_mut(entity) {
-            inventory.add_item(broken, 1);
+        } else {
+            // Breaking a container block tears down its block entity. The
+            // contents are handed to the breaker rather than dropped, so a
+            // chest can never be destroyed to destroy its loot.
+            if crate::entities::is_block_entity(broken)
+                && let Some(block_entity_id) = registry.at_block(ev.pos)
+            {
+                if let Some(be) = registry.entity_of(block_entity_id) {
+                    if let Ok(mut container) = containers.get_mut(be)
+                        && let Ok(mut inventory) = inventories.get_mut(entity)
+                    {
+                        let leftover = inventory.0.absorb(&mut container.0);
+                        if leftover > 0 {
+                            warn!(
+                                "[BreakBlock] {} items did not fit in the breaker inventory",
+                                leftover
+                            );
+                        }
+                    }
+                }
+                despawns.write(crate::entities::DespawnEntityRequest(block_entity_id));
+            }
+            if let Ok(mut inventory) = inventories.get_mut(entity) {
+                inventory.add_item(broken, 1);
+            }
         }
     }
 }

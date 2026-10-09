@@ -88,6 +88,29 @@ impl Inventory {
         remaining
     }
 
+    /// Every occupied slot, in slot order. Mod code and the spill-on-break
+    /// path both need to walk a container without caring about which slots
+    /// are empty.
+    pub fn iter(&self) -> impl Iterator<Item = (usize, Slot)> + '_ {
+        self.slots
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| s.map(|s| (i, s)))
+    }
+
+    /// Move everything in `other` into this inventory, returning what did
+    /// not fit. Used when a chest is broken: the breaker keeps what their
+    /// hotbar can hold and the remainder is reported rather than silently
+    /// destroyed.
+    pub fn absorb(&mut self, other: &mut Inventory) -> u8 {
+        let mut remaining = 0u8;
+        for (_, slot) in other.iter() {
+            remaining = remaining.saturating_add(self.add_item(slot.item, slot.amount));
+        }
+        *other = Inventory::new();
+        remaining
+    }
+
     /// Removes exactly one item from slot `index` if it holds `item`.
     /// Used by place: the server decrements the selected slot only after
     /// confirming the placement is otherwise valid, so a rejected place

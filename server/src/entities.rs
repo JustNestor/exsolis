@@ -399,10 +399,26 @@ mod tests {
     #[test]
     fn allocation_stops_at_the_cap() {
         let mut reg = EntityRegistry::default();
-        for _ in 0..MAX_ENTITIES {
-            assert!(reg.allocate().is_some());
+        // The cap counts *live* entities, not ids handed out, so the
+        // registry has to actually hold the records for the cap to bite.
+        let mut next = 0u64;
+        while reg.len() < MAX_ENTITIES {
+            let id = reg.allocate().expect("under the cap");
+            next = next.max(id);
+            reg.records.insert(
+                id,
+                EntityRecord {
+                    id,
+                    kind: EntityKind::Prop,
+                    entity: Entity::from_raw_u32(0).unwrap(),
+                    state: EntityState::default(),
+                    last_sent: None,
+                    block_pos: None,
+                },
+            );
         }
-        assert!(reg.allocate().is_none());
+        assert!(next as usize <= MAX_ENTITIES);
+        assert!(reg.allocate().is_none(), "cap must refuse further spawns");
     }
 
     #[test]
