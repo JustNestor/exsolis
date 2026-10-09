@@ -216,6 +216,7 @@ pub struct UiPlugin;
 impl Plugin for UiPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<UiManager>()
+            .add_observer(spawn::on_scroll)
             .add_systems(
                 Update,
                 (
@@ -225,6 +226,7 @@ impl Plugin for UiPlugin {
                         .before(handle_ui_packets),
                     hide_on_disconnect,
                     events::update_hover_styles,
+                    spawn::update_scrollbar_thumbs,
                 ),
             )
             .add_plugins(render_bridge::UiRenderBridgePlugin)

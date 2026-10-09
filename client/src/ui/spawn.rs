@@ -11,8 +11,11 @@
 //! `color` and `font-size` are inherited down the tree like CSS.
 
 use bevy_color::Color;
+use bevy_ecs::observer::On;
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
+use bevy_math::Vec2;
+use bevy_picking::events::{Pointer, Scroll};
 use bevy_picking::prelude::*;
 use bevy_text::{TextColor, TextFont};
 use bevy_ui::prelude::*;
@@ -82,6 +85,164 @@ pub struct UiImageSrc {
     pub src: String,
 }
 
+#[derive(Component, Debug, Clone, Copy)]
+pub struct UiScrollArea;
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct UiScrollbarThumb {
+    pub area: Entity,
+    pub horizontal: bool,
+}
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct UiScrollbarRail {
+    pub area: Entity,
+}
+
+pub fn update_scrollbar_thumbs(
+    mut bars: Query<(
+        &mut Node,
+        Option<&UiScrollbarThumb>,
+        Option<&UiScrollbarRail>,
+    )>,
+    areas: Query<(&ComputedNode, &bevy_ui::ScrollPosition)>,
+) {
+    for (mut node, thumb, rail) in &mut bars {
+        let Some(area) = thumb
+            .map(|thumb| thumb.area)
+            .or_else(|| rail.map(|rail| rail.area))
+        else {
+            continue;
+        };
+        let Ok((computed, position)) = areas.get(area) else {
+            continue;
+        };
+        if rail.is_some() {
+            // The parent scroll offset moves every child; offset the rail by
+            // the same amount so it stays pinned to the viewport edge.
+            node.left = Val::Px(position.x);
+            node.top = Val::Px(position.y);
+            continue;
+        }
+        let Some(thumb) = thumb else { continue };
+        let visible_size = computed.size() * computed.inverse_scale_factor;
+        let content = computed.content_size() * computed.inverse_scale_factor;
+        let (visible, content, offset) = if thumb.horizontal {
+            (visible_size.x, content.x, position.x)
+        } else {
+            (visible_size.y, content.y, position.y)
+        };
+        let range = (content - visible).max(0.0);
+        let ratio = if content > 0.0 {
+            (visible / content).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let track = visible;
+        let length = (track * ratio).max(18.0).min(track);
+        let travel = (track - length).max(0.0);
+        let offset = if range > 0.0 {
+            offset / range * travel
+        } else {
+            0.0
+        };
+        if thumb.horizontal {
+            node.width = Val::Px(length);
+            node.left = Val::Px(offset);
+        } else {
+            node.height = Val::Px(length);
+            node.top = Val::Px(offset);
+        }
+    }
+}
+
+fn spawn_scrollbar(
+    commands: &mut Commands,
+    area: Entity,
+    horizontal: bool,
+    thumb_color: Color,
+    track_color: Color,
+) -> Entity {
+    let rail = if horizontal {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            top: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Px(6.0),
+            ..Default::default()
+        }
+    } else {
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            left: Val::Px(0.0),
+            width: Val::Px(6.0),
+            height: Val::Percent(100.0),
+            ..Default::default()
+        }
+    };
+    let rail_id = commands
+        .spawn((
+            rail,
+            BackgroundColor(track_color),
+            ZIndex(100),
+            UiScrollbarRail { area },
+        ))
+        .id();
+    let thumb = if horizontal {
+        Node {
+            position_type: PositionType::Absolute,
+            left: Val::Px(0.0),
+            width: Val::Px(24.0),
+            height: Val::Percent(100.0),
+            ..Default::default()
+        }
+    } else {
+        Node {
+            position_type: PositionType::Absolute,
+            top: Val::Px(0.0),
+            width: Val::Percent(100.0),
+            height: Val::Px(24.0),
+            ..Default::default()
+        }
+    };
+    let thumb_id = commands
+        .spawn((
+            thumb,
+            BackgroundColor(thumb_color),
+            ZIndex(101),
+            UiScrollbarThumb { area, horizontal },
+        ))
+        .id();
+    commands.entity(rail_id).add_child(thumb_id);
+    rail_id
+}
+
+pub fn on_scroll(
+    mut event: On<Pointer<Scroll>>,
+    mut areas: Query<(&Node, &ComputedNode, &mut ScrollPosition), With<UiScrollArea>>,
+) {
+    if let Ok((node, computed, mut position)) = areas.get_mut(event.entity) {
+        event.propagate(false);
+        let factor = match event.event().unit {
+            bevy_input::mouse::MouseScrollUnit::Line => {
+                bevy_input::mouse::MouseScrollUnit::SCROLL_UNIT_CONVERSION_FACTOR
+            }
+            bevy_input::mouse::MouseScrollUnit::Pixel => 1.0,
+        };
+        let visible = computed.size() * computed.inverse_scale_factor;
+        let content = computed.content_size() * computed.inverse_scale_factor;
+        let range = (content - visible).max(Vec2::ZERO);
+        if node.overflow.x == OverflowAxis::Scroll {
+            position.x = (position.x - event.event().x * factor).clamp(0.0, range.x);
+        }
+        if node.overflow.y == OverflowAxis::Scroll {
+            position.y = (position.y - event.event().y * factor).clamp(0.0, range.y);
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Inherited {
     color: Color,
@@ -139,7 +300,16 @@ fn spawn_widget(
         hover_bg,
         pressed_bg,
         drag,
+        z_index,
+        background_image,
+        scrollbar,
+        scrollbar_color,
+        scrollbar_track,
     } = style::resolve(def.kind, &def.attrs, warnings);
+    let is_scroll_area =
+        node.overflow.x == OverflowAxis::Scroll || node.overflow.y == OverflowAxis::Scroll;
+    let scrolls_x = node.overflow.x == OverflowAxis::Scroll;
+    let scrolls_y = node.overflow.y == OverflowAxis::Scroll;
 
     let inh = Inherited {
         color: color.unwrap_or(inherited.color),
@@ -174,6 +344,14 @@ fn spawn_widget(
     } else {
         None
     };
+    let background_image = background_image.filter(|src| {
+        if super::parse::is_valid_img_src(src) && img_assets::probe_size(src).is_some() {
+            true
+        } else {
+            warnings.push(format!("invalid or unreadable `background-image` {src:?}"));
+            false
+        }
+    });
 
     // Auto ids are structural paths ("#0.1.2"): stable as long as the XML
     // shape is, so servers can still route un-id'd widgets if they must.
@@ -187,6 +365,12 @@ fn spawn_widget(
             element_id,
         },
     ));
+    if let Some(z) = z_index {
+        e.insert(ZIndex(z));
+    }
+    if is_scroll_area {
+        e.insert((UiScrollArea, bevy_ui::ScrollPosition::default()));
+    }
 
     match def.kind {
         WidgetKind::Div => {}
@@ -245,6 +429,11 @@ fn spawn_widget(
     }
     if let Some(c) = bg {
         e.insert(BackgroundColor(c));
+    }
+    if def.kind != WidgetKind::Image {
+        if let Some(src) = background_image {
+            e.insert(UiImageSrc { src });
+        }
     }
     if let Some(c) = border_color {
         // ASSUMPTION: Bevy >= 0.17 per-side `BorderColor`; on older
@@ -320,6 +509,32 @@ fn spawn_widget(
         .collect();
     if !kids.is_empty() {
         commands.entity(id).add_children(&kids);
+    }
+    if is_scroll_area && scrollbar {
+        let mut bars = Vec::new();
+        let thumb_color = scrollbar_color.unwrap_or(Color::srgba(0.86, 0.89, 0.94, 0.8));
+        let track_color = scrollbar_track.unwrap_or(Color::srgba(0.0, 0.0, 0.0, 0.24));
+        if scrolls_x {
+            bars.push(spawn_scrollbar(
+                commands,
+                id,
+                true,
+                thumb_color,
+                track_color,
+            ));
+        }
+        if scrolls_y {
+            bars.push(spawn_scrollbar(
+                commands,
+                id,
+                false,
+                thumb_color,
+                track_color,
+            ));
+        }
+        if !bars.is_empty() {
+            commands.entity(id).add_children(&bars);
+        }
     }
     id
 }

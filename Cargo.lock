@@ -2102,6 +2102,7 @@ dependencies = [
  "bevy_input",
  "bevy_internal",
  "bevy_log",
+ "bevy_math",
  "bevy_picking",
  "bevy_renet",
  "bevy_tasks",

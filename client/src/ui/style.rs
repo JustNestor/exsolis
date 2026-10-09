@@ -138,6 +138,11 @@ pub struct ResolvedStyle {
     pub hover_bg: Option<Color>,
     pub pressed_bg: Option<Color>,
     pub drag: DragConfig,
+    pub z_index: Option<i32>,
+    pub background_image: Option<String>,
+    pub scrollbar: bool,
+    pub scrollbar_color: Option<Color>,
+    pub scrollbar_track: Option<Color>,
 }
 
 /// Drag/drop knobs for one widget. `None`/empty group means "matches any
@@ -287,6 +292,28 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
     ) {
         node.position_type = v;
     }
+    if let Some(v) = get(
+        "overflow",
+        |s| match s.trim() {
+            "visible" => Some(Overflow::visible()),
+            "clip" => Some(Overflow::clip()),
+            "hidden" => Some(Overflow::hidden()),
+            "scroll" | "auto" => Some(Overflow::scroll()),
+            "scroll-x" => Some(Overflow {
+                x: OverflowAxis::Scroll,
+                y: OverflowAxis::Hidden,
+            }),
+            "scroll-y" => Some(Overflow {
+                x: OverflowAxis::Hidden,
+                y: OverflowAxis::Scroll,
+            }),
+            _ => None,
+        },
+        attrs,
+        warnings,
+    ) {
+        node.overflow = v;
+    }
     if let Some(v) = get("left", parse_val, attrs, warnings) {
         node.left = v;
     }
@@ -334,6 +361,11 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
             group: attrs.get("drag-group").cloned(),
             ghost_bg: get("drag-ghost-bg", parse_color, attrs, warnings),
         },
+        z_index: get("z-index", |s| s.trim().parse::<i32>().ok(), attrs, warnings),
+        background_image: attrs.get("background-image").cloned(),
+        scrollbar: get("scrollbar", parse_bool, attrs, warnings).unwrap_or(true),
+        scrollbar_color: get("scrollbar-color", parse_color, attrs, warnings),
+        scrollbar_track: get("scrollbar-track", parse_color, attrs, warnings),
     }
 }
 

@@ -13,6 +13,10 @@
 //! `<img src="icons/sword.png" alt="Sword" width="32" height="32"/>` draws a
 //! PNG/JPEG from `assets/ui/`. `src` must be a relative path inside that
 //! folder (no `..`, no absolute paths); `alt` is shown if the file can't load.
+//! Scrollable panels use `overflow="scroll"` (both axes), `scroll-x`, or
+//! `scroll-y`; scrollbars are shown by default and can be hidden with
+//! `scrollbar="false"`. Any widget can use `background-image="panels/paper.png"`
+//! and `z-index="2"` to layer itself within its UI screen.
 //!
 //! Strictness policy: structural problems (bad XML, unknown element, too
 //! big, too deep) are hard errors — the screen isn't mounted. Attribute
@@ -119,6 +123,10 @@ const STYLE_ATTRS: &[&str] = &[
     "top",
     "bottom",
     "hidden",
+    "overflow",
+    "scrollbar",
+    "scrollbar-color",
+    "scrollbar-track",
     // root only
     "anchor",
     "modal",
@@ -131,6 +139,8 @@ const STYLE_ATTRS: &[&str] = &[
     "font-size",
     "hover-bg",
     "pressed-bg",
+    "background-image",
+    "z-index",
     // drag & drop
     "draggable",
     "droppable",
