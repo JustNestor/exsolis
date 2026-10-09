@@ -55,6 +55,10 @@ pub struct TextureManager {
     /// isn't found so a missing asset renders as *a* texture, not a
     /// crash or an unmeshed hole.
     fallback: Option<SampledImageId>,
+    /// Bumped on every (re)build. GLTF uploads stamp the generation they
+    /// were built against; a mismatch means `setup_textures` replaced this
+    /// manager (wiping GLTF bindless ids) and textures must be re-uploaded.
+    pub generation: u64,
 }
 
 #[derive(Resource, Default)]
@@ -262,6 +266,7 @@ impl TextureManager {
 
         self.textures = Arc::new(loaded);
         self.fallback = fallback;
+        self.generation += 1;
 
         results
     }
@@ -357,6 +362,10 @@ fn setup_textures(
     TextureManager::discover_pngs(&base_dir, &base_dir, &mut discovered);
 
     let mut manager = TextureManager::default();
+    // A rebuild replaces the whole resource, invalidating every bindless id
+    // handed out before (including GLTF textures) — stamp it so uploaders
+    // can detect the wipe and re-upload.
+    manager.generation = textures.map(|t| t.generation).unwrap_or(0) + 1;
     let mut loaded: HashMap<String, SampledImageId> = HashMap::new();
 
     if discovered.is_empty() {

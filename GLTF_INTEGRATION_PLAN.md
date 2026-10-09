@@ -1,11 +1,34 @@
 # GLTF Model Integration Plan
 
-## Status: Phase 1 (CPU→GPU foundation) — implemented, compiles
+## Status: Phase 1 (CPU→GPU foundation) — implemented, compiles, decode-tested
 
-`cargo check -p exsolis_client` and `cargo check --workspace` pass.
-Test target builds (`cargo check --tests`). Shaders are inline in
+`cargo check --workspace` passes. `gltf::tests::decode_duck_glb` passes
+(real GLB 2.0 asset: meshes, vertices, finite tangents). Shaders are inline in
 `render/gpu.rs` (matching the `mesh.rs` pattern) rather than separate
 `.glsl` files.
+
+### Agreed decisions (2026-10-09)
+- **GLB-only**: server manifests and sends only `.glb`. `.gltf` sources are
+  auto-converted server-side (A6); raw sources never ship.
+- **Hot-reload swaps under instances**: entities keyed by asset path keep
+  working; the upload system frees + reallocates GPU buffers (B1).
+- **Eager decode at sync**: all manifest `.glb` decoded like effect shaders.
+- **Suggestions accepted**: 64 MiB per-model cap (`GLB_MAX_BYTES`, enforced
+  server-side at manifest time and client-side at decode), bindless texture
+  leak on hot-reload logged as tech debt.
+- **Color fix (2026-10-09)**: `TextureManager` rebuilds replaced the whole
+  resource, invalidating GLTF bindless ids (models rendered untextured after
+  any PNG-bearing asset sync). Fixed with a `generation` counter: uploads
+  stamp the generation they built against and redo fully on mismatch.
+
+### Test assets (`assets/models/`)
+- `duck.glb` (120 KiB, GLB 2.0) — primary test model, covered by unit test.
+- `avocado.glb` (8.3 MiB, GLB 2.0) — larger/stress test model.
+- `dragon/`, `girl/` source dirs are **glTF 1.0** (assimp export). The server
+  auto-converts them to `models/dragon/result.glb`, `models/girl/result.glb`
+  at catalog time (`server/src/gltf_pack.rs`, tested); the raw dirs are NOT
+  usable by the client loader and never ship (filtered at pak-add).
+  Do not add new 1.0 assets; re-export as 2.0/GLB instead.
 
 ## Current State Analysis
 
@@ -445,6 +468,71 @@ image = { version = "0.25", features = ["png", "jpeg", "ktx2"] }
 4. **External textures**: How to resolve URI references? (Download via asset system)
 5. **GLTF extensions**: `KHR_materials_unlit`, `KHR_materials_specular`, `KHR_texture_basisu`?
 6. **Scene graph**: GLTF has nodes/scenes. Support full hierarchy or just mesh list?
+7. **Model distribution**: GLB-only for now, or `.gltf`+`.bin` pairs too? (see Hot-reload item 4)
+8. **Load trigger**: eager-decode all manifest `.glb` at sync, or server-driven
+   `request_load` per spawn? (see Server-download item 3)
+
+---
+
+## TODO: Server-download integration & hot-reload
+
+### A. Server-download integration (NOT yet done)
+
+Finding: `is_client_asset_path` (`server/src/assets.rs:617`) allowlists only
+`fxm | wgsl | png | xml | json`. `.glb` / `.gltf` / `.bin` never enter the
+manifest, so models are currently never downloaded at all. Client-side loader
+registration alone is insufficient.
+
+| # | Task | File | Description | Status |
+|---|------|------|-------------|--------|
+| A1 | Manifest allowlist | `server/src/assets.rs` | `glb` ships; `.gltf` sources auto-convert (see A6), raw sources never ship | ✅ done |
+| A6 | Server auto-convert | `server/src/gltf_pack.rs` (new) | Rust: v1.0→GLB (geometry 1:1, diffuse→PBR base color) + v2.0 external-embed; `.glb` written next to source when stale, served from disk via `make_delta`; committed `.glb` wins on collision | ✅ done + unit-tested |
+| A2 | Size guard | `server/src/assets.rs` | Per-model warn/skip above a cap (e.g. 64 MiB); models are orders of magnitude larger than shaders | ✅ done (`GLB_MAX_BYTES`, skip+warn in `walk_assets`) |
+| A3 | Eager decode at sync | `client/src/assets.rs` | Extend `load_effect_assets` (or add `load_model_assets`) to force-decode manifest `.glb`/`.gltf` at `SyncReady`, like `fxm`/`wgsl` today. Otherwise a model only decodes if the server sends an explicit `AssetLoad` for it | ✅ done (`glb` added to eager match) + decode-side `GLB_MAX_BYTES` guard |
+| A4 | GPU upload hook | `client/src/gltf.rs` | Fill in `upload_gltf_assets` body: for each resident `GltfAsset`, call `upload_gltf_model` → `upload_gltf_writes`, record in `GltfModels.uploaded` | ✅ done (incl. material packing ≤256 slots, B1 free+re-upload) |
+| A5 | Test | manual | Place a `.glb` under `assets/`, join, verify download + resident `GltfAsset` + GPU upload | ⏳ user verification (duck+avocado via `mods/models_test.lua`) |
+
+### B. Hot-reload
+
+What already works: `WorkerEvent::Updated` re-runs the registered `decode_gltf`
+loader, so a changed `.glb` becomes a fresh resident `GltfAsset`, and
+`AssetCacheChanged` fires. What is missing is everything GPU-side.
+
+| # | Task | File | Description |
+|---|------|------|-------------|
+| B1 | Re-upload on change | `client/src/gltf.rs` | `upload_gltf_assets` reads `AssetCacheChanged`; for changed `.glb` paths: free old `gltf_allocator` allocation, re-run `upload_gltf_model`, swap `GltfModels.uploaded` entry. Instances keyed by path keep working | ✅ done |
+| B2 | Texture refresh | `client/src/texture.rs` | Re-run `load_gltf_textures` for the new pixels; update material bindless indices. Note: old bindless ids leak (no unload policy — same as PNGs, acceptable for dev, track as tech debt) | ✅ done (re-upload via `upload_gltf_model`; leak logged with warn on hot-reload) |
+| B3 | Material buffer rewrite | `client/src/gltf.rs` | Rewrite that model's material range via `upload_gltf_writes` material writes | ✅ done (whole-buffer repack ≤256 slots on any upload) |
+| B4 | Removal | `client/src/gltf.rs` | On `AssetRemove` / manifest prune: free GPU allocation, drop `GltfModels` entry, hide dependent `GltfModelInstance`s (or fall back to placeholder). Textures retained per existing no-unload policy | ⏳ todo |
+| B5 | External-URI constraint | `client/src/gltf.rs` | Document: hot-reload of `.gltf`+`.bin`/external-URI pairs is unsupported until custom buffer resolution lands (`import_slice` reads externals from CWD and will fail); GLB + embedded base64 only | ✅ documented (GLB-only decision) |
+
+### C. TEMPORARY scripting spawn API (test only — remove before merge)
+
+| # | Task | File | Description | Status |
+|---|------|------|-------------|--------|
+| C1 | Protocol | `common/src/lib.rs` | `SpawnModel { entity_id, path, x, y, z, scale }` + `DespawnModel { entity_id }` appended last (bincode index stability); `MODEL_PATH_MAX_LEN` | ✅ done |
+| C2 | Lua kinds | `server/src/scripting.rs` | `spawn_model` / `despawn_model` in `build_server_message` with path/scale validation | ✅ done |
+| C3 | Client handler | `client/src/gltf.rs` | `handle_spawn_model_messages`: spawn `GltfModelInstance`+`Transform` entities (replace semantics per server id), `ModelEntityId` mapping for despawn | ✅ done, registered in `RendererPlugin` chain |
+| C4 | Test script | `mods/models_test.lua` | On `player_join`: duck (id 1) + avocado (id 2) + dragon (id 3) + girl (id 4) near spawn | ✅ done |
+| C5 | In-game verification | manual | Join, confirm all four models render near spawn | ⏳ user verification |
+
+**Verification checklist for the session**: (1) server manifest includes
+`models/*.glb`; (2) client downloads + eager-decodes
+them (no `asset handler failed` warnings); (3) all four models render near
+spawn; (4) `cargo test -p exsolis_client --bin exsolis gltf` passes (already ✅).
+
+Fixed this session: `setup_renderer` panic — shader inputs (`in_position`,
+…) did not match `Vertex`-derived attribute names (`position`, …); renamed
+shader-side. `cargo check` passing does NOT catch this class of error (it is
+a runtime `definition()` validation), only a real renderer startup does.
+
+Fixed next: `create_info.stages[0]` validation — `pipeline_layout_from_stages`
+carries only the bindless global set, dropping our set-1 storage bindings.
+GLTF pipeline now builds its layout explicitly as
+`[global_set_layout, local]` (same shape as `create_effect_pipeline_layout`),
+and the descriptor set allocates against that local layout.
+
+---
 
 ---
 

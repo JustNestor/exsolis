@@ -438,7 +438,9 @@ fn load_effect_assets(
             .and_then(|ext| ext.to_str())
             .unwrap_or("")
             .to_ascii_lowercase();
-        if !matches!(ext.as_str(), "fxm" | "wgsl") || handlers.resident.contains_key(&asset.path) {
+        if !matches!(ext.as_str(), "fxm" | "wgsl" | "glb")
+            || handlers.resident.contains_key(&asset.path)
+        {
             continue;
         }
         let full_path = paths.extracted.join(&asset.path);

@@ -44,6 +44,7 @@ impl Plugin for RendererPlugin {
                     avatars::ensure_avatar_mesh.run_if(resource_exists::<RenderState>),
                     meshing::cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
                     crate::gltf::upload_gltf_assets.run_if(resource_exists::<RenderState>),
+                    crate::gltf::handle_spawn_model_messages.run_if(resource_exists::<RenderState>),
                     crate::gltf::sync_gltf_instances.run_if(resource_exists::<RenderState>),
                     gpu::render_frame.run_if(resource_exists::<RenderState>),
                 )

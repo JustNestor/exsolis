@@ -294,6 +294,22 @@ pub enum ServerMessage {
     /// Authenticated identity of the receiving client, for correlating local
     /// model transforms with server-authored actions. Appended for wire compatibility.
     YourPlayerId(PlayerId),
+    /// Spawn a GLTF model instance on the client. `path` is a server-manifest
+    /// asset path (e.g. `models/duck.glb`). TEMPORARY test API.
+    /// Appended for wire compatibility.
+    SpawnModel {
+        entity_id: u64,
+        path: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        scale: f32,
+    },
+    /// Despawn a previously spawned model instance. Unknown ids are ignored.
+    /// TEMPORARY test API. Appended for wire compatibility.
+    DespawnModel {
+        entity_id: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,6 +337,11 @@ pub const UI_DRAG_MAX_ID_LEN: usize = UI_MAX_ID_LEN;
 pub const MOD_ACTION_MAX_ID_BYTES: usize = 128;
 /// Maximum UTF-8 JSON payload size for one mod action packet.
 pub const MOD_ACTION_MAX_PAYLOAD_BYTES: usize = 4096;
+/// Maximum asset path length for a `SpawnModel` request.
+pub const MODEL_PATH_MAX_LEN: usize = 256;
+/// Maximum decoded bytes for one GLB model. Models dwarf shaders/textures;
+/// one oversized asset must not stall joins or exhaust GPU buffers.
+pub const GLB_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// Mod action identifiers use the same `namespace:name` form as keybinds.
 pub fn is_valid_mod_action_id(id: &str) -> bool {

@@ -23,6 +23,7 @@ use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMe
 mod assets;
 mod chunks;
 mod events;
+mod gltf_pack;
 mod interaction;
 mod movement;
 mod net;

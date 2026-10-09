@@ -15,6 +15,11 @@ use glam::{Mat4, Quat, Vec3};
 use vulkano::{
     DeviceSize, VulkanError,
     buffer::{Buffer, BufferCreateInfo, BufferUsage, BufferContents},
+    descriptor_set::{
+        DescriptorBufferInfo, DescriptorSet, WriteDescriptorSet,
+        allocator::StandardDescriptorSetAllocator,
+        layout::{DescriptorSetLayout, DescriptorSetLayoutBinding, DescriptorSetLayoutCreateInfo},
+    },
     format::{ClearValue, Format},
     image::{Image, ImageCreateInfo, ImageUsage},
     memory::{
@@ -22,7 +27,8 @@ use vulkano::{
         allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter},
     },
     pipeline::{
-        DynamicState, GraphicsPipeline, Pipeline, PipelineShaderStageCreateInfo,
+        DynamicState, GraphicsPipeline, Pipeline, PipelineBindPoint, PipelineShaderStageCreateInfo,
+        layout::{PipelineLayoutCreateInfo, push_constant_ranges_from_stages},
         graphics::{
             GraphicsPipelineCreateInfo,
             color_blend::{ColorBlendAttachmentState, ColorBlendState},
@@ -36,6 +42,7 @@ use vulkano::{
     },
     swapchain::{PresentMode, Swapchain, SwapchainCreateInfo},
 };
+use vulkano::shader::ShaderStages;
 use vulkano_taskgraph::{
     ClearValues, Id, Task, TaskContext, TaskResult,
     command_buffer::RecordingCommandBuffer,
@@ -89,17 +96,17 @@ pub mod gltf_vs {
             vec2 _pad;
         } push_constants;
 
-        layout(location = 0) in vec3 in_position;
-        layout(location = 1) in vec3 in_normal;
-        layout(location = 2) in vec2 in_uv;
-        layout(location = 3) in vec4 in_color;
-        layout(location = 4) in vec4 in_tangent;
+        layout(location = 0) in vec3 position;
+        layout(location = 1) in vec3 normal;
+        layout(location = 2) in vec2 uv;
+        layout(location = 3) in vec4 color;
+        layout(location = 4) in vec4 tangent;
 
-        layout(set = 0, binding = 0, std430) readonly buffer InstanceData {
+        layout(set = 1, binding = 0, std430) readonly buffer InstanceData {
             mat4 model_matrices[];
         } instances;
 
-        layout(set = 0, binding = 1, std430) readonly buffer MaterialData {
+        layout(set = 1, binding = 1, std430) readonly buffer MaterialData {
             GltfMaterial materials[];
         } materials;
 
@@ -115,12 +122,12 @@ pub mod gltf_vs {
             mat4 model = instances.model_matrices[instance_id];
             mat3 normal_matrix = transpose(inverse(mat3(model)));
 
-            vec4 world_pos = model * vec4(in_position, 1.0);
+            vec4 world_pos = model * vec4(position, 1.0);
             v_world_pos = world_pos.xyz;
-            v_world_normal = normalize(normal_matrix * in_normal);
-            v_uv = in_uv;
-            v_color = in_color;
-            v_tangent = in_tangent;
+            v_world_normal = normalize(normal_matrix * normal);
+            v_uv = uv;
+            v_color = color;
+            v_tangent = tangent;
             v_material_index = 0;
 
             gl_Position = push_constants.view_proj * world_pos;
@@ -162,7 +169,7 @@ pub mod gltf_fs {
             vec2 _pad;
         } push_constants;
 
-        layout(set = 0, binding = 1, std430) readonly buffer MaterialData {
+        layout(set = 1, binding = 1, std430) readonly buffer MaterialData {
             GltfMaterial materials[];
         } materials;
 
@@ -315,21 +322,8 @@ pub mod gltf_fs {
     }
 }
 
-/// GLTF vertex format for pipeline creation
-#[derive(BufferContents, Vertex, Clone, Copy)]
-#[repr(C)]
-pub struct GltfGpuVertex {
-    #[format(R32G32B32_SFLOAT)]
-    pub position: [f32; 3],
-    #[format(R32G32B32_SFLOAT)]
-    pub normal: [f32; 3],
-    #[format(R32G32_SFLOAT)]
-    pub uv: [f32; 2],
-    #[format(R32G32B32A32_SFLOAT)]
-    pub color: [f32; 4],
-    #[format(R32G32B32A32_SFLOAT)]
-    pub tangent: [f32; 4],
-}
+/// GLTF vertex format for pipeline creation (canonical type in crate::gltf).
+pub(crate) use crate::gltf::GltfGpuVertex;
 
 // 32^3 chunks pack more geometry per chunk than the old 16x16x256 columns
 // did on average once boundary culling removes most internal faces, and
@@ -356,6 +350,19 @@ pub(crate) struct RenderStateShared {
     pub gltf_instance_buffer_id: Option<Id<Buffer>>,
     /// Number of GLTF instances to draw
     pub gltf_instance_count: u32,
+    /// Per-primitive GLTF draws for the current frame (built by sync).
+    pub gltf_draws: Vec<GltfDrawCall>,
+    /// Descriptor set for GLTF instance/material storage buffers (set 1;
+    /// set 0 is the bindless globals). Buffers are created once, so one
+    /// persistent set covers uploads and hot-reload rewrites.
+    pub gltf_descriptors: Option<GltfDescriptors>,
+}
+
+/// GLTF storage-buffer bindings for set 1.
+pub(crate) struct GltfDescriptors {
+    pub set: Arc<DescriptorSet>,
+    #[allow(dead_code)]
+    pub allocator: Arc<StandardDescriptorSetAllocator>,
 }
 
 pub(crate) struct FrameData {
@@ -511,6 +518,8 @@ pub(crate) struct GltfDrawCall {
     pub first_index: u32,
     pub vertex_offset: i32,
     pub material_index: u32,
+    pub first_instance: u32,
+    pub instance_count: u32,
 }
 
 // GLTF render task for drawing instanced GLTF models
@@ -552,10 +561,20 @@ impl Task for GltfRenderTask {
             );
             cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[]);
 
-            // NOTE: instance/material storage buffers (set 0, bindings 0/1)
-            // still need descriptor-set binding before real draws work.
-            // Until then, issue the draws so pipeline/vertex-format errors
-            // surface early; they will render once descriptors are wired.
+            // Storage buffers (instances, materials) live at set 1.
+            if let Some(descriptors) = shared.gltf_descriptors.as_ref() {
+                unsafe {
+                    cbf.as_raw().bind_descriptor_sets(
+                        PipelineBindPoint::Graphics,
+                        pipeline.layout(),
+                        1,
+                        &[descriptors.set.as_raw()],
+                        &[],
+                    );
+                }
+            }
+
+            // NOTE: without gltf_descriptors the draws below read garbage;
             for draw in &world.gltf_draws {
                 cbf.push_constants(
                     pipeline.layout(),
@@ -573,10 +592,10 @@ impl Task for GltfRenderTask {
                 unsafe {
                     cbf.draw_indexed(
                         draw.index_count,
-                        world.gltf_instance_count,
+                        draw.instance_count,
                         draw.first_index,
                         draw.vertex_offset,
-                        0,
+                        draw.first_instance,
                     );
                 }
             }
@@ -922,6 +941,8 @@ pub(super) fn setup_renderer(
         gltf_material_buffer_id: Some(gltf_material_buffer_id),
         gltf_instance_buffer_id: Some(gltf_instance_buffer_id),
         gltf_instance_count: 0,
+        gltf_draws: Vec::new(),
+        gltf_descriptors: None,
     }));
 
     let mut task_graph: TaskGraph<FrameData> = TaskGraph::new(&vk.resources);
@@ -1113,7 +1134,44 @@ pub(super) fn setup_renderer(
         PipelineShaderStageCreateInfo::new(&gltf_fs),
     ];
 
-    let gltf_layout = vk.resources.bindless_context().unwrap().pipeline_layout_from_stages(&gltf_stages).unwrap();
+    // Explicit layout: set 0 = bindless globals, set 1 = our storage
+    // buffers. `pipeline_layout_from_stages` only carries the bindless set,
+    // which is what dropped our bindings (same shape as effect pipelines).
+    let gltf_local_layout = DescriptorSetLayout::new(
+        &vk.device,
+        &DescriptorSetLayoutCreateInfo {
+            bindings: &[
+                DescriptorSetLayoutBinding {
+                    binding: 0,
+                    descriptor_count: 1,
+                    stages: ShaderStages::VERTEX,
+                    ..DescriptorSetLayoutBinding::new(
+                        vulkano::descriptor_set::layout::DescriptorType::StorageBuffer,
+                    )
+                },
+                DescriptorSetLayoutBinding {
+                    binding: 1,
+                    descriptor_count: 1,
+                    stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::new(
+                        vulkano::descriptor_set::layout::DescriptorType::StorageBuffer,
+                    )
+                },
+            ],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let bcx = vk.resources.bindless_context().unwrap();
+    let gltf_layout = vulkano::pipeline::layout::PipelineLayout::new(
+        &vk.device,
+        &PipelineLayoutCreateInfo {
+            set_layouts: &[bcx.global_set_layout(), &gltf_local_layout],
+            push_constant_ranges: &push_constant_ranges_from_stages(&gltf_stages),
+            ..Default::default()
+        },
+    )
+    .unwrap();
 
     let gltf_pipeline = GraphicsPipeline::new(
         &vk.device,
@@ -1148,6 +1206,44 @@ pub(super) fn setup_renderer(
     .unwrap();
 
     shared.write().unwrap().gltf_pipeline = Some(gltf_pipeline);
+
+    // Descriptor set for GLTF storage buffers at set 1 (set 0 = bindless).
+    // Buffers are whole-range bound once; uploads rewrite contents in place.
+    {
+        let allocator = Arc::new(StandardDescriptorSetAllocator::new(
+            &vk.device,
+            &Default::default(),
+        ));
+        let instance_buf = vk.resources.buffer(gltf_instance_buffer_id).buffer().clone();
+        let material_buf = vk.resources.buffer(gltf_material_buffer_id).buffer().clone();
+        let instance_info = DescriptorBufferInfo {
+            buffer: Some(&instance_buf),
+            offset: 0,
+            range: None,
+        };
+        let material_info = DescriptorBufferInfo {
+            buffer: Some(&material_buf),
+            offset: 0,
+            range: None,
+        };
+        match DescriptorSet::new(
+            &allocator,
+            &gltf_local_layout,
+            &[
+                WriteDescriptorSet::buffer(0, &instance_info),
+                WriteDescriptorSet::buffer(1, &material_info),
+            ],
+            &[],
+        ) {
+            Ok(set) => {
+                shared.write().unwrap().gltf_descriptors =
+                    Some(GltfDescriptors { set, allocator });
+            }
+            Err(e) => {
+                bevy_log::warn!("gltf descriptor set failed: {e:?}");
+            }
+        }
+    }
 
     shared.write().unwrap().effects_gpu = Some(super::effects_gpu::EffectGpuState::new(
         &vk,
@@ -1276,18 +1372,22 @@ pub(super) fn render_frame(
     let ui_count = render_state.ui_gpu.count;
     let ui_buffer_id = render_state.ui_gpu.buffer_id;
 
-    // Get GLTF buffers from shared state
-    let (gltf_instance_buffer_id, gltf_instance_count, gltf_material_buffer_id) = {
+    // Get GLTF buffers, staged draws, and instance count from shared state
+    // (staged by sync_gltf_instances earlier in the chain).
+    let (
+        gltf_instance_buffer_id,
+        gltf_instance_count,
+        gltf_material_buffer_id,
+        gltf_draws,
+    ) = {
         let shared = render_state.shared.read().unwrap();
         (
             shared.gltf_instance_buffer_id.unwrap(),
             shared.gltf_instance_count,
             shared.gltf_material_buffer_id.unwrap(),
+            shared.gltf_draws.clone(),
         )
     };
-
-    // TODO(phase-1b): populate from GltfModels resource (draws + instances).
-    let gltf_draws = Vec::new();
 
     let frame = FrameData {
         frame_index: render_state.frame_index,

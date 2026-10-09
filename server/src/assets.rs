@@ -509,7 +509,47 @@ fn scan_catalog(
     let state = snapshot_files(&files).map_err(|e| e.to_string())?;
     let mut builder = PakBuilder::new();
     builder.intent(Intent::Fast);
+    // Auto-convert `.gltf` sources to self-contained `.glb` next to the
+    // source, then ship only allowlisted extensions. Raw `.gltf`/`.bin`
+    // sources stay out of the pak (but remain mtime-tracked for hot-reload).
+    // A committed `.glb` next to a `.gltf` wins over conversion.
+    let mut shippable: HashMap<String, PathBuf> = HashMap::new();
     for (logical_path, disk_path) in &files {
+        if logical_path.ends_with(".gltf") {
+            continue;
+        }
+        if !is_client_asset_path(disk_path) {
+            continue;
+        }
+        if logical_path.ends_with(".glb")
+            && let Ok(size) = disk_path.metadata().map(|m| m.len())
+            && size > exsolis_common::GLB_MAX_BYTES as u64
+        {
+            warn!(
+                "skipping oversized model {logical_path} (size {size} > {} bytes)",
+                exsolis_common::GLB_MAX_BYTES
+            );
+            continue;
+        }
+        shippable.insert(logical_path.clone(), disk_path.clone());
+    }
+    for (logical_path, disk_path) in &files {
+        if !logical_path.ends_with(".gltf") {
+            continue;
+        }
+        let glb_logical = format!("{}.glb", logical_path.trim_end_matches(".gltf"));
+        if shippable.contains_key(&glb_logical) {
+            warn!("skipping gltf conversion for {logical_path}: {glb_logical} already present");
+            continue;
+        }
+        match crate::gltf_pack::ensure_converted_glb(disk_path) {
+            Ok(glb_disk) => {
+                shippable.insert(glb_logical, glb_disk);
+            }
+            Err(e) => warn!("gltf conversion failed for {logical_path}: {e}"),
+        }
+    }
+    for (logical_path, disk_path) in &shippable {
         builder
             .add_file(logical_path, disk_path)
             .map_err(|e| format!("could not add asset '{logical_path}': {e}"))?;
@@ -531,7 +571,12 @@ fn scan_catalog(
         .collect();
     drop(pak);
     let _ = fs::remove_file(pak_path);
-    Ok((assets, files, state))
+    // Return the shippable map (not raw discovery): converted `.glb`s live
+    // here so `make_delta` can serve them from disk; raw `.gltf`/`.bin`
+    // sources stay mtime-tracked via `state` but are never served.
+    let mut served = files;
+    served.extend(shippable);
+    Ok((assets, served, state))
 }
 
 fn discover_client_assets(
@@ -554,6 +599,23 @@ fn discover_client_assets(
             } else if ty.is_file() {
                 if filter_extensions && !is_client_asset_path(&path) {
                     continue;
+                }
+                // Oversized models never enter the manifest: one bad asset
+                // must not stall joins or exhaust client GPU buffers.
+                if path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("glb"))
+                {
+                    let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                    if size > exsolis_common::GLB_MAX_BYTES as u64 {
+                        warn!(
+                            "skipping oversized model {} ({size} > {} bytes)",
+                            path.display(),
+                            exsolis_common::GLB_MAX_BYTES
+                        );
+                        continue;
+                    }
                 }
                 let relative = path.strip_prefix(root).unwrap_or(&path);
                 let relative = relative.to_string_lossy().replace('\\', "/");
@@ -620,7 +682,7 @@ fn is_client_asset_path(path: &Path) -> bool {
         .is_some_and(|ext| {
             matches!(
                 ext.to_ascii_lowercase().as_str(),
-                "fxm" | "wgsl" | "png" | "xml" | "json"
+                "fxm" | "wgsl" | "png" | "xml" | "json" | "glb"
             )
         })
 }

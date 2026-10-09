@@ -6,17 +6,30 @@
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
+use bevy_log::{info, warn};
+use bevy_transform::prelude::{GlobalTransform, Transform};
+use exsolis_common::ServerMessage;
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano_taskgraph::descriptor_set::SampledImageId;
 
 use crate::{
-    assets::{AssetLoader, LoadedAsset},
+    assets::{AssetCacheChanged, AssetHandlerRegistry, AssetLoader, LoadedAsset},
     mesh::ChunkVertex,
-    render::allocator::{GpuMeshAllocation, MeshBufferAllocator},
+    net::IncomingPacket,
+    render::{
+        RenderState,
+        allocator::{GpuMeshAllocation, MeshBufferAllocator},
+        gpu::{GltfDrawCall, PendingWrite, upload_gltf_writes},
+    },
     texture::{TextureManager, sampled_image_index},
     vulkan_prelude::VulkanContext,
 };
+
+/// Max materials across all uploaded models (matches the storage buffer).
+const MAX_GLTF_MATERIALS: usize = 256;
+/// Max model instances drawn per frame (matches the instance buffer).
+const MAX_GLTF_INSTANCES: usize = 1024;
 
 /// A loaded GLTF model containing meshes and their associated data.
 #[derive(Debug, Clone)]
@@ -177,6 +190,13 @@ pub struct GltfAsset {
 
 /// Decode a GLTF/GLB file from bytes.
 pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
+    if bytes.len() > exsolis_common::GLB_MAX_BYTES {
+        return Err(format!(
+            "GLB too large ({} > {} bytes)",
+            bytes.len(),
+            exsolis_common::GLB_MAX_BYTES
+        ));
+    }
     let model = load_gltf_model(bytes)
         .map_err(|e| format!("Failed to load GLTF model: {}", e))?;
 
@@ -596,14 +616,14 @@ pub struct GltfUploadData {
 }
 
 /// Upload a GLTF model to GPU buffers (prepares data for upload).
+/// `texture_indices` must parallel `model.textures` (see
+/// `TextureManager::load_gltf_textures`); texture uploading itself is owned
+/// by the caller so it can be redone independently of mesh uploads.
 pub fn upload_gltf_model(
-    vk: &VulkanContext,
     allocator: &mut MeshBufferAllocator,
-    texture_manager: &mut TextureManager,
     model: &GltfModel,
+    texture_indices: &[Option<SampledImageId>],
 ) -> Result<GltfUploadData, String> {
-    // First, upload all embedded textures and get bindless indices
-    let texture_indices = texture_manager.load_gltf_textures(vk, &model.textures);
 
     // Convert materials to GPU format
     let mut gpu_materials = Vec::with_capacity(model.materials.len());
@@ -683,37 +703,366 @@ impl GltfModelInstance {
 pub struct UploadedGltf {
     pub mesh: GltfGpuMesh,
     pub materials: Vec<GltfGpuMaterial>,
+    /// Base slot of this model's materials in the global material buffer.
+    pub material_base: u32,
 }
+
+/// Server-assigned id for a spawned model (see `SpawnModel`/`DespawnModel`).
+/// TEMPORARY test API.
+#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ModelEntityId(pub u64);
 
 /// All GPU-uploaded GLTF models, keyed by asset path.
 #[derive(Resource, Default)]
 pub struct GltfModels {
     pub uploaded: std::collections::HashMap<String, UploadedGltf>,
     pub pending_paths: std::collections::HashSet<String>,
+    /// `TextureManager::generation` textures were last uploaded into.
+    pub texture_generation: u64,
+    /// Instance paths warned about once (model not uploaded yet).
+    pub warned_missing: std::collections::HashSet<String>,
 }
 
-/// Upload newly arrived GLTF assets to the dedicated GPU buffers.
+/// Upload newly arrived (or hot-reloaded) GLTF assets to the dedicated GPU
+/// buffers. Models whose materials would overflow the global material buffer
+/// are skipped with a warning and left out of `uploaded` (their instances
+/// are skipped by sync until they fit).
 pub fn upload_gltf_assets(
     vk: Option<Res<VulkanContext>>,
-    mut render_state: Option<ResMut<crate::render::RenderState>>,
-    mut textures: Option<ResMut<TextureManager>>,
-    assets: Res<crate::assets::AssetHandlerRegistry>,
+    render_state: Option<ResMut<RenderState>>,
+    textures: Option<ResMut<TextureManager>>,
+    assets: Option<Res<AssetHandlerRegistry>>,
     mut models: ResMut<GltfModels>,
+    mut changed: MessageReader<AssetCacheChanged>,
 ) {
-    let (Some(vk), Some(render_state), Some(textures)) = (vk, render_state, textures) else {
+    let (Some(vk), Some(mut render_state), Some(mut textures), Some(assets)) =
+        (vk, render_state, textures, assets)
+    else {
         return;
     };
-    let _ = (vk, render_state, textures, assets, models);
-    // Full upload wired in Phase 1b: decode is done in AssetHandlerRegistry,
-    // GPU transfer needs RenderStateShared buffer ids + allocator access.
-    // Kept as a registered system so the data path exists and compiles.
+
+    let changed_glb: std::collections::HashSet<&str> = changed
+        .read()
+        .flat_map(|event| event.assets.iter())
+        .filter(|asset| asset.path.ends_with(".glb"))
+        .map(|asset| asset.path.as_str())
+        .collect();
+
+    // Newly resident + hot-reloaded models need mesh uploads.
+    let mut to_upload: Vec<String> = assets
+        .iter_loaded::<GltfAsset>()
+        .map(|(path, _)| path.to_owned())
+        .filter(|path| !models.uploaded.contains_key(path) || changed_glb.contains(path.as_str()))
+        .collect();
+
+    // A manager rebuild wiped all bindless ids. Resident GltfAssets retain
+    // everything, so redo those models fully (textures + meshes + materials).
+    let manager_regenerated = models.texture_generation != textures.generation;
+    if manager_regenerated {
+        for path in models.uploaded.keys() {
+            if !to_upload.contains(path) {
+                to_upload.push(path.clone());
+            }
+        }
+        if !to_upload.is_empty() {
+            warn!(
+                "gltf textures wiped by texture rebuild (gen {} -> {}); re-uploading {} model(s), old bindless ids retained",
+                models.texture_generation,
+                textures.generation,
+                to_upload.len()
+            );
+        }
+    }
+    to_upload.sort();
+
+    if to_upload.is_empty() {
+        return;
+    }
+
+    // Free previous GPU allocations for re-uploaded models (swap-under-
+    // instances: entities keyed by path keep working, see B1).
+    for path in &to_upload {
+        if let Some(old) = models.uploaded.remove(path) {
+            render_state.gltf_allocator.free(old.mesh.allocation);
+        }
+    }
+    if !changed_glb.is_empty() {
+        // Textures are re-uploaded below; the old bindless ids are retained
+        // (no GPU unload policy — same as PNGs). Long dev sessions with many
+        // model hot-reloads will accumulate VRAM; tracked as tech debt.
+        warn!(
+            "gltf hot-reload: re-uploading {} model(s); old bindless textures retained",
+            changed_glb.len()
+        );
+    }
+
+    let mut vertex_writes = Vec::new();
+    let mut index_writes = Vec::new();
+    for path in &to_upload {
+        let Some(asset) = assets.get::<GltfAsset>(path) else {
+            continue;
+        };
+        let indices = textures.load_gltf_textures(&vk, &asset.model.textures);
+        let ok = indices.iter().filter(|i| i.is_some()).count();
+        if ok < indices.len() {
+            warn!("gltf textures: {ok}/{} uploaded for {path}", indices.len());
+        }
+        match upload_gltf_model(&mut render_state.gltf_allocator, &asset.model, &indices) {
+            Ok(data) => {
+                info!(
+                    "gltf uploaded {path}: {} verts, {} prims, {} materials, textures {:?}",
+                    data.vertices.len(),
+                    data.mesh.primitives.len(),
+                    data.materials.len(),
+                    indices
+                        .iter()
+                        .map(|id| id.map(sampled_image_index))
+                        .collect::<Vec<_>>(),
+                );
+                // NOTE: GLTF stride (64 B), not ChunkVertex — hence slots.
+                let offset_v = data.mesh.allocation.vertex_slot() as u64
+                    * std::mem::size_of::<GltfGpuVertex>() as u64;
+                let offset_i = data.mesh.allocation.index_slot() as u64
+                    * std::mem::size_of::<u32>() as u64;
+                vertex_writes.push(PendingWrite {
+                    offset_bytes: offset_v,
+                    data: data.vertices,
+                });
+                index_writes.push(PendingWrite {
+                    offset_bytes: offset_i,
+                    data: data.indices,
+                });
+                models.uploaded.insert(
+                    path.clone(),
+                    UploadedGltf {
+                        mesh: data.mesh,
+                        materials: data.materials,
+                        material_base: 0, // assigned below
+                    },
+                );
+            }
+            Err(e) => warn!("gltf upload failed for {path}: {e}"),
+        }
+    }
+    if vertex_writes.is_empty() {
+        return;
+    }
+
+    // Pack materials for all uploaded models from slot 0; skip models that
+    // would overflow the buffer (their draws are skipped by sync).
+    let mut paths: Vec<String> = models.uploaded.keys().cloned().collect();
+    paths.sort();
+    let mut material_data = Vec::new();
+    let mut base = 0u32;
+    let mut skipped = Vec::new();
+    for path in &paths {
+        let count = models.uploaded[path].materials.len() as u32;
+        if base + count > MAX_GLTF_MATERIALS as u32 {
+            skipped.push(path.clone());
+            continue;
+        }
+        models.uploaded.get_mut(path).unwrap().material_base = base;
+        material_data.extend_from_slice(&models.uploaded[path].materials);
+        base += count;
+    }
+    for path in skipped {
+        if let Some(old) = models.uploaded.remove(&path) {
+            render_state.gltf_allocator.free(old.mesh.allocation);
+        }
+        warn!("gltf materials overflow ({MAX_GLTF_MATERIALS} slots); skipped {path}");
+    }
+
+    let material_writes = [PendingWrite {
+        offset_bytes: 0,
+        data: material_data,
+    }];
+    let (material_buf, instance_buf) = {
+        let shared = render_state.shared.read().unwrap();
+        (
+            shared.gltf_material_buffer_id.unwrap(),
+            shared.gltf_instance_buffer_id.unwrap(),
+        )
+    };
+    upload_gltf_writes(
+        &vk,
+        render_state.gltf_vertex_buffer_id,
+        render_state.gltf_index_buffer_id,
+        material_buf,
+        instance_buf,
+        &vertex_writes,
+        &index_writes,
+        &material_writes,
+        &[],
+    );
+    models.texture_generation = textures.generation;
 }
 
-/// Collect `GltfModelInstance` transforms into the instance buffer each frame.
+/// Collect `GltfModelInstance` transforms into the instance buffer and stage
+/// per-primitive draws for the frame. Instances whose model is not uploaded
+/// (still downloading, failed, or skipped) are skipped with a one-time warn.
 pub fn sync_gltf_instances(
-    instances: Query<(&GltfModelInstance, &bevy_transform::prelude::GlobalTransform)>,
-    models: Res<GltfModels>,
-    mut render_state: Option<ResMut<crate::render::RenderState>>,
+    vk: Option<Res<VulkanContext>>,
+    render_state: Option<ResMut<RenderState>>,
+    mut models: ResMut<GltfModels>,
+    instances: Query<(&GltfModelInstance, &GlobalTransform)>,
 ) {
-    let _ = (instances, models, render_state);
+    let (Some(vk), Some(mut render_state)) = (vk, render_state) else {
+        return;
+    };
+
+    for (instance, _) in instances.iter() {
+        if !models.uploaded.contains_key(&instance.model_path)
+            && models.warned_missing.insert(instance.model_path.clone())
+        {
+            warn!(
+                "gltf instance references model with no GPU upload: {}",
+                instance.model_path
+            );
+        }
+    }
+
+    // Deterministic model order so draws and instance ranges line up.
+    let mut paths: Vec<&String> = models.uploaded.keys().collect();
+    paths.sort();
+
+    let mut matrices: Vec<glam::Mat4> = Vec::new();
+    let mut draws: Vec<GltfDrawCall> = Vec::new();
+    for path in paths {
+        let uploaded = &models.uploaded[path];
+        let first_instance = matrices.len() as u32;
+        for (instance, transform) in instances.iter() {
+            if instance.model_path != *path {
+                continue;
+            }
+            if matrices.len() >= MAX_GLTF_INSTANCES {
+                warn!("gltf instance overflow ({MAX_GLTF_INSTANCES}); dropping extras");
+                break;
+            }
+            matrices.push(transform.to_matrix());
+        }
+        let instance_count = matrices.len() as u32 - first_instance;
+        if instance_count == 0 {
+            continue;
+        }
+        for prim in &uploaded.mesh.primitives {
+            draws.push(GltfDrawCall {
+                index_count: prim.index_count,
+                first_index: uploaded.mesh.allocation.first_index() + prim.first_index,
+                vertex_offset: uploaded.mesh.allocation.vertex_offset()
+                    + prim.vertex_offset,
+                material_index: uploaded.material_base + prim.material_index as u32,
+                first_instance,
+                instance_count,
+            });
+        }
+    }
+
+    let (instance_buf, material_buf) = {
+        let mut shared = render_state.shared.write().unwrap();
+        shared.gltf_instance_count = matrices.len() as u32;
+        shared.gltf_draws = draws;
+        (
+            shared.gltf_instance_buffer_id.unwrap(),
+            shared.gltf_material_buffer_id.unwrap(),
+        )
+    };
+    if matrices.is_empty() {
+        return;
+    }
+    upload_gltf_writes(
+        &vk,
+        render_state.gltf_vertex_buffer_id,
+        render_state.gltf_index_buffer_id,
+        material_buf,
+        instance_buf,
+        &[],
+        &[],
+        &[],
+        &[PendingWrite {
+            offset_bytes: 0,
+            data: matrices,
+        }],
+    );
+}
+
+/// TEMPORARY test API: spawn/despawn model entities from server messages.
+pub fn handle_spawn_model_messages(
+    mut incoming: MessageReader<IncomingPacket>,
+    mut commands: Commands,
+    existing: Query<(Entity, &ModelEntityId)>,
+) {
+    for packet in incoming.read() {
+        match &packet.0 {
+            ServerMessage::SpawnModel {
+                entity_id,
+                path,
+                x,
+                y,
+                z,
+                scale,
+            } => {
+                if !path.ends_with(".glb") || path.len() > exsolis_common::MODEL_PATH_MAX_LEN
+                {
+                    warn!("spawn_model: rejected path {path:?}");
+                    continue;
+                }
+                // Replace semantics: one live entity per server id.
+                for (entity, id) in existing.iter() {
+                    if id.0 == *entity_id {
+                        commands.entity(entity).despawn();
+                    }
+                }
+                commands.spawn((
+                    ModelEntityId(*entity_id),
+                    GltfModelInstance::new(path.clone()),
+                    Transform::from_xyz(*x, *y, *z).with_scale(glam::Vec3::splat(*scale)),
+                    GlobalTransform::default(),
+                ));
+            }
+            ServerMessage::DespawnModel { entity_id } => {
+                for (entity, id) in existing.iter() {
+                    if id.0 == *entity_id {
+                        commands.entity(entity).despawn();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_duck_glb() {
+        decode_test_model("duck.glb");
+    }
+
+    fn decode_test_model(model: &str) {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/models")
+            .join(model);
+        let bytes = std::fs::read(&path).expect("duck.glb test model missing");
+        let loaded = decode_gltf(&bytes).expect("decode_gltf failed");
+        let asset = loaded
+            .as_ref()
+            .downcast_ref::<GltfAsset>()
+            .expect("wrong asset type");
+        assert!(
+            !asset.model.meshes.is_empty(),
+            "duck has no meshes"
+        );
+        let vert_count: usize = asset.model.meshes.iter()
+            .flat_map(|mesh| mesh.primitives.iter())
+            .map(|prim| prim.vertices.len())
+            .sum();
+        assert!(vert_count > 0, "duck has no vertices");
+        // Tangent generation + material conversion (GPU prep path).
+        let prim = &asset.model.meshes[0].primitives[0];
+        let gpu = gltf_vertices_to_gpu_vertices(&prim.vertices, &prim.indices);
+        assert_eq!(gpu.len(), prim.vertices.len());
+        assert!(gpu.iter().all(|v| v.tangent.iter().all(|c| c.is_finite())));
+    }
 }

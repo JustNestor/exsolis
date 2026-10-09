@@ -49,6 +49,19 @@ impl GpuMeshAllocation {
     pub fn vertex_offset(self) -> i32 {
         self.vertex.offset as i32
     }
+
+    /// Raw vertex slot (for buffers whose stride differs from ChunkVertex,
+    /// e.g. GLTF vertex buffers: byte offset = slot * stride).
+    #[inline]
+    pub fn vertex_slot(self) -> u32 {
+        self.vertex.offset
+    }
+
+    /// Raw index slot.
+    #[inline]
+    pub fn index_slot(self) -> u32 {
+        self.index.offset
+    }
 }
 
 pub struct MeshBufferAllocator {

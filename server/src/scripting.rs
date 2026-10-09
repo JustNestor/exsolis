@@ -48,6 +48,7 @@ use bevy_log::{error, info, warn};
 use mlua::{Lua, MultiValue, Table, Value};
 
 use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId, ServerMessage};
+use fastpack;
 
 use crate::Player;
 use crate::chunks::{ChunkWorld, PlayerPosition};
@@ -1170,6 +1171,45 @@ fn build_server_message(kind: &str, args: &[LuaScalar]) -> Result<ServerMessage,
                 .ok_or("ui_hide: missing ui_id")?
                 .to_string();
             Ok(ServerMessage::UiHide { id })
+        }
+        // TEMPORARY test API. args: [entity_id, path, x, y, z, scale?]
+        "spawn_model" => {
+            let entity_id = args.first().and_then(LuaScalar::as_i32).unwrap_or(0) as u64;
+            let path = args
+                .get(1)
+                .and_then(LuaScalar::as_str)
+                .ok_or("spawn_model: missing path")?
+                .to_string();
+            if path.len() > exsolis_common::MODEL_PATH_MAX_LEN {
+                return Err(format!(
+                    "spawn_model: path too long ({} > {})",
+                    path.len(),
+                    exsolis_common::MODEL_PATH_MAX_LEN
+                ));
+            }
+            if fastpack::normalize_path(&path).is_err() {
+                return Err(format!("spawn_model: invalid path {path:?}"));
+            }
+            let x = args.get(2).and_then(LuaScalar::as_f32).unwrap_or(0.0);
+            let y = args.get(3).and_then(LuaScalar::as_f32).unwrap_or(0.0);
+            let z = args.get(4).and_then(LuaScalar::as_f32).unwrap_or(0.0);
+            let scale = args.get(5).and_then(LuaScalar::as_f32).unwrap_or(1.0);
+            if !scale.is_finite() || scale <= 0.0 || scale > 1000.0 {
+                return Err("spawn_model: scale must be in (0, 1000]".to_string());
+            }
+            Ok(ServerMessage::SpawnModel {
+                entity_id,
+                path,
+                x,
+                y,
+                z,
+                scale,
+            })
+        }
+        // TEMPORARY test API. args: [entity_id]
+        "despawn_model" => {
+            let entity_id = args.first().and_then(LuaScalar::as_i32).unwrap_or(0) as u64;
+            Ok(ServerMessage::DespawnModel { entity_id })
         }
         other => Err(format!("unknown message kind '{other}'")),
     }
