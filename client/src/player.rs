@@ -164,13 +164,14 @@ fn fly_camera_look(
 #[derive(Default)]
 struct InputSyncState {
     last_sent: Vec3,
+    last_look: (f32, f32),
     last_sent_at: Option<Instant>,
 }
 
 fn send_movement_input(
     keys: Res<ButtonInput<KeyCode>>,
     windows: Query<&CursorOptions, With<PrimaryWindow>>,
-    query: Query<&Transform, With<LocalPlayer>>,
+    query: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
     connected: Res<NetConnected>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     mut sync: Local<InputSyncState>,
@@ -180,7 +181,7 @@ fn send_movement_input(
         return;
     }
 
-    let Ok(transform) = query.single() else {
+    let Ok((transform, cam)) = query.single() else {
         return;
     };
 
@@ -217,7 +218,10 @@ fn send_movement_input(
         direction = direction.normalize_or_zero();
     }
 
-    if direction.abs_diff_eq(sync.last_sent, 1e-3) {
+    let changed_move = !direction.abs_diff_eq(sync.last_sent, 1e-3);
+    let changed_look =
+        (cam.yaw - sync.last_look.0).abs() > 1e-3 || (cam.pitch - sync.last_look.1).abs() > 1e-3;
+    if !changed_move && !changed_look {
         return;
     }
 
@@ -229,19 +233,29 @@ fn send_movement_input(
         }
     }
 
-    outgoing.write(OutgoingPacket::reliable(ClientMessage::Move {
-        x: direction.x,
-        y: direction.y,
-        z: direction.z,
-    }));
+    if direction != Vec3::ZERO || changed_move {
+        outgoing.write(OutgoingPacket::reliable(ClientMessage::MoveAndLook {
+            x: direction.x,
+            y: direction.y,
+            z: direction.z,
+            yaw: cam.yaw,
+            pitch: cam.pitch,
+        }));
+    } else {
+        outgoing.write(OutgoingPacket::reliable(ClientMessage::Look {
+            yaw: cam.yaw,
+            pitch: cam.pitch,
+        }));
+    }
     sync.last_sent = direction;
+    sync.last_look = (cam.yaw, cam.pitch);
     sync.last_sent_at = Some(now);
 }
 
 fn receive_server_position(
     mut incoming: MessageReader<IncomingPacket>,
     mut query: Query<(&mut Transform, &mut ServerTarget), With<LocalPlayer>>,
-    mut remote: Query<(&RemotePlayer, &mut ServerTarget), Without<LocalPlayer>>,
+    mut remote: Query<(&RemotePlayer, &mut ServerTarget, &mut Transform), Without<LocalPlayer>>,
 ) {
     let Ok((mut transform, mut target)) = query.single_mut() else {
         return;
@@ -256,11 +270,24 @@ fn receive_server_position(
                 }
                 target.0 = Some(pos);
             }
-            ServerMessage::PlayerMoved { player_id, x, y, z } => {
+            ServerMessage::PlayerMoved {
+                player_id,
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
                 let pos = Vec3::new(x, y, z);
-                for (p, mut t) in &mut remote {
+                for (p, mut t, mut remote_transform) in &mut remote {
                     if p.0 == player_id {
                         t.0 = Some(pos);
+                        remote_transform.rotation = Quat::from_euler(
+                            EulerRot::YXZ,
+                            yaw + std::f32::consts::PI,
+                            -pitch,
+                            0.0,
+                        );
                     }
                 }
             }

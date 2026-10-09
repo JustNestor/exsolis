@@ -8,7 +8,7 @@ use super::*;
 //                 continue;
 //             };
 //             match msg {
-//                 ClientMessage::Move { x, y, z } => {}
+//                 ClientMessage::MoveAndLook { x, y, z, yaw, pitch } => {}
 //             }
 //         }
 //     }

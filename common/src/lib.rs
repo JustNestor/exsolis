@@ -5,7 +5,7 @@ pub mod inventory;
 
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
-pub const PROTOCOL_ID: u64 = 1;
+pub const PROTOCOL_ID: u64 = 2;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -129,10 +129,16 @@ pub enum EntityKind {
 #[non_exhaustive]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
-    Move {
+    MoveAndLook {
         x: f32,
         y: f32,
         z: f32,
+        yaw: f32,
+        pitch: f32,
+    },
+    Look {
+        yaw: f32,
+        pitch: f32,
     },
     PlaceBlock {
         pos: BlockPos,
@@ -142,7 +148,6 @@ pub enum ClientMessage {
         pos: BlockPos,
     },
     SelectHotbar(u8),
-    ToggleInventory,
     SetRenderDistance(u8),
     /// A UI interaction. `ui_id` is the screen the server mounted with
     /// `UiShow`, `element_id` the widget's `id` attribute (or an auto
@@ -196,6 +201,8 @@ pub enum ServerMessage {
         x: f32,
         y: f32,
         z: f32,
+        yaw: f32,
+        pitch: f32,
     },
     ChunkData {
         coord: ChunkCoord,
@@ -227,16 +234,6 @@ pub enum ServerMessage {
         x: f32,
         y: f32,
         z: f32,
-    },
-    /// The receiving player's own hotbar, sent on ReliableOrdered whenever
-    /// it changes (join, pickup, place/break consuming a stack, hotbar
-    /// select). `slots[i]` is `None` for an empty slot. There is no
-    /// visible UI yet (see inventory.rs on both sides) — this exists so
-    /// the client can know what `kind` to put in its next `PlaceBlock`
-    /// without guessing. Appended last, same reason as `YourPosition`.
-    YourInventory {
-        slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
-        selected: u8,
     },
     /// Mount (or atomically replace) the named UI screen. `xml` is the SDUI
     /// document (see client `ui::parse`). ReliableOrdered. If the client

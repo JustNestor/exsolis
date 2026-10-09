@@ -47,10 +47,29 @@ pub struct TargetedBlock {
     pub place_pos: IVec3,
 }
 
-#[derive(Resource, Default, Debug)]
+#[derive(Resource, Debug)]
 pub struct ClientInventory {
     pub slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
     pub selected: u8,
+}
+
+impl Default for ClientInventory {
+    fn default() -> Self {
+        let mut slots = [None; HOTBAR_SIZE];
+        for (index, item) in [
+            BlockType::Dirt,
+            BlockType::Stone,
+            BlockType::Sand,
+            BlockType::Snow,
+            BlockType::Glass,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            slots[index] = Some((item, 64));
+        }
+        Self { slots, selected: 0 }
+    }
 }
 
 impl ClientInventory {

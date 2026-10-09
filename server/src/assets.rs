@@ -360,7 +360,7 @@ fn handle_asset_packets(
     mut outgoing: MessageWriter<OutgoingPacket>,
     mut commands: Commands,
     mut player_map: ResMut<PlayerMap>,
-    positions: Query<&crate::chunks::PlayerPosition>,
+    positions: Query<(&crate::chunks::PlayerPosition, &crate::movement::PlayerLook)>,
 ) {
     for packet in incoming.read() {
         match &packet.msg {

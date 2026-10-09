@@ -7,7 +7,7 @@ use bevy_ecs::message::Message;
 use chunks::{PlayerPosition, RenderDistanceRequested};
 use exsolis_common::{BlockType, SPAWN_POS};
 use glam::Vec3;
-use movement::{PlayerInput, PositionSync};
+use movement::{PlayerInput, PlayerLook, PositionSync};
 
 pub struct EventsPlugin;
 
@@ -89,7 +89,7 @@ pub(crate) fn spawn_joined_player(
     client_id: PlayerId,
     commands: &mut Commands,
     player_map: &mut PlayerMap,
-    positions: &Query<&PlayerPosition>,
+    positions: &Query<(&PlayerPosition, &PlayerLook)>,
     outgoing: &mut MessageWriter<OutgoingPacket>,
 ) {
     if player_map.playerid_to_entity.contains_key(&client_id) {
@@ -104,7 +104,7 @@ pub(crate) fn spawn_joined_player(
             client_id,
             ServerMessage::PlayerJoined(existing_id),
         ));
-        if let Ok(pos) = positions.get(existing_entity) {
+        if let Ok((pos, look)) = positions.get(existing_entity) {
             outgoing.write(OutgoingPacket::to(
                 client_id,
                 ServerMessage::PlayerMoved {
@@ -112,6 +112,8 @@ pub(crate) fn spawn_joined_player(
                     x: pos.0.x,
                     y: pos.0.y,
                     z: pos.0.z,
+                    yaw: look.yaw,
+                    pitch: look.pitch,
                 },
             ));
         }
@@ -132,6 +134,7 @@ pub(crate) fn spawn_joined_player(
             Player(client_id),
             PlayerPosition(Vec3::from(SPAWN_POS)),
             PlayerInput::default(),
+            PlayerLook::default(),
             PositionSync::default(),
             inventory,
         ))
@@ -151,25 +154,46 @@ pub fn dispatch_incoming(
     mut incoming: MessageReader<IncomingPacket>,
     mut commands: Commands,
     player_map: Res<PlayerMap>,
-    mut inputs: Query<&mut PlayerInput>,
+    mut players: Query<(&mut PlayerInput, &mut PlayerLook)>,
 ) {
     for packet in incoming.read() {
         let client_id = packet.player_id;
         debug!("Recived packet {:?} from player {}", packet.msg, client_id);
 
         match &packet.msg {
-            ClientMessage::Move { x, y, z } => {
+            ClientMessage::MoveAndLook {
+                x,
+                y,
+                z,
+                yaw,
+                pitch,
+            } => {
                 let dir = Vec3::new(*x, *y, *z);
-                if !dir.is_finite() {
+                if !dir.is_finite() || !yaw.is_finite() || !pitch.is_finite() {
                     continue;
                 }
                 let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
                     continue;
                 };
-                let Ok(mut input) = inputs.get_mut(entity) else {
+                let Ok((mut input, mut look)) = players.get_mut(entity) else {
                     continue;
                 };
                 input.0 = dir.clamp_length_max(1.0);
+                look.yaw = *yaw;
+                look.pitch = pitch.clamp(-89_f32.to_radians(), 89_f32.to_radians());
+            }
+            ClientMessage::Look { yaw, pitch } => {
+                if !yaw.is_finite() || !pitch.is_finite() {
+                    continue;
+                }
+                let Some(&entity) = player_map.playerid_to_entity.get(&client_id) else {
+                    continue;
+                };
+                let Ok((_, mut look)) = players.get_mut(entity) else {
+                    continue;
+                };
+                look.yaw = *yaw;
+                look.pitch = pitch.clamp(-89_f32.to_radians(), 89_f32.to_radians());
             }
             ClientMessage::SetRenderDistance(radius) => {
                 commands.write_message(RenderDistanceRequested {

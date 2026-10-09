@@ -10,9 +10,16 @@ const POSITION_REPEATS: u8 = 3;
 #[derive(Component, Debug, Default)]
 pub struct PlayerInput(pub Vec3);
 
+#[derive(Component, Debug, Default)]
+pub struct PlayerLook {
+    pub yaw: f32,
+    pub pitch: f32,
+}
+
 #[derive(Component, Debug)]
 pub struct PositionSync {
     last_sent: Vec3,
+    last_look: (f32, f32),
     repeats_left: u8,
 }
 
@@ -20,6 +27,7 @@ impl Default for PositionSync {
     fn default() -> Self {
         Self {
             last_sent: Vec3::NAN,
+            last_look: (f32::NAN, f32::NAN),
             repeats_left: 0,
         }
     }
@@ -45,10 +53,10 @@ impl Plugin for MovementPlugin {
 
 fn apply_player_input(
     time: Res<bevy_time::Time>,
-    mut query: Query<(&mut PlayerInput, &mut PlayerPosition)>,
+    mut query: Query<(&PlayerInput, &mut PlayerPosition)>,
 ) {
     let dt = time.delta_secs();
-    for (mut input, mut pos) in &mut query {
+    for (input, mut pos) in &mut query {
         if input.0 != Vec3::ZERO {
             pos.0 += input.0 * SERVER_MOVE_SPEED * dt;
         }
@@ -56,12 +64,13 @@ fn apply_player_input(
 }
 
 fn send_position_updates(
-    mut query: Query<(&Player, &PlayerPosition, &mut PositionSync)>,
+    mut query: Query<(&Player, &PlayerPosition, &PlayerLook, &mut PositionSync)>,
     mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
-    for (player, pos, mut sync) in &mut query {
-        if pos.0 != sync.last_sent {
+    for (player, pos, look, mut sync) in &mut query {
+        if pos.0 != sync.last_sent || (look.yaw, look.pitch) != sync.last_look {
             sync.last_sent = pos.0;
+            sync.last_look = (look.yaw, look.pitch);
             sync.repeats_left = POSITION_REPEATS;
         }
         if sync.repeats_left == 0 {
@@ -87,6 +96,8 @@ fn send_position_updates(
                 x: pos.0.x,
                 y: pos.0.y,
                 z: pos.0.z,
+                yaw: look.yaw,
+                pitch: look.pitch,
             },
         ));
     }

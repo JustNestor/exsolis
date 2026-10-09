@@ -1,17 +1,9 @@
 //! Minimal shared inventory: hotbar only.
 //!
-//! No crafting grid, no main storage, no armor, no drag-and-drop — those
-//! were in the old single-crate project's `inventory.rs` but this pass is
-//! deliberately scoped to "place/break works, nothing is drawn yet." A
-//! fuller `Inventory` can replace this later; `HOTBAR_SIZE` and `Slot`'s
-//! shape are picked so that migration doesn't need a protocol break (see
-//! `ServerMessage::YourInventory` in `lib.rs`).
-//!
-//! Lives here, not in a per-side `inventory.rs`, because:
-//! - the SERVER owns the authoritative copy (mutated by `interaction.rs`),
-//! - the CLIENT needs the same shape to decode `ServerMessage::YourInventory`
-//!   and to know what to put in `ClientMessage::PlaceBlock`'s `kind`.
-//! No Bevy/GPU dependency, so it costs nothing to share.
+//! Server-side hotbar state for validating block placement. Player-facing
+//! container and inventory UI state lives in Lua (`mods/container.lua` and
+//! `mods/player_inventory.lua`); this small type currently backs the block
+//! interaction rules until those rules are moved to the Lua inventory.
 
 use serde::{Deserialize, Serialize};
 
@@ -115,10 +107,6 @@ impl Inventory {
         true
     }
 
-    /// Wire form for `ServerMessage::YourInventory`.
-    pub fn to_wire(self) -> [Option<(BlockType, u8)>; HOTBAR_SIZE] {
-        self.slots.map(|s| s.map(|s| (s.item, s.amount)))
-    }
 }
 
 impl Default for Inventory {

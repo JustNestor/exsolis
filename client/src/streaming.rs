@@ -9,7 +9,6 @@ use glam::Vec3;
 use crate::{
     chunk::Chunk,
     chunk_registry::ChunkRegistry,
-    interaction::ClientInventory,
     net::{GameplaySet, IncomingPacket},
     player::ServerTarget,
 };
@@ -34,7 +33,6 @@ fn receive_chunk_updates(
     mut commands: Commands,
     mut incoming: MessageReader<IncomingPacket>,
     mut registry: ResMut<ChunkRegistry>,
-    mut inventory: ResMut<ClientInventory>,
     mut local_player_id: ResMut<LocalPlayerId>,
     mut chunks: Query<&mut Chunk>,
     remote_players: Query<(Entity, &RemotePlayer)>,
@@ -75,10 +73,6 @@ fn receive_chunk_updates(
                     commands.entity(entity).despawn();
                     registry.remove(*coords);
                 }
-            }
-            ServerMessage::YourInventory { slots, selected } => {
-                inventory.slots = *slots;
-                inventory.selected = *selected;
             }
             ServerMessage::PlayerJoined(id) => {
                 let exists = remote_players.iter().any(|(_, p)| p.0 == *id);

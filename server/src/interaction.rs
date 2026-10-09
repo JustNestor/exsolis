@@ -45,7 +45,6 @@ impl Plugin for InteractionPlugin {
                 (
                     handle_select_hotbar,
                     (handle_place_block, handle_break_block),
-                    sync_inventories,
                 )
                     .chain()
                     .after(crate::events::dispatch_incoming)
@@ -327,24 +326,5 @@ fn handle_break_block(
         } else if let Ok(mut inventory) = inventories.get_mut(entity) {
             inventory.add_item(broken, 1);
         }
-    }
-}
-
-/// Queues `YourInventory` for each player whose inventory changed this
-/// tick. Bevy's change detection (`Changed<Inventory>`) means this only
-/// fires on an actual mutation, not every tick, so it's fine to run
-/// unconditionally.
-fn sync_inventories(
-    changed: Query<(&crate::Player, &Inventory), Changed<Inventory>>,
-    mut outgoing: MessageWriter<OutgoingPacket>,
-) {
-    for (player, inventory) in &changed {
-        outgoing.write(OutgoingPacket::to(
-            player.0,
-            ServerMessage::YourInventory {
-                slots: inventory.to_wire(),
-                selected: inventory.selected_index(),
-            },
-        ));
     }
 }

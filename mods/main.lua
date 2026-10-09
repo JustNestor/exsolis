@@ -1,27 +1,23 @@
 local SLOT_COUNT = 27
-Inventories = Inventories or {}
 IsInvOpen = IsInvOpen or {}
 
 local function ensure(player_id)
-    if not Inventories[player_id] then
-        Inventories[player_id] = {}
-        for i = 0, SLOT_COUNT - 1 do
-            Inventories[player_id][i] = nil
-        end
-        Inventories[player_id][0] = { id = "wood", count = 12 }
-        Inventories[player_id][2] = { id = "stone", count = 3 }
+    if not PlayerInventory.players[player_id] then
+        local inventory = PlayerInventory.create(player_id)
+        Container.set(inventory.container, 0, { id = "wood", count = 12 })
+        Container.set(inventory.container, 2, { id = "stone", count = 3 })
     end
-    return Inventories[player_id]
+    return PlayerInventory.get(player_id)
 end
 
 local function inv_data(player_id)
-    local inv = ensure(player_id)
+    local inv = ensure(player_id).container
     local slots = {}
     local slots2 = {}
     for i = 0, SLOT_COUNT - 1 do
         slots[i + 1] = {
             index = i,
-            item = inv[i],
+            item = Container.get(inv, i),
         }
     end
     for i = 0, 9 - 1 do
@@ -33,6 +29,7 @@ local function inv_data(player_id)
         title = "Inventory",
         slots = slots,
         slots2=slots2,
+        selected = ensure(player_id).selected,
     }
 end
 
@@ -71,6 +68,7 @@ end)
 
 api.on("player_leave", function(ev)
     IsInvOpen[ev.player_id] = nil
+    PlayerInventory.remove_player(ev.player_id)
 end)
 
 
@@ -89,7 +87,13 @@ api.on("ui_drag", function(ev)
     if from == nil or to == nil or from == to then return end
     if from < 0 or from >= SLOT_COUNT or to < 0 or to >= SLOT_COUNT then return end
 
-    local inv = ensure(ev.player_id)
-    inv[from], inv[to] = inv[to], inv[from]
+    ensure(ev.player_id)
+    PlayerInventory.swap(ev.player_id, from, to)
     show_inv(ev.player_id)
+end)
+
+api.on("select_hotbar", function(ev)
+    if ev.index >= 0 and ev.index < 9 then
+        PlayerInventory.get(ev.player_id).selected = ev.index
+    end
 end)
