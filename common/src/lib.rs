@@ -5,7 +5,10 @@ pub mod inventory;
 
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
-pub const PROTOCOL_ID: u64 = 2;
+/// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
+/// `EntityStateUpdate`). `EntityKind` gained variants, so an old client's
+/// decode of a new server's stream would desync rather than fail cleanly.
+pub const PROTOCOL_ID: u64 = 3;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -119,9 +122,56 @@ impl Face {
     }
 }
 
+/// Server-allocated handle for anything in the world that is not a block:
+/// players, block entities, dropped items and mod-spawned props.
+pub type EntityId = u64;
+
+/// What an [`EntityId`] refers to. Serialized as a bincode enum index, so new
+/// kinds MUST be appended or every client's decode shifts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EntityKind {
+    /// A connected player. `entity_id` is stable for the whole session, so a
+    /// client can correlate it with the `PlayerId` from `YourPlayerId`.
     Player,
+    /// Bound to a `BlockPos` (a chest, a furnace, ...). Spawned and despawned
+    /// by block changes, never moved by physics.
+    Block,
+    /// A dropped item stack, simulated with simple gravity.
+    Item,
+    /// A mod-spawned decorative prop with a model but no behaviour.
+    Prop,
+}
+
+/// Server-authoritative placement + facing of an entity.
+///
+/// `anim` is locomotion the client can use to pick a clip without inferring it
+/// from velocity deltas: the server already knows the authoritative speed, and
+/// deriving speed client-side from unreliable position updates is noisy.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct EntityState {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+    pub yaw: f32,
+    pub pitch: f32,
+    /// Blocks/second along the horizontal facing. `0.0` means standing still.
+    pub speed: f32,
+    /// `true` while airborne, so the client can pick a non-ground clip.
+    pub airborne: bool,
+}
+
+impl Default for EntityState {
+    fn default() -> Self {
+        Self {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            yaw: 0.0,
+            pitch: 0.0,
+            speed: 0.0,
+            airborne: false,
+        }
+    }
 }
 
 /// NOTE: no longer `Copy` — `UiAction` owns `String`s. Anything that copied a
@@ -309,6 +359,29 @@ pub enum ServerMessage {
     /// TEMPORARY test API. Appended for wire compatibility.
     DespawnModel {
         entity_id: u64,
+    },
+    /// Bring an entity into existence on the client. `model` is a catalog
+    /// asset path (`models/girl.glb`) or `None` for entities that render
+    /// nothing on their own (a block entity renders its block instead).
+    /// ReliableOrdered. Appended last so existing variant indices don't shift.
+    SpawnEntity {
+        entity_id: EntityId,
+        kind: EntityKind,
+        state: EntityState,
+        model: Option<String>,
+        scale: f32,
+    },
+    /// Remove an entity. Unknown ids are ignored. ReliableOrdered.
+    /// Appended for wire compatibility.
+    DespawnEntity {
+        entity_id: EntityId,
+    },
+    /// Authoritative transform of an existing entity. Sent on the unreliable
+    /// channel; the client interpolates between updates, so a dropped packet
+    /// costs smoothness but never correctness. Appended for wire compatibility.
+    EntityStateUpdate {
+        entity_id: EntityId,
+        state: EntityState,
     },
 }
 
