@@ -17,6 +17,8 @@
 //! `scroll-y`; scrollbars are shown by default and can be hidden with
 //! `scrollbar="false"`. Any widget can use `background-image="panels/paper.png"`
 //! and `z-index="2"` to layer itself within its UI screen.
+//! A `<cursor>` subtree follows the pointer while it is present in the XML;
+//! server templates can use `v-if` to show it only while holding an item.
 //!
 //! Strictness policy: structural problems (bad XML, unknown element, too
 //! big, too deep) are hard errors — the screen isn't mounted. Attribute
@@ -40,6 +42,8 @@ pub enum WidgetKind {
     Label,
     Button,
     Image,
+    /// Hidden until the parent drag source is moved; its subtree follows the pointer.
+    Cursor,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +182,7 @@ fn convert(
         "label" => WidgetKind::Label,
         "button" => WidgetKind::Button,
         "img" => WidgetKind::Image,
+        "cursor" => WidgetKind::Cursor,
         other => {
             return Err(ParseError::UnknownElement {
                 tag: other.to_owned(),

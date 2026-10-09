@@ -175,7 +175,7 @@ fn get<T>(
 pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> ResolvedStyle {
     // Per-kind defaults.
     let mut node = match kind {
-        WidgetKind::Div => Node {
+        WidgetKind::Div | WidgetKind::Cursor => Node {
             flex_direction: FlexDirection::Column,
             ..Default::default()
         },

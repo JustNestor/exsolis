@@ -8,3 +8,4 @@ crates/fastpak/goldclient_test.pak
 
 # graft's local graph cache — regenerable, not committed (run `graft build`).
 /graft/
+.aider*

@@ -20,6 +20,7 @@ use bevy_picking::prelude::*;
 use bevy_text::{TextColor, TextFont};
 use bevy_ui::prelude::*;
 use bevy_ui::{GlobalZIndex, Interaction};
+use bevy_window::{PrimaryWindow, Window};
 
 use crate::ui::events::{on_ui_pointer_enter, on_ui_pointer_leave};
 
@@ -87,6 +88,23 @@ pub struct UiImageSrc {
 
 #[derive(Component, Debug, Clone, Copy)]
 pub struct UiScrollArea;
+
+#[derive(Component, Debug, Clone, Copy)]
+pub struct UiCursorWidget;
+
+pub fn update_cursor_widgets(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cursors: Query<&mut Node, With<UiCursorWidget>>,
+) {
+    let Ok(window) = windows.single() else { return };
+    let Some(position) = window.cursor_position() else {
+        return;
+    };
+    for mut node in &mut cursors {
+        node.left = Val::Px(position.x);
+        node.top = Val::Px(position.y);
+    }
+}
 
 #[derive(Component, Debug, Clone, Copy)]
 pub struct UiScrollbarThumb {
@@ -261,8 +279,6 @@ pub fn spawn_ui(commands: &mut Commands, ui_id: &str, parsed: &ParsedUi) -> Enti
         color: DEFAULT_TEXT_COLOR,
         font_size: DEFAULT_FONT_SIZE,
     };
-    let content = spawn_widget(commands, ui_id, &parsed.root, "0", inherited, &mut warnings);
-
     let wrapper = commands
         .spawn((
             Name::new(format!("ui:{ui_id}")),
@@ -274,8 +290,22 @@ pub fn spawn_ui(commands: &mut Commands, ui_id: &str, parsed: &ParsedUi) -> Enti
             // The wrapper covers the screen but must not eat world clicks.
             Pickable::IGNORE,
         ))
-        .add_children(&[content])
         .id();
+    let mut cursor_overlays = Vec::new();
+    let content = spawn_widget(
+        commands,
+        ui_id,
+        &parsed.root,
+        "0",
+        inherited,
+        &mut warnings,
+        &mut cursor_overlays,
+        false,
+    );
+    commands.entity(wrapper).add_child(content);
+    // The custom renderer walks child order and does not apply Bevy's ZIndex
+    // stack, so pointer-following overlays must come after the screen tree.
+    commands.entity(wrapper).add_children(&cursor_overlays);
 
     for w in warnings {
         warn!("ui `{ui_id}`: {w}");
@@ -290,6 +320,8 @@ fn spawn_widget(
     path: &str,
     inherited: Inherited,
     warnings: &mut Vec<String>,
+    cursor_overlays: &mut Vec<Entity>,
+    inside_cursor: bool,
 ) -> Entity {
     let ResolvedStyle {
         mut node,
@@ -310,11 +342,28 @@ fn spawn_widget(
         node.overflow.x == OverflowAxis::Scroll || node.overflow.y == OverflowAxis::Scroll;
     let scrolls_x = node.overflow.x == OverflowAxis::Scroll;
     let scrolls_y = node.overflow.y == OverflowAxis::Scroll;
-
     let inh = Inherited {
         color: color.unwrap_or(inherited.color),
         font_size: font_size.unwrap_or(inherited.font_size),
     };
+    let cursor_defs: Vec<(usize, &WidgetDef)> = def
+        .children
+        .iter()
+        .enumerate()
+        .filter(|(_, child)| child.kind == WidgetKind::Cursor)
+        .collect();
+    for (i, child) in cursor_defs {
+        spawn_widget(
+            commands,
+            ui_id,
+            child,
+            &format!("{path}.cursor{i}"),
+            inh,
+            warnings,
+            cursor_overlays,
+            true,
+        );
+    }
 
     // `<img>`: size is resolved before spawning (`node` is moved into the
     // spawn below). Unreadable file => `image_src` is None and the widget
@@ -356,6 +405,9 @@ fn spawn_widget(
     // Auto ids are structural paths ("#0.1.2"): stable as long as the XML
     // shape is, so servers can still route un-id'd widgets if they must.
     let element_id = def.id.clone().unwrap_or_else(|| format!("#{path}"));
+    if def.kind == WidgetKind::Cursor {
+        node.position_type = PositionType::Absolute;
+    }
 
     let mut e = commands.spawn((
         Name::new(format!("ui:{ui_id}/{element_id}")),
@@ -365,6 +417,12 @@ fn spawn_widget(
             element_id,
         },
     ));
+    if def.kind == WidgetKind::Cursor {
+        e.insert((UiCursorWidget, GlobalZIndex(200), Pickable::IGNORE));
+    }
+    if inside_cursor {
+        e.insert(Pickable::IGNORE);
+    }
     if let Some(z) = z_index {
         e.insert(ZIndex(z));
     }
@@ -373,7 +431,7 @@ fn spawn_widget(
     }
 
     match def.kind {
-        WidgetKind::Div => {}
+        WidgetKind::Div | WidgetKind::Cursor => {}
         WidgetKind::Label => {
             e.insert((
                 Text::new(def.text.clone().unwrap_or_default()),
@@ -496,6 +554,7 @@ fn spawn_widget(
         .children
         .iter()
         .enumerate()
+        .filter(|(_, child)| child.kind != WidgetKind::Cursor)
         .map(|(i, child)| {
             spawn_widget(
                 commands,
@@ -504,11 +563,16 @@ fn spawn_widget(
                 &format!("{path}.{i}"),
                 inh,
                 warnings,
+                cursor_overlays,
+                inside_cursor,
             )
         })
         .collect();
     if !kids.is_empty() {
         commands.entity(id).add_children(&kids);
+    }
+    if def.kind == WidgetKind::Cursor {
+        cursor_overlays.push(id);
     }
     if is_scroll_area && scrollbar {
         let mut bars = Vec::new();

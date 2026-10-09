@@ -227,6 +227,7 @@ impl Plugin for UiPlugin {
                     hide_on_disconnect,
                     events::update_hover_styles,
                     spawn::update_scrollbar_thumbs,
+                    spawn::update_cursor_widgets,
                 ),
             )
             .add_plugins(render_bridge::UiRenderBridgePlugin)
