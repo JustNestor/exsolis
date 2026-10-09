@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 /// Bump when conversion output changes so stale artifacts regenerate.
-const CONVERTER_VERSION: u32 = 3;
+const CONVERTER_VERSION: u32 = 4;
 
 fn generator(kind: &str) -> String {
     format!("exsolis gltf_pack v{CONVERTER_VERSION} ({kind})")
@@ -297,8 +297,10 @@ fn convert_v1(doc: &serde_json::Value, dir: &Path) -> Result<(serde_json::Value,
                 s.get(k).and_then(|v| v.as_u64()).unwrap_or(dflt as u64) as u32
             };
             samplers_out.push(serde_json::json!({
-                "magFilter": get("magFilter", 9728),
-                "minFilter": get("minFilter", 9728),
+                // assimp-era glTF 1.0 dumps default to 9728 (GL_NEAREST), which
+                // ruins models with small UV islands. Default to Linear (9729).
+                "magFilter": 9729,
+                "minFilter": 9729,
                 "wrapS": get("wrapS", 10497),
                 "wrapT": get("wrapT", 10497),
             }));

@@ -46,17 +46,21 @@ fn main() {
         .unwrap_or_else(|_| format!("{}/assets", env!("CARGO_MANIFEST_DIR")));
 
     App::new()
-        .add_plugins(DefaultPlugins.set(AssetPlugin {
-            file_path: asset_root,
-            ..default()
-        }).set(WindowPlugin {
-            primary_window: Some(Window {
-                resolution: (1920, 1080).into(),
-                title: "bevy_ref - exsolis gltf reference".into(),
-                ..default()
-            }),
-            ..default()
-        }))
+        .add_plugins(
+            DefaultPlugins
+                .set(AssetPlugin {
+                    file_path: asset_root,
+                    ..default()
+                })
+                .set(WindowPlugin {
+                    primary_window: Some(Window {
+                        resolution: (1920, 1080).into(),
+                        title: "bevy_ref - exsolis gltf reference".into(),
+                        ..default()
+                    }),
+                    ..default()
+                }),
+        )
         .insert_resource(Focus(focus_slot))
         .register_type::<ModelRoot>()
         .add_systems(Startup, setup)
@@ -135,10 +139,9 @@ fn normalize_models(
             continue;
         };
         let inv = root_gt.affine().inverse();
-        let entry = acc.entry(model_root.slot).or_insert((
-            [Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)],
-            0,
-        ));
+        let entry = acc
+            .entry(model_root.slot)
+            .or_insert(([Vec3::splat(f32::MAX), Vec3::splat(f32::MIN)], 0));
         entry.1 += 1;
         for i in 0..8 {
             let corner = Vec3::new(
@@ -191,10 +194,13 @@ fn camera_control(
     roots: Query<(&Transform, &ModelRoot), (With<ModelRoot>, Without<Camera3d>)>,
     mut cams: Query<&mut Transform, (With<Camera3d>, Without<ModelRoot>)>,
 ) {
-    let Ok(mut cam) = cams.single_mut() else { return };
+    let Ok(mut cam) = cams.single_mut() else {
+        return;
+    };
     match focus.0 {
         None => {
-            *cam = Transform::from_xyz(0.0, 3.2, 12.0).looking_at(Vec3::new(0.0, 1.2, 0.0), Vec3::Y);
+            *cam =
+                Transform::from_xyz(0.0, 3.2, 12.0).looking_at(Vec3::new(0.0, 1.2, 0.0), Vec3::Y);
         }
         Some(slot) => {
             let Some((t, _)) = roots.iter().find(|(_, r)| r.slot == slot) else {

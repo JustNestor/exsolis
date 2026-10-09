@@ -55,8 +55,15 @@ pub struct VulkanContext {
     /// mip chains `texture.rs` generates.
     pub block_sampler_id: SamplerId,
     /// Bindless sampler for smooth content: SDF text (`text.rs`) needs
-    /// linear magnification or glyph edges come out blocky.
+    /// linear magnification or glyph edges come out blocky. Clamps instead
+    /// of repeating so out-of-range UVs can't pull texels from the opposite
+    /// edge (edge bleed / dark contour seams).
     pub linear_sampler_id: SamplerId,
+    /// Bindless sampler for pixel-art content, and the default for glTF
+    /// models: NEAREST everywhere (mag, min and mip) + ClampToEdge, no
+    /// anisotropy. Nothing is averaged, so neighbouring texels of an atlas
+    /// never bleed into each other and cube seams stay crisp.
+    pub pixel_sampler_id: SamplerId,
     /// Set when a resize is detected or the swapchain comes back
     /// `OutOfDate` from a failed present; `renderer.rs`'s frame system
     /// clears it after recreating the swapchain + depth image.
@@ -157,7 +164,7 @@ pub fn setup_vulkan(
     // Samplers live in the bindless global set; shaders receive them as a
     // `SamplerId` push constant. Anisotropic filtering is now enabled via
     // the `sampler_anisotropy` feature.
-    let (block_sampler_id, linear_sampler_id) = {
+    let (block_sampler_id, linear_sampler_id, pixel_sampler_id) = {
         let global_set = resources.bindless_context().unwrap().global_set();
         let block = global_set
             .create_sampler(&SamplerCreateInfo {
@@ -169,17 +176,33 @@ pub fn setup_vulkan(
                 ..Default::default()
             })
             .unwrap();
+        // Linear magnification for smooth content (mod effect textures,
+        // SDF text). ClampToEdge: a Repeat sampler would blend the last
+        // texel with the opposite edge on bilinear fetches just outside
+        // [0, 1], drawing dark seams along contours.
         let linear = global_set
             .create_sampler(&SamplerCreateInfo {
                 mag_filter: Filter::Linear,
                 min_filter: Filter::Linear,
                 mipmap_mode: SamplerMipmapMode::Linear,
-                address_mode: [SamplerAddressMode::Repeat; 3],
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
                 anisotropy: Some(16.0),
                 ..Default::default()
             })
             .unwrap();
-        (block, linear)
+        // Pixel-art sampler, the glTF default: everything Nearest so no
+        // interpolation (and no atlas edge bleed) can happen at all.
+        let pixel = global_set
+            .create_sampler(&SamplerCreateInfo {
+                mag_filter: Filter::Nearest,
+                min_filter: Filter::Nearest,
+                mipmap_mode: SamplerMipmapMode::Nearest,
+                address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                anisotropy: None,
+                ..Default::default()
+            })
+            .unwrap();
+        (block, linear, pixel)
     };
 
     let surface = unsafe { Surface::from_window_ref(&instance, &raw_handle_ref).unwrap() };
@@ -238,6 +261,7 @@ pub fn setup_vulkan(
         viewport,
         block_sampler_id,
         linear_sampler_id,
+        pixel_sampler_id,
         recreate_swapchain: false,
     });
 }

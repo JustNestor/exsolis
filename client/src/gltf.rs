@@ -132,8 +132,9 @@ pub struct GltfGpuMaterial {
     pub alpha_mode: u32, // 0 = Opaque, 1 = Mask, 2 = Blend
     pub alpha_cutoff: f32,
     pub double_sided: u32,
-    /// Base-color sampler magnification: 1 = Nearest (block sampler),
-    /// 0 = Linear. From the texture's sampler `magFilter`.
+    /// Base-color sampler magnification: 1 = Nearest (pixel sampler, the
+    /// default for our pixel-art models), 0 = Linear. From the texture's
+    /// sampler `magFilter`.
     pub mag_nearest: u32,
     pub _padding: [u32; 2],
 }
@@ -152,7 +153,7 @@ impl Default for GltfGpuMaterial {
             alpha_mode: 0,
             alpha_cutoff: 0.5,
             double_sided: 0,
-            mag_nearest: 0,
+            mag_nearest: 1,
             _padding: [0, 0],
         }
     }
@@ -173,7 +174,8 @@ pub struct GltfMaterial {
     pub alpha_mode: AlphaMode,
     pub alpha_cutoff: f32,
     pub double_sided: bool,
-    /// Base-color texture magnification from the sampler: true = Nearest.
+    /// Base-color texture magnification: true = Nearest (the default;
+    /// only an explicitly authored `magFilter: LINEAR` clears it).
     pub base_mag_nearest: bool,
 }
 
@@ -337,11 +339,12 @@ fn load_gltf_material(
     // document.images(), so resolve through the texture's source image.
     let base_color_info = pbr.base_color_texture();
     let base_color_texture = base_color_info.as_ref().map(|t| t.texture().source().index());
-    // Honor the authored magnification filter: Nearest gives crisp texels
-    // on pixel-art-ish assets instead of linear blur. Defaults to Linear
-    // when the texture has no sampler (glTF default).
-    let base_mag_nearest = base_color_info.is_some_and(|t| {
-        t.texture().sampler().mag_filter() == Some(gltf::texture::MagFilter::Nearest)
+    // Default to Nearest: every model we ship is pixel art, and a glTF
+    // sampler that omits `magFilter` (Blockbench's usual export) would
+    // otherwise fall back to Linear blur + atlas edge bleed. Only an
+    // explicitly authored `magFilter: LINEAR` opts a material out.
+    let base_mag_nearest = base_color_info.map_or(true, |t| {
+        t.texture().sampler().mag_filter() != Some(gltf::texture::MagFilter::Linear)
     });
 
     let normal_texture = material

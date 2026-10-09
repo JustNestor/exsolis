@@ -90,7 +90,9 @@ pub mod gltf_vs {
 
         layout(push_constant) uniform PushConstants {
             mat4 view_proj;
-            SamplerId sampler_id;
+            // Nearest/ClampToEdge sampler for pixel-art models (the glTF
+            // default), plus a linear one for materials authored LINEAR.
+            SamplerId pixel_sampler_id;
             SamplerId linear_sampler_id;
             vec4 camera_position;
             uint material_index;
@@ -163,7 +165,9 @@ pub mod gltf_fs {
 
         layout(push_constant) uniform PushConstants {
             mat4 view_proj;
-            SamplerId sampler_id;
+            // Nearest/ClampToEdge sampler for pixel-art models (the glTF
+            // default), plus a linear one for materials authored LINEAR.
+            SamplerId pixel_sampler_id;
             SamplerId linear_sampler_id;
             vec4 camera_position;
             uint material_index;
@@ -196,7 +200,7 @@ pub mod gltf_fs {
             // Honor the authored magnification filter: Nearest gives crisp
             // texels on pixel-art-ish assets instead of linear blur.
             if (mag_nearest != 0u) {
-                return texture(vko_sampler2D(tex_id, push_constants.sampler_id), uv);
+                return texture(vko_sampler2D(tex_id, push_constants.pixel_sampler_id), uv);
             }
             return texture(vko_sampler2D(tex_id, push_constants.linear_sampler_id), uv);
         }
@@ -396,6 +400,9 @@ pub(crate) struct FrameData {
     /// Bindless sampler with linear magnification, exposed to effect shaders
     /// next to `sampler_id` (nearest) in the frame buffer.
     pub linear_sampler_id: SamplerId,
+    /// Nearest/ClampToEdge sampler that glTF draws use for pixel-art
+    /// materials (the default): no interpolation, so no atlas edge bleed.
+    pub pixel_sampler_id: SamplerId,
     /// Snapshot of loaded textures so effects can resolve their declared
     /// PNGs each frame (an `Arc` clone, and it survives texture hot-reload).
     pub textures: Option<crate::texture::TextureManager>,
@@ -622,7 +629,7 @@ impl Task for GltfRenderTask {
                         0,
                         &gltf_vs::PushConstants {
                             view_proj: world.view_proj.to_cols_array_2d(),
-                            sampler_id: world.sampler_id,
+                            pixel_sampler_id: world.pixel_sampler_id,
                             linear_sampler_id: world.linear_sampler_id,
                             camera_position: [world.camera_position.x, world.camera_position.y, world.camera_position.z, 1.0],
                             material_index: draw.material_index,
@@ -1490,6 +1497,7 @@ pub(super) fn render_frame(
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
         linear_sampler_id: vk.linear_sampler_id,
+        pixel_sampler_id: vk.pixel_sampler_id,
         textures: textures.map(|textures| (*textures).clone()),
         avatar_models,
         model_transforms,
