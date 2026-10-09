@@ -55,7 +55,14 @@ use super::{effects::*, gpu::FrameData};
 
 pub(super) const EFFECT_ARENA_BYTES: u64 = 16 * 1024 * 1024;
 const TRANSIENT_BYTES: u64 = 4 * 1024 * 1024;
-const FRAME_BYTES: usize = 240;
+/// Frame buffer layout: the 240-byte block mods have always seen, then a
+/// texture table so existing shaders (which declare only the first 240
+/// bytes) keep working:
+///   240 sampler_nearest: u32   244 sampler_linear: u32
+///   248 texture_count:   u32   252 padding
+///   256 textures: array<u32, MAX_EFFECT_TEXTURES>  (bindless image indices)
+const FRAME_TABLE_OFFSET: usize = 240;
+const FRAME_BYTES: usize = FRAME_TABLE_OFFSET + 16 + MAX_EFFECT_TEXTURES * 4;
 const MIN_DESCRIPTOR_RANGE: u64 = 4;
 
 #[derive(Clone, Copy)]
@@ -443,7 +450,8 @@ impl EffectGpuState {
                 started_at: now,
             });
             let frame_inputs = effect.manifest.frame_inputs.clone();
-            let frame_bytes = build_frame_bytes(frame, &frame_inputs, model);
+            let texture_decls = effect.manifest.textures.clone();
+            let frame_bytes = build_frame_bytes(frame, &frame_inputs, &texture_decls, model);
             let effect = self.effects.get(&event.effect_id).unwrap();
             let pass = &effect.passes[pass_index];
             self.dispatch(
@@ -486,7 +494,12 @@ impl EffectGpuState {
             let model = state.model;
             let buffers = instance.buffers.clone();
             let pass = &effect.passes[pass_index];
-            let frame_bytes = build_frame_bytes(frame, &effect.manifest.frame_inputs, model);
+            let frame_bytes = build_frame_bytes(
+                frame,
+                &effect.manifest.frame_inputs,
+                &effect.manifest.textures,
+                model,
+            );
             self.dispatch(
                 cbf,
                 tcx,
@@ -636,6 +649,7 @@ impl EffectGpuState {
                 .copy_from_slice(&build_frame_bytes(
                     frame,
                     &effect.manifest.frame_inputs,
+                    &effect.manifest.textures,
                     model,
                 ));
             let descriptor_set = match self.create_descriptor_set(
@@ -908,6 +922,7 @@ fn webgpu_view_proj(frame: &FrameData) -> glam::Mat4 {
 fn build_frame_bytes(
     frame: &FrameData,
     inputs: &[FrameInput],
+    textures: &[TextureDecl],
     model: Option<glam::Mat4>,
 ) -> Vec<u8> {
     let mut bytes = vec![0; FRAME_BYTES];
@@ -949,7 +964,44 @@ fn build_frame_bytes(
             write_mat4(&mut bytes, 176, view_proj * model);
         }
     }
+    write_texture_table(&mut bytes, frame, textures);
     bytes
+}
+
+/// Fills the bindless texture table that follows the classic frame block.
+///
+/// Indices are resolved every frame from the live `TextureManager`, so a
+/// texture hot-reload (which registers new bindless ids) is picked up with no
+/// effect-side invalidation. A path that isn't loaded resolves to the
+/// placeholder texture; before any texture exists the slot stays 0.
+fn write_texture_table(bytes: &mut [u8], frame: &FrameData, textures: &[TextureDecl]) {
+    write_u32(
+        bytes,
+        FRAME_TABLE_OFFSET,
+        crate::texture::sampler_index(frame.sampler_id),
+    );
+    write_u32(
+        bytes,
+        FRAME_TABLE_OFFSET + 4,
+        crate::texture::sampler_index(frame.linear_sampler_id),
+    );
+    write_u32(
+        bytes,
+        FRAME_TABLE_OFFSET + 8,
+        textures.len().min(MAX_EFFECT_TEXTURES) as u32,
+    );
+    let Some(manager) = frame.textures.as_ref() else {
+        return;
+    };
+    for (slot, decl) in textures.iter().take(MAX_EFFECT_TEXTURES).enumerate() {
+        if let Some(id) = manager.get_asset(&decl.path) {
+            write_u32(
+                bytes,
+                FRAME_TABLE_OFFSET + 16 + slot * 4,
+                crate::texture::sampled_image_index(id),
+            );
+        }
+    }
 }
 
 fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {

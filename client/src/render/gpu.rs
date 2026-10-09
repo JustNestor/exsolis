@@ -84,6 +84,12 @@ pub(super) struct FrameData {
     /// Bindless sampler used to read every block texture. Same sampler for
     /// all chunks; per-texture state lives in the image, not here.
     pub sampler_id: SamplerId,
+    /// Bindless sampler with linear magnification, exposed to effect shaders
+    /// next to `sampler_id` (nearest) in the frame buffer.
+    pub linear_sampler_id: SamplerId,
+    /// Snapshot of loaded textures so effects can resolve their declared
+    /// PNGs each frame (an `Arc` clone, and it survives texture hot-reload).
+    pub textures: Option<crate::texture::TextureManager>,
     /// One model matrix per remote player. Mesh is local-space in [`avatar`].
     pub avatar_models: Vec<Mat4>,
     /// Player ID -> model transform, for actions that explicitly request it.
@@ -535,6 +541,7 @@ pub(super) fn render_frame(
     time: Res<Time>,
     mut mod_actions: MessageReader<super::effects::ModActionEvent>,
     ui_list: Option<Res<UiDrawList>>,
+    textures: Option<Res<crate::texture::TextureManager>>,
     local_player_id: Option<Res<LocalPlayerId>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
@@ -633,6 +640,8 @@ pub(super) fn render_frame(
             .unwrap_or(Vec3::ZERO),
         viewport: vk.viewport.clone(),
         sampler_id: vk.block_sampler_id,
+        linear_sampler_id: vk.linear_sampler_id,
+        textures: textures.map(|textures| (*textures).clone()),
         avatar_models,
         model_transforms,
         mod_actions,

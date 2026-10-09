@@ -27,7 +27,7 @@ use vulkano::memory::DeviceAlignment;
 use vulkano::memory::allocator::{AllocationCreateInfo, DeviceLayout, MemoryTypeFilter};
 use vulkano_taskgraph::Id;
 use vulkano_taskgraph::command_buffer::{BlitImageInfo, CopyBufferToImageInfo, ImageBlit};
-use vulkano_taskgraph::descriptor_set::SampledImageId;
+use vulkano_taskgraph::descriptor_set::{SampledImageId, SamplerId};
 use vulkano_taskgraph::resource::{HostAccessType, ImageLayoutType};
 
 use crate::vulkan_prelude::VulkanContext;
@@ -61,6 +61,19 @@ struct TextureReload(bool);
 impl TextureManager {
     pub fn get(&self, name: &str) -> Option<SampledImageId> {
         self.textures.get(name).copied().or(self.fallback)
+    }
+
+    /// Resolves a mod-declared asset path such as `mods/fly/effects/spark.png`
+    /// to its bindless texture. Keys are asset paths with the `.png` stripped
+    /// (see `discover_pngs`). Unlike [`get`], an unknown path falls back to
+    /// the same placeholder texture used for blocks, so a missing effect
+    /// sprite looks wrong instead of crashing; `None` only before any
+    /// texture has loaded.
+    pub fn get_asset(&self, path: &str) -> Option<SampledImageId> {
+        match path.strip_suffix(".png") {
+            Some(key) => self.get(key),
+            None => self.fallback,
+        }
     }
 
     /// True once at least one texture is loaded. Meshing must wait for
@@ -330,6 +343,14 @@ fn setup_textures(
 /// public guarantee, so if a `vulkano-taskgraph` update ever changes it,
 /// this is the one place that would need to follow.
 pub fn sampled_image_index(id: SampledImageId) -> u32 {
+    let raw: [u32; 2] = unsafe { std::mem::transmute(id) };
+    raw[0]
+}
+
+/// Same as [`sampled_image_index`] but for samplers. `SamplerId` is generated
+/// by the same `declare_key_with_null!` macro, so it has the identical
+/// `[u32; 2]` layout (`transmute` fails to compile if that ever changes size).
+pub fn sampler_index(id: SamplerId) -> u32 {
     let raw: [u32; 2] = unsafe { std::mem::transmute(id) };
     raw[0]
 }

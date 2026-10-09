@@ -52,5 +52,8 @@
   "buffers": [
     { "id": "particles", "bytes": 262144, "persistent": true }
   ],
-  "images": []
+  "images": [],
+  "textures": [
+    { "id": "spark", "path": "mods/fly/effects/spark.png" }
+  ]
 }

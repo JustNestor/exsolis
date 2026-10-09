@@ -49,6 +49,19 @@ pub struct EffectManifest {
     pub buffers: Vec<BufferDecl>,
     #[serde(default)]
     pub images: Vec<ImageDecl>,
+    /// PNG assets sampled by this effect's shaders. Order matters: shaders
+    /// read `frame.textures[i]` for the i-th entry (see `MAX_EFFECT_TEXTURES`).
+    #[serde(default)]
+    pub textures: Vec<TextureDecl>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextureDecl {
+    /// Human-readable name; unique within the effect.
+    pub id: String,
+    /// Asset path of a `.png`, e.g. `mods/fly/effects/spark.png`.
+    pub path: String,
 }
 
 fn default_max_instances() -> u32 {
@@ -207,6 +220,9 @@ pub enum ImageUsage {
 const MAX_MANIFEST_BYTES: usize = 32 * 1024;
 const MAX_PASSES: usize = 16;
 const MAX_RESOURCES: usize = 16;
+/// Capacity of the texture table in the frame buffer; the WGSL-side
+/// `textures: array<u32, 8>` must match.
+pub(crate) const MAX_EFFECT_TEXTURES: usize = 8;
 const MAX_EFFECT_BUFFER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EFFECT_IMAGE_PIXELS: u64 = 4096 * 4096;
 const MAX_EFFECT_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
@@ -258,6 +274,7 @@ fn validate_manifest(manifest: &EffectManifest) -> Result<(), String> {
         || manifest.passes.len() > MAX_PASSES
         || manifest.buffers.len() > MAX_RESOURCES
         || manifest.images.len() > MAX_RESOURCES
+        || manifest.textures.len() > MAX_EFFECT_TEXTURES
     {
         return Err("effect manifest exceeds a declaration limit".into());
     }
@@ -413,6 +430,17 @@ fn validate_manifest(manifest: &EffectManifest) -> Result<(), String> {
     }
     if total_buffer_bytes > MAX_EFFECT_BUFFER_BYTES {
         return Err("effect buffers exceed the 4 MiB package limit".into());
+    }
+
+    let mut texture_ids = HashSet::new();
+    for texture in &manifest.textures {
+        if !is_identifier(&texture.id) || !texture_ids.insert(texture.id.as_str()) {
+            return Err(format!("invalid or duplicate texture '{}'", texture.id));
+        }
+        // `.png` exactly: texture.rs only discovers lowercase-extension files.
+        if fastpack::normalize_path(&texture.path).is_err() || !texture.path.ends_with(".png") {
+            return Err(format!("invalid texture asset path '{}'", texture.path));
+        }
     }
 
     let mut image_ids = HashSet::new();

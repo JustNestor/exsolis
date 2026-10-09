@@ -1,3 +1,5 @@
+enable wgpu_binding_array;
+
 struct FrameData {
     frame_index: u32,
     time_seconds: f32,
@@ -10,6 +12,14 @@ struct FrameData {
     view_projection: mat4x4<f32>,
     model: mat4x4<f32>,
     model_view_projection: mat4x4<f32>,
+    // Texture table (added after the classic block, so shaders that stop at
+    // model_view_projection keep working).
+    sampler_nearest: u32,
+    sampler_linear: u32,
+    texture_count: u32,
+    _padding4: u32,
+    // Bindless image indices, in the order of the manifest's "textures".
+    textures: array<u32, 8>,
 }
 
 struct FlyAction {
@@ -21,6 +31,14 @@ struct Particle {
     position_age: vec4<f32>,
     velocity_lifetime: vec4<f32>,
 }
+
+// Engine-provided bindless set (group 0). Index with frame.sampler_* /
+// frame.textures[..]; those values come from a read-only storage buffer, so
+// naga treats them as uniform and textureSample is fine.
+@group(0) @binding(0) var samplers: binding_array<sampler>;
+@group(0) @binding(1) var textures: binding_array<texture_2d<f32>>;
+
+const TEX_SPARK: u32 = 0u;
 
 @group(1) @binding(0) var<storage, read> action: FlyAction;
 @group(1) @binding(1) var<storage, read> frame: FrameData;
@@ -127,7 +145,13 @@ fn vs_main(
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let edge = 1.0 - smoothstep(0.45, 1.0, length(in.local_corner));
-    let alpha = in.life * edge;
-    return vec4<f32>(1.0, 0.42, 0.08, alpha);
+    // corner is [-1, 1] with +y up; texture v grows downward.
+    let uv = vec2<f32>(in.local_corner.x, -in.local_corner.y) * 0.5 + vec2<f32>(0.5, 0.5);
+    let spark = textureSample(
+        textures[frame.textures[TEX_SPARK]],
+        samplers[frame.sampler_linear],
+        uv,
+    );
+    // Additive blend is SrcAlpha/One, so alpha scales the colour.
+    return vec4<f32>(spark.rgb * vec3<f32>(1., 0.42, 0.08), spark.a * in.life);
 }
