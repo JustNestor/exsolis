@@ -1,43 +1,56 @@
-//! `tesjit` CLI — compile and run a `.ts` file through the JIT.
+//! `tesjit` CLI — compile, type-check, or benchmark a `.ts` file through the
+//! JIT.
 //!
 //! ```text
 //! tesjit <file.ts>          compile, then call `main()` if exported (else list exports)
+//! tesjit check <file.ts>    type-check only, print every diagnostic
 //! tesjit bench <file.ts>    run the fib benchmark driver
 //! ```
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use tesjit::{register_host, Compiled, Jit, Ty};
+use tesjit::{Compiled, JitBuilder, Ty};
 
 extern "C" fn host_log(x: f64) {
     println!("[host] {x}");
 }
-register_host!(log, host_log, &[Ty::F64], Ty::Void);
 
 fn main() -> miette::Result<()> {
     let mut args = std::env::args().skip(1);
     let first = args
         .next()
-        .ok_or_else(|| miette::miette!("usage: tesjit <file.ts> | tesjit bench <file.ts>"))?;
-    let run_bench = first == "bench";
-
-    let path = if run_bench {
-        args.next()
-            .ok_or_else(|| miette::miette!("usage: tesjit bench <file.ts>"))?
-    } else {
+        .ok_or_else(|| miette::miette!("usage: tesjit <file.ts> | tesjit check <file.ts> | tesjit bench <file.ts>"))?;
+    let mode = match first.as_str() {
+        "check" | "bench" => first.clone(),
+        _ => "run".to_owned(),
+    };
+    let path = if mode == "run" {
         first
+    } else {
+        args.next()
+            .ok_or_else(|| miette::miette!("usage: tesjit {mode} <file.ts>"))?
     };
 
     let src = std::fs::read_to_string(&path)
         .map_err(|e| miette::miette!("failed to read {}: {e}", path))?;
     let src: Arc<str> = src.into();
 
-    let mut jit = Jit::new(&path, src.clone())?;
+    let mut jit = JitBuilder::new(path.clone(), src.clone())
+        .host_fn("log", vec![Ty::F64], Ty::Void, host_log as *const u8)
+        .build()?;
+
+    if mode == "check" {
+        for d in jit.check(&src) {
+            println!("{d:?}");
+        }
+        return Ok(());
+    }
+
     jit.compile(&src)?;
     let compiled = jit.finish()?;
 
-    if run_bench {
+    if mode == "bench" {
         bench(&compiled)
     } else {
         run(compiled)
@@ -48,7 +61,7 @@ fn main() -> miette::Result<()> {
 /// list what it exports so `compiled.get::<F>(name)` can be used from an
 /// embedding host.
 fn run(compiled: Compiled) -> miette::Result<()> {
-    if let Some(entry) = compiled.fns.get("main") {
+    if let Some(entry) = compiled.entry("main") {
         if entry.ret == Ty::Void {
             unsafe { compiled.call_void("main", &[]) }
         } else {
@@ -57,10 +70,10 @@ fn run(compiled: Compiled) -> miette::Result<()> {
         return Ok(());
     }
     println!("no `main` export; available exports:");
-    let mut names: Vec<_> = compiled.fns.keys().collect();
+    let mut names: Vec<_> = compiled.exports().map(|(n, _, _)| n.to_owned()).collect();
     names.sort();
     for name in names {
-        let e = &compiled.fns[name];
+        let e = &compiled.fns[&name];
         println!("  {name}({:?}) -> {:?}", e.params, e.ret);
     }
     Ok(())

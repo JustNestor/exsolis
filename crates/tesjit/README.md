@@ -1,0 +1,81 @@
+# tesjit
+
+A minimal, statically-typed TypeScript → Cranelift JIT, meant to be **embedded**
+by the exsolis server as the scripting/mod backend.
+
+## Pipeline
+
+```
+source → oxc parse ─→ typed HIR ─→ Cranelift IR ─→ machine code
+            (check.rs)      (hir.rs)    (codegen.rs)
+```
+
+| Module | Responsibility |
+|---|---|
+| `src/check.rs` | parse + lower oxc AST into typed HIR; collect **all** diagnostics |
+| `src/hir.rs` | owned typed IR: names resolved to local slots, every expression typed |
+| `src/codegen.rs` | structural Cranelift lowering (infallible, no lookups) |
+| `src/jit.rs` | `JitBuilder` → `Jit` → `Compiled`; host registration + entry points |
+| `src/host.rs` | host function registry, per compilation unit (no globals) |
+| `src/ty.rs` / `src/diag.rs` | the type universe / miette diagnostics |
+
+## Language rules (v1)
+
+- **Every function boundary is annotated** — parameters *and* return type
+  (use `: void` explicitly). No `any`/`unknown`.
+- Inference is local: `let x = expr` only.
+- No implicit conversions; `as` is explicit (`i32`↔`f64`, `boolean`→`i32`/`f64`).
+- Types: `i32`, `f64`, `boolean`, `void`.
+- Statements: `let`, `if/else`, `while`, `for`, `break`, `continue`, `return`,
+  blocks, expression statements.
+- Expressions: arithmetic/comparison/bitwise/shift ops, `&&`/`||`, `?:`,
+  assignment (`=` and compounds), `++`/`--` (pre/post), calls, `as`, literals.
+- Host calls go through `declare function name(...): T;` + registration.
+
+Anything else is a compile-time error (`unsupported statement`/`unsupported
+expression`), never silently miscompiled.
+
+## Embedding
+
+```rust
+use tesjit::{JitBuilder, Ty};
+
+extern "C" fn host_log(x: f64) { println!("[host] {x}"); }
+
+let src = r#"
+declare function log(x: f64): void;
+export function go(dt: f64): void { log(dt * 2); }
+"#;
+
+let mut jit = JitBuilder::new("mod.ts", src)
+    .host_fn("log", vec![Ty::F64], Ty::Void, host_log as *const u8)
+    .build()?;
+jit.compile(src)?;                 // all diagnostics at once
+let compiled = jit.finish()?;
+
+let go: extern "C" fn(f64) = unsafe { compiled.get("go").unwrap() };
+go(1.5);
+```
+
+Other API surface: `jit.check(src)` (type-check only), `Compiled::exports()`,
+`Compiled::entry()`, `Compiled::call_i64()/call_void()` (integer arguments only),
+and `Jit::lower()` for tooling that wants the typed HIR.
+
+## CLI
+
+```sh
+tesjit run <file.ts>      # compile, call main() if exported
+tesjit check <file.ts>    # type-check only, print every diagnostic
+tesjit bench <file.ts>    # fib benchmark driver
+```
+
+## Tests
+
+```sh
+cargo test -p tesjit
+```
+
+Covered: recursion/loops, host calls, short-circuit logic, `?:`, casts,
+compound assignment, prefix/postfix updates, plus diagnostics: missing return
+type, host signature mismatch, unknown host function, `break` outside a loop,
+and batched reporting of multiple errors.
