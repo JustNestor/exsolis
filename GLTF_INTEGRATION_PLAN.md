@@ -532,6 +532,67 @@ GLTF pipeline now builds its layout explicitly as
 `[global_set_layout, local]` (same shape as `create_effect_pipeline_layout`),
 and the descriptor set allocates against that local layout.
 
+Fixed next: completely black models — CPU `GltfGpuMaterial` (72 B packed)
+did not match the GLSL std430 layout (vec2/vec3 padding + 96 B stride), so
+every material field read garbage. Both sides reordered to vec4s-first with
+zero implicit padding (80 B / stride 80), locked by
+`gltf_gpu_material_layout` unit test. Lesson: any GPU struct with vec2/vec3
+members needs an explicit layout test; vec4s + scalars ordered
+largest-first need none.
+
+Fixed next: sky giant — measured POSITION bounds show the test models are
+wildly different scales (duck 165u, avocado 0.04u, dragon 51u, girl 2.7u).
+`mods/models_test.lua` scales each to ~2-3 world units. Always measure
+bounds before choosing spawn scales.
+
+Fixed next: exploded multi-primitive models — `vertex_offset` was applied
+TWICE (indices pre-offset to model-global at upload AND `prim.vertex_offset`
+added again in the draw; Vulkan adds `vertexOffset` on top). Primitive 0
+(vertex_start 0) rendered fine, which is exactly why single-primitive duck
+looked perfect while dragon/girl shattered. Draws now use only the
+allocation base. Lesson: pick ONE offset scheme and assert it — pre-baked
+indices pair with allocation-only `vertexOffset`.
+
+Fixed next: texture/image index confusion — materials stored
+`texture().index()` (textures-array space) but our texture list parallels
+`images()`. Now resolves via `texture().source().index()`; covered by the
+faithfulness test asserting every material texture ref < image count.
+
+Deferred with reason: global alpha blending (all test models are Opaque;
+blending needs Phase 2.5 sorting + depth-write policy, not a blanket flag),
+`SampledImageId(_, 256)` (mirrors mesh.rs exactly; shared constant if ever
+changed), image layout transitions (identical code shape to the working PNG
+path — taskgraph handles it).
+
+Fixed next: stretched textures + black wing gaps on converted models.
+UV/mip investigation showed the pipeline samples faithfully (duck perfect,
+girl's face details correct) — converted UVs are tiny authored islands
+(~0.02 span magnified over whole quads), i.e. asset quality, not a bug.
+The black gaps are backface-culled thin membranes: v1 carries no sidedness,
+so the converter now emits `doubleSided: true` and the client draws those
+primitives with a no-cull pipeline variant (grouped binds). Converter output
+is version-stamped (`CONVERTER_VERSION`, via `asset.generator`) so future
+converter changes force regeneration instead of freshness-skipping.
+
+Fixed next: dark transparent regions (wing membranes, tails). Two parts:
+(a) universal `alpha < 0.004` discard — fully-transparent texels (black RGB
+in cutout atlases) no longer render as opaque black under any mode;
+(b) full Blend support — `alpha_blend` flag per draw, blend + blend_nocull
+pipelines (`AttachmentBlend::alpha()`, depth-write off), transparent groups
+drawn last in a 4-pass loop. Converter emits `MASK` + 0.5 cutoff for textured
+v1 materials (opaque textures never trip it), so converted cutouts resolve
+in the opaque pass.
+
+Fixed next: **anisotropic filtering** — the primary cause of "blurred"
+textures at oblique angles. The `linear_sampler` and `block_sampler` were
+created without anisotropy (`anisotropy: None`). Enabled by:
+1. Adding `anisotropy: Some(16.0)` to both samplers in `vulkan_prelude.rs`
+2. The vulkano git commit used already supports the `anisotropy` field in
+   `SamplerCreateInfo`; the Cargo feature flag was not needed (field exists
+   in base API). Vulkan clamps to device max.
+Result: textures at oblique angles now remain sharp; mipmap selection uses
+the correct LOD based on the anisotropic footprint.
+
 ---
 
 ---

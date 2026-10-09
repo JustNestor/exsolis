@@ -96,7 +96,9 @@ pub fn setup_vulkan(
         khr_swapchain: true,
         ..BindlessContext::required_extensions(&instance)
     };
-    let device_features = BindlessContext::required_features(&instance);
+    // Enable sampler_anisotropy for anisotropic texture filtering
+    let mut device_features = BindlessContext::required_features(&instance);
+    device_features.sampler_anisotropy = true;
 
     let (physical_device, queue_family_index) = instance
         .enumerate_physical_devices()
@@ -153,9 +155,8 @@ pub fn setup_vulkan(
     let flight_id = resources.create_flight(MAX_FRAMES_IN_FLIGHT).unwrap();
 
     // Samplers live in the bindless global set; shaders receive them as a
-    // `SamplerId` push constant. `anisotropy` is deliberately left None:
-    // `BindlessContext::required_features` doesn't enable `sampler_anisotropy`,
-    // so requesting it here would fail validation.
+    // `SamplerId` push constant. Anisotropic filtering is now enabled via
+    // the `sampler_anisotropy` feature.
     let (block_sampler_id, linear_sampler_id) = {
         let global_set = resources.bindless_context().unwrap().global_set();
         let block = global_set
@@ -164,6 +165,7 @@ pub fn setup_vulkan(
                 min_filter: Filter::Linear,
                 mipmap_mode: SamplerMipmapMode::Linear,
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                anisotropy: Some(16.0),
                 ..Default::default()
             })
             .unwrap();
@@ -173,6 +175,7 @@ pub fn setup_vulkan(
                 min_filter: Filter::Linear,
                 mipmap_mode: SamplerMipmapMode::Linear,
                 address_mode: [SamplerAddressMode::ClampToEdge; 3],
+                anisotropy: Some(16.0),
                 ..Default::default()
             })
             .unwrap();

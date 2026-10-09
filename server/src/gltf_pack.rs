@@ -16,6 +16,13 @@
 
 use std::path::{Path, PathBuf};
 
+/// Bump when conversion output changes so stale artifacts regenerate.
+const CONVERTER_VERSION: u32 = 3;
+
+fn generator(kind: &str) -> String {
+    format!("exsolis gltf_pack v{CONVERTER_VERSION} ({kind})")
+}
+
 fn align4(n: usize) -> usize {
     (n + 3) & !3
 }
@@ -60,7 +67,7 @@ pub fn ensure_converted_glb(gltf_path: &Path) -> Result<PathBuf, String> {
                 }
             }
             match latest {
-                Some(t) => t > glb_mtime,
+                Some(t) => t > glb_mtime || glb_converter_version(&glb_path) != Some(CONVERTER_VERSION),
                 None => true,
             }
         }
@@ -73,6 +80,21 @@ pub fn ensure_converted_glb(gltf_path: &Path) -> Result<PathBuf, String> {
     Ok(glb_path)
 }
 
+/// Converter version stamped into a previously generated `.glb`
+/// (`asset.generator`), if parseable. `None` forces regeneration.
+fn glb_converter_version(glb_path: &Path) -> Option<u32> {
+    let bytes = std::fs::read(glb_path).ok()?;
+    if bytes.len() < 20 || &bytes[0..4] != b"glTF" {
+        return None;
+    }
+    let json_len = u32::from_le_bytes(bytes[12..16].try_into().ok()?) as usize;
+    let doc: serde_json::Value = serde_json::from_slice(bytes.get(20..20 + json_len)?).ok()?;
+    let generator = doc.get("asset")?.get("generator")?.as_str()?;
+    generator
+        .strip_prefix("exsolis gltf_pack v")
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|v| v.parse().ok())
+}
 /// `.gltf` itself plus every sibling it references (buffers, images).
 /// Version-agnostic: v1 uses string-id maps, v2 uses arrays.
 fn referenced_files(gltf_path: &Path) -> Result<Vec<PathBuf>, String> {
@@ -311,6 +333,11 @@ fn convert_v1(
         let mut pbr = Map::new();
         pbr.insert("metallicFactor".into(), 0.0.into());
         pbr.insert("roughnessFactor".into(), 1.0.into());
+        // Textured v1 materials become alpha-tested cutouts: assimp-era
+        // diffuse textures routinely carry transparency (wing membranes,
+        // tails) with black RGB, which would otherwise render as opaque
+        // black geometry. Fully-opaque textures never trip the cutoff.
+        let mut alpha_mode = "OPAQUE";
         match values.and_then(|v| v.get("diffuse")) {
             Some(Value::String(_)) => {
                 // Diffuse texture reference; one texture per model here.
@@ -320,6 +347,7 @@ fn convert_v1(
                 let mut tex = Map::new();
                 tex.insert("index".into(), 0.into());
                 pbr.insert("baseColorTexture".into(), Value::Object(tex));
+                alpha_mode = "MASK";
             }
             Some(Value::Array(c)) => {
                 let rgba: Vec<Value> = c.iter().take(4).cloned().collect();
@@ -334,6 +362,12 @@ fn convert_v1(
         }
         materials_out.push(serde_json::json!({
             "name": name, "pbrMetallicRoughness": Value::Object(pbr),
+            // v1 carries no sidedness: assimp-era soup meshes are thin and
+            // one-sided, so render double-sided (the client honors this per
+            // draw with a no-cull pipeline variant).
+            "doubleSided": true,
+            "alphaMode": alpha_mode,
+            "alphaCutoff": 0.5,
         }));
     }
 
@@ -433,7 +467,7 @@ fn convert_v1(
     }
 
     let json = serde_json::json!({
-        "asset": {"version": "2.0", "generator": "exsolis gltf_pack (v1)"},
+        "asset": {"version": "2.0", "generator": generator("v1")},
         "buffers": [{"byteLength": blob.len()}],
         "bufferViews": buffer_views_out,
         "accessors": accessors_out,
@@ -564,7 +598,7 @@ fn convert_v2(
         serde_json::json!([{"byteLength": blob.len()}]),
     );
     if let Some(asset) = root.get_mut("asset").and_then(|v| v.as_object_mut()) {
-        asset.insert("generator".into(), "exsolis gltf_pack (v2)".into());
+        asset.insert("generator".into(), generator("v2").into());
     }
     Ok((Value::Object(root.clone()), blob))
 }
@@ -616,5 +650,21 @@ mod tests {
         let doc: serde_json::Value = serde_json::from_slice(&glb[20..20 + json_len]).unwrap();
         let meshes = doc["meshes"].as_array().unwrap().len();
         assert!(meshes > 700, "girl meshes: {meshes}");
+    }
+
+    /// Regenerate the server-side `result.glb` fixtures next to the v1
+    /// sources (what `scan_catalog` does on every fresh/missing output).
+    /// Keeps the client loader tests honest when run after this suite.
+    #[test]
+    fn refresh_converted_fixtures() {
+        for name in ["dragon", "girl"] {
+            let gltf = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../assets/models")
+                .join(name)
+                .join("result.gltf");
+            let glb_path = ensure_converted_glb(&gltf).expect("conversion failed");
+            let bytes = std::fs::read(&glb_path).expect("written glb unreadable");
+            assert_eq!(&bytes[0..4], b"glTF");
+        }
     }
 }

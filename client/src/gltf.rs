@@ -112,36 +112,44 @@ pub struct Aabb {
 }
 
 /// GPU-side material data (uploaded to storage buffer).
+///
+/// Layout contract with the `GltfMaterial` GLSL struct: vec4s first, then
+/// scalars, so every member is naturally aligned under std430 with NO
+/// implicit padding and the array stride is exactly 80 bytes. Do NOT add a
+/// vec2/vec3 member or reorder fields without updating the shader AND the
+/// `gltf_gpu_material_layout` test below.
 #[derive(BufferContents, Clone, Copy, Debug)]
 #[repr(C)]
 pub struct GltfGpuMaterial {
     pub base_color_factor: [f32; 4],
-    pub base_color_texture: u32,      // bindless index, 0xFFFFFFFF = none
-    pub metallic_roughness: [f32; 2], // x = metallic, y = roughness
+    pub emissive: [f32; 4], // rgb = emissive color, a unused
+    pub base_color_texture: u32, // bindless index, 0xFFFFFFFF = none
     pub normal_texture: u32,
     pub occlusion_texture: u32,
-    pub emissive_factor: [f32; 3],
     pub emissive_texture: u32,
-    pub alpha_mode: u32,              // 0 = Opaque, 1 = Mask, 2 = Blend
+    pub metallic: f32,
+    pub roughness: f32,
+    pub alpha_mode: u32, // 0 = Opaque, 1 = Mask, 2 = Blend
     pub alpha_cutoff: f32,
     pub double_sided: u32,
-    pub _padding: [u32; 2],
+    pub _padding: [u32; 3],
 }
 
 impl Default for GltfGpuMaterial {
     fn default() -> Self {
         Self {
             base_color_factor: [1.0, 1.0, 1.0, 1.0],
+            emissive: [0.0, 0.0, 0.0, 0.0],
             base_color_texture: 0xFFFFFFFF,
-            metallic_roughness: [0.0, 1.0],
             normal_texture: 0xFFFFFFFF,
             occlusion_texture: 0xFFFFFFFF,
-            emissive_factor: [0.0, 0.0, 0.0],
             emissive_texture: 0xFFFFFFFF,
+            metallic: 0.0,
+            roughness: 1.0,
             alpha_mode: 0,
             alpha_cutoff: 0.5,
             double_sided: 0,
-            _padding: [0, 0],
+            _padding: [0, 0, 0],
         }
     }
 }
@@ -319,11 +327,21 @@ fn load_gltf_material(
     let pbr = material.pbr_metallic_roughness();
     
     let base_color_factor = pbr.base_color_factor();
-    let base_color_texture = pbr.base_color_texture().map(|t| t.texture().index());
-    
-    let normal_texture = material.normal_texture().map(|t| t.texture().index());
-    let occlusion_texture = material.occlusion_texture().map(|t| t.texture().index());
-    let emissive_texture = material.emissive_texture().map(|t| t.texture().index());
+    // NOTE: texture index != image index. Our texture list parallels
+    // document.images(), so resolve through the texture's source image.
+    let base_color_texture = pbr
+        .base_color_texture()
+        .map(|t| t.texture().source().index());
+
+    let normal_texture = material
+        .normal_texture()
+        .map(|t| t.texture().source().index());
+    let occlusion_texture = material
+        .occlusion_texture()
+        .map(|t| t.texture().source().index());
+    let emissive_texture = material
+        .emissive_texture()
+        .map(|t| t.texture().source().index());
     
     let alpha_mode = match material.alpha_mode() {
         gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
@@ -594,16 +612,17 @@ pub fn gltf_material_to_gpu_material(
 
     GltfGpuMaterial {
         base_color_factor: mat.base_color_factor,
+        emissive: [mat.emissive_factor[0], mat.emissive_factor[1], mat.emissive_factor[2], 0.0],
         base_color_texture,
-        metallic_roughness: [mat.metallic_factor, mat.roughness_factor],
         normal_texture,
         occlusion_texture,
-        emissive_factor: mat.emissive_factor,
         emissive_texture,
+        metallic: mat.metallic_factor,
+        roughness: mat.roughness_factor,
         alpha_mode,
         alpha_cutoff: mat.alpha_cutoff,
         double_sided: if mat.double_sided { 1 } else { 0 },
-        _padding: [0, 0],
+        _padding: [0, 0, 0],
     }
 }
 
@@ -776,6 +795,9 @@ pub fn upload_gltf_assets(
     to_upload.sort();
 
     if to_upload.is_empty() {
+        // Nothing to do, but stamp the generation so a rebuild that lands
+        // while no models are loaded doesn't force a full re-upload later.
+        models.texture_generation = textures.generation;
         return;
     }
 
@@ -945,14 +967,21 @@ pub fn sync_gltf_instances(
             continue;
         }
         for prim in &uploaded.mesh.primitives {
+            let mat = uploaded.materials.get(prim.material_index);
+            let double_sided = mat.is_some_and(|m| m.double_sided != 0);
+            let alpha_blend = mat.is_some_and(|m| m.alpha_mode == 2);
             draws.push(GltfDrawCall {
                 index_count: prim.index_count,
                 first_index: uploaded.mesh.allocation.first_index() + prim.first_index,
-                vertex_offset: uploaded.mesh.allocation.vertex_offset()
-                    + prim.vertex_offset,
+                // Indices are pre-offset to model-global at upload, so only
+                // the allocation base applies here (adding prim.vertex_offset
+                // again double-counts and scatters multi-primitive models).
+                vertex_offset: uploaded.mesh.allocation.vertex_offset(),
                 material_index: uploaded.material_base + prim.material_index as u32,
                 first_instance,
                 instance_count,
+                double_sided,
+                alpha_blend,
             });
         }
     }
@@ -1034,6 +1063,98 @@ pub fn handle_spawn_model_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gltf_gpu_material_layout() {
+        // Must match the GLSL GltfMaterial struct under std430 exactly:
+        // vec4s first, then scalars — no implicit padding, stride 80.
+        use std::mem::{offset_of, size_of};
+        assert_eq!(size_of::<GltfGpuMaterial>(), 80);
+        assert_eq!(offset_of!(GltfGpuMaterial, base_color_factor), 0);
+        assert_eq!(offset_of!(GltfGpuMaterial, emissive), 16);
+        assert_eq!(offset_of!(GltfGpuMaterial, base_color_texture), 32);
+        assert_eq!(offset_of!(GltfGpuMaterial, normal_texture), 36);
+        assert_eq!(offset_of!(GltfGpuMaterial, occlusion_texture), 40);
+        assert_eq!(offset_of!(GltfGpuMaterial, emissive_texture), 44);
+        assert_eq!(offset_of!(GltfGpuMaterial, metallic), 48);
+        assert_eq!(offset_of!(GltfGpuMaterial, roughness), 52);
+        assert_eq!(offset_of!(GltfGpuMaterial, alpha_mode), 56);
+        assert_eq!(offset_of!(GltfGpuMaterial, alpha_cutoff), 60);
+        assert_eq!(offset_of!(GltfGpuMaterial, double_sided), 64);
+    }
+
+    #[test]
+    fn converted_models_loader_faithful() {
+        // Server-generated GLBs (see server/src/gltf_pack.rs): every output
+        // position must fall inside its accessor-declared min/max and every
+        // index must reference a real vertex. Catches loader misreads of
+        // packed files (string-id remaps, stride/offset handling).
+        for model in ["dragon/result.glb", "girl/result.glb"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../assets/models")
+                .join(model);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("SKIPPED {model}: server-generated artifact absent (run server or server tests once)");
+                continue;
+            };
+            let loaded = decode_gltf(&bytes).expect("decode failed");
+            let asset = loaded.as_ref().downcast_ref::<GltfAsset>().unwrap();
+
+            let glen = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+            let doc: serde_json::Value =
+                serde_json::from_slice(&bytes[20..20 + glen]).unwrap();
+            let accs = doc["accessors"].as_array().unwrap();
+            let mut pmap: Vec<(&GltfPrimitive, usize)> = Vec::new();
+            for mesh in &asset.model.meshes {
+                for prim in &mesh.primitives {
+                    pmap.push((prim, pmap.len()));
+                }
+            }
+            let mut prims = Vec::new();
+            for mesh in doc["meshes"].as_array().unwrap() {
+                for p in mesh["primitives"].as_array().unwrap() {
+                    prims.push(p);
+                }
+            }
+            assert_eq!(pmap.len(), prims.len(), "{model}: primitive count");
+            for ((prim, _), p) in pmap.iter().zip(prims.iter()) {
+                let ai = p["attributes"]["POSITION"].as_u64().unwrap() as usize;
+                let acc = &accs[ai];
+                let (mn, mx) = (
+                    acc["min"].as_array().unwrap(),
+                    acc["max"].as_array().unwrap(),
+                );
+                assert_eq!(prim.vertices.len(), acc["count"].as_u64().unwrap() as usize);
+                for v in &prim.vertices {
+                    for k in 0..3 {
+                        let (lo, hi) = (mn[k].as_f64().unwrap() as f32, mx[k].as_f64().unwrap() as f32);
+                        assert!(
+                            v.position[k] >= lo - 1e-3 && v.position[k] <= hi + 1e-3,
+                            "{model}: position out of range"
+                        );
+                    }
+                }
+                let nv = prim.vertices.len() as u32;
+                assert!(prim.indices.iter().all(|&i| i < nv), "{model}: index OOB");
+            }
+            // Material texture refs must be valid image indices (texture
+            // index != image index in general; see load_gltf_material).
+            let ntex = asset.model.textures.len();
+            for mat in &asset.model.materials {
+                for tex in [
+                    mat.base_color_texture,
+                    mat.normal_texture,
+                    mat.occlusion_texture,
+                    mat.emissive_texture,
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    assert!(tex < ntex, "{model}: texture ref {tex} >= {ntex} images");
+                }
+            }
+        }
+    }
 
     #[test]
     fn decode_duck_glb() {

@@ -31,7 +31,7 @@ use vulkano::{
         layout::{PipelineLayoutCreateInfo, push_constant_ranges_from_stages},
         graphics::{
             GraphicsPipelineCreateInfo,
-            color_blend::{ColorBlendAttachmentState, ColorBlendState},
+            color_blend::{AttachmentBlend, ColorBlendAttachmentState, ColorBlendState},
             depth_stencil::{CompareOp, DepthState, DepthStencilState},
             input_assembly::InputAssemblyState,
             multisample::MultisampleState,
@@ -73,17 +73,19 @@ pub mod gltf_vs {
 
         struct GltfMaterial {
             vec4 base_color_factor;
+            vec4 emissive;
             uint base_color_texture;
-            vec2 metallic_roughness;
             uint normal_texture;
             uint occlusion_texture;
-            vec3 emissive_factor;
             uint emissive_texture;
+            float metallic;
+            float roughness;
             uint alpha_mode;
             float alpha_cutoff;
             uint double_sided;
             uint _pad0;
             uint _pad1;
+            uint _pad2;
         };
 
         layout(push_constant) uniform PushConstants {
@@ -115,7 +117,6 @@ pub mod gltf_vs {
         layout(location = 2) out vec2 v_uv;
         layout(location = 3) out vec4 v_color;
         layout(location = 4) out vec4 v_tangent;
-        layout(location = 5) out flat uint v_material_index;
 
         void main() {
             uint instance_id = gl_InstanceIndex;
@@ -128,7 +129,6 @@ pub mod gltf_vs {
             v_uv = uv;
             v_color = color;
             v_tangent = tangent;
-            v_material_index = 0;
 
             gl_Position = push_constants.view_proj * world_pos;
         }
@@ -146,17 +146,19 @@ pub mod gltf_fs {
 
         struct GltfMaterial {
             vec4 base_color_factor;
+            vec4 emissive;
             uint base_color_texture;
-            vec2 metallic_roughness;
             uint normal_texture;
             uint occlusion_texture;
-            vec3 emissive_factor;
             uint emissive_texture;
+            float metallic;
+            float roughness;
             uint alpha_mode;
             float alpha_cutoff;
             uint double_sided;
             uint _pad0;
             uint _pad1;
+            uint _pad2;
         };
 
         layout(push_constant) uniform PushConstants {
@@ -178,7 +180,6 @@ pub mod gltf_fs {
         layout(location = 2) in vec2 v_uv;
         layout(location = 3) in vec4 v_color;
         layout(location = 4) in vec4 v_tangent;
-        layout(location = 5) in flat uint v_material_index;
 
         layout(location = 0) out vec4 f_color;
 
@@ -235,11 +236,8 @@ pub mod gltf_fs {
         }
 
         void main() {
-            uint mat_idx = v_material_index;
-            if (push_constants.material_index != 0xFFFFFFFFu) {
-                mat_idx = push_constants.material_index;
-            }
-            GltfMaterial mat = materials.materials[mat_idx];
+            // One draw per primitive, each with its own material in push.
+            GltfMaterial mat = materials.materials[push_constants.material_index];
 
             vec3 N = normalize(v_world_normal);
             if (mat.normal_texture != 0xFFFFFFFFu) {
@@ -261,13 +259,18 @@ pub mod gltf_fs {
 
             base_color = srgb_to_linear(base_color);
 
-            float metallic = mat.metallic_roughness.x;
-            float roughness = clamp(mat.metallic_roughness.y, 0.04, 1.0);
+            float metallic = mat.metallic;
+            float roughness = clamp(mat.roughness, 0.04, 1.0);
 
             if (mat.alpha_mode == 1u) {
                 if (alpha < mat.alpha_cutoff) {
                     discard;
                 }
+            } else if (alpha < 0.004) {
+                // Fully-transparent texels contribute nothing under any
+                // blending; discard so cutout textures (wing membranes,
+                // tails) don't render their black RGB as opaque geometry.
+                discard;
             }
 
             vec3 V = normalize(push_constants.camera_position.xyz - v_world_pos);
@@ -276,7 +279,7 @@ pub mod gltf_fs {
             vec3 ambient = vec3(0.03) * mix(vec3(1.0), F0, metallic);
             vec3 Lo = ambient * base_color;
 
-            vec3 emissive = mat.emissive_factor;
+            vec3 emissive = mat.emissive.rgb;
             if (mat.emissive_texture != 0xFFFFFFFFu) {
                 emissive *= sample_texture(mat.emissive_texture, v_uv, 0.0).rgb;
             }
@@ -344,6 +347,13 @@ pub(crate) struct RenderStateShared {
     pub effects_gpu: Option<super::effects_gpu::EffectGpuState>,
     /// GLTF model pipeline
     pub gltf_pipeline: Option<Arc<GraphicsPipeline>>,
+    /// GLTF pipeline variant with face culling disabled, for double-sided
+    /// materials (thin membranes like wings would otherwise show gaps).
+    pub gltf_pipeline_nocull: Option<Arc<GraphicsPipeline>>,
+    /// Blend variants (alpha_mode == Blend): standard alpha blending, no
+    /// depth write. Drawn after all opaque draws (see execute).
+    pub gltf_pipeline_blend: Option<Arc<GraphicsPipeline>>,
+    pub gltf_pipeline_blend_nocull: Option<Arc<GraphicsPipeline>>,
     /// GLTF material storage buffer
     pub gltf_material_buffer_id: Option<Id<Buffer>>,
     /// GLTF instance buffer (model matrices)
@@ -520,6 +530,8 @@ pub(crate) struct GltfDrawCall {
     pub material_index: u32,
     pub first_instance: u32,
     pub instance_count: u32,
+    pub double_sided: bool,
+    pub alpha_blend: bool,
 }
 
 // GLTF render task for drawing instanced GLTF models
@@ -549,9 +561,16 @@ impl Task for GltfRenderTask {
         }
 
         let shared = self.shared.read().unwrap();
-        if let Some(pipeline) = shared.gltf_pipeline.as_ref() {
+        let (Some(pipeline), Some(pipeline_nocull), Some(pipeline_blend), Some(pipeline_blend_nocull)) = (
+            shared.gltf_pipeline.as_ref(),
+            shared.gltf_pipeline_nocull.as_ref(),
+            shared.gltf_pipeline_blend.as_ref(),
+            shared.gltf_pipeline_blend_nocull.as_ref(),
+        ) else {
+            return Ok(());
+        };
+        {
             cbf.set_viewport(0, std::slice::from_ref(&world.viewport));
-            cbf.bind_pipeline(pipeline);
 
             cbf.bind_index_buffer(
                 self.index_buffer_id,
@@ -562,6 +581,7 @@ impl Task for GltfRenderTask {
             cbf.bind_vertex_buffers(0, &[self.vertex_buffer_id], &[0], &[], &[]);
 
             // Storage buffers (instances, materials) live at set 1.
+            // NOTE: without gltf_descriptors the draws below read garbage;
             if let Some(descriptors) = shared.gltf_descriptors.as_ref() {
                 unsafe {
                     cbf.as_raw().bind_descriptor_sets(
@@ -574,29 +594,43 @@ impl Task for GltfRenderTask {
                 }
             }
 
-            // NOTE: without gltf_descriptors the draws below read garbage;
-            for draw in &world.gltf_draws {
-                cbf.push_constants(
-                    pipeline.layout(),
-                    0,
-                    &gltf_vs::PushConstants {
-                        view_proj: world.view_proj.to_cols_array_2d(),
-                        sampler_id: world.sampler_id,
-                        linear_sampler_id: world.linear_sampler_id,
-                        camera_position: [world.camera_position.x, world.camera_position.y, world.camera_position.z, 1.0],
-                        material_index: draw.material_index,
-                        time_seconds: world.time_seconds,
-                        _pad: [0.0, 0.0],
-                    },
-                );
-                unsafe {
-                    cbf.draw_indexed(
-                        draw.index_count,
-                        draw.instance_count,
-                        draw.first_index,
-                        draw.vertex_offset,
-                        draw.first_instance,
+            // Four groups so each binds its pipeline once: opaque first
+            // (culled, then double-sided), blend materials last.
+            for (blend, double_sided) in
+                [(false, false), (false, true), (true, false), (true, true)]
+            {
+                let pipe = match (blend, double_sided) {
+                    (false, false) => pipeline,
+                    (false, true) => pipeline_nocull,
+                    (true, false) => pipeline_blend,
+                    (true, true) => pipeline_blend_nocull,
+                };
+                cbf.bind_pipeline(pipe);
+                for draw in world.gltf_draws.iter().filter(|d| {
+                    d.double_sided == double_sided && d.alpha_blend == blend
+                }) {
+                    cbf.push_constants(
+                        pipe.layout(),
+                        0,
+                        &gltf_vs::PushConstants {
+                            view_proj: world.view_proj.to_cols_array_2d(),
+                            sampler_id: world.sampler_id,
+                            linear_sampler_id: world.linear_sampler_id,
+                            camera_position: [world.camera_position.x, world.camera_position.y, world.camera_position.z, 1.0],
+                            material_index: draw.material_index,
+                            time_seconds: world.time_seconds,
+                            _pad: [0.0, 0.0],
+                        },
                     );
+                    unsafe {
+                        cbf.draw_indexed(
+                            draw.index_count,
+                            draw.instance_count,
+                            draw.first_index,
+                            draw.vertex_offset,
+                            draw.first_instance,
+                        );
+                    }
                 }
             }
         }
@@ -938,6 +972,9 @@ pub(super) fn setup_renderer(
         avatar: None,
         effects_gpu: None,
         gltf_pipeline: None,
+        gltf_pipeline_nocull: None,
+        gltf_pipeline_blend: None,
+        gltf_pipeline_blend_nocull: None,
         gltf_material_buffer_id: Some(gltf_material_buffer_id),
         gltf_instance_buffer_id: Some(gltf_instance_buffer_id),
         gltf_instance_count: 0,
@@ -1173,39 +1210,84 @@ pub(super) fn setup_renderer(
     )
     .unwrap();
 
-    let gltf_pipeline = GraphicsPipeline::new(
-        &vk.device,
-        None,
-        &GraphicsPipelineCreateInfo {
-            stages: &gltf_stages,
-            vertex_input_state: Some(&gltf_vertex_input_state),
-            input_assembly_state: Some(&InputAssemblyState::default()),
-            viewport_state: Some(&ViewportState::default()),
-            rasterization_state: Some(&RasterizationState {
-                cull_mode: CullMode::Back,
-                front_face: FrontFace::Clockwise,
-                ..Default::default()
-            }),
-            multisample_state: Some(&MultisampleState::default()),
-            color_blend_state: Some(&ColorBlendState {
-                attachments: &[ColorBlendAttachmentState::default()],
-                ..Default::default()
-            }),
-            depth_stencil_state: Some(&DepthStencilState {
-                depth: Some(DepthState {
-                    write_enable: true,
-                    compare_op: CompareOp::Less,
-                }),
-                ..Default::default()
-            }),
-            dynamic_state: &[DynamicState::Viewport],
-            subpass: Some((&subpass).into()),
-            ..GraphicsPipelineCreateInfo::new(&gltf_layout)
-        },
-    )
-    .unwrap();
+    let gltf_raster_cull = RasterizationState {
+        cull_mode: CullMode::Back,
+        // Same as the chunk pipeline: FlyCamera::view_projection
+        // negates Y (a reflection), so CCW-from-outside faces in
+        // world/model space — which is what both mesh.rs and glTF
+        // author — rasterize as clockwise in NDC.
+        front_face: FrontFace::Clockwise,
+        ..Default::default()
+    };
+    let gltf_raster_nocull = RasterizationState {
+        cull_mode: CullMode::None,
+        front_face: FrontFace::Clockwise,
+        ..Default::default()
+    };
+    let gltf_blend_off = ColorBlendState {
+        attachments: &[ColorBlendAttachmentState::default()],
+        ..Default::default()
+    };
+    let gltf_blend_on = ColorBlendState {
+        attachments: &[ColorBlendAttachmentState {
+            blend: Some(AttachmentBlend::alpha()),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let gltf_depth_write = DepthStencilState {
+        depth: Some(DepthState {
+            write_enable: true,
+            compare_op: CompareOp::Less,
+        }),
+        ..Default::default()
+    };
+    // Transparent draws must not poison the depth buffer for what follows.
+    let gltf_depth_readonly = DepthStencilState {
+        depth: Some(DepthState {
+            write_enable: false,
+            compare_op: CompareOp::Less,
+        }),
+        ..Default::default()
+    };
+
+    // Four variants: {cull, nocull} x {opaque, blend}. Same shaders/layout,
+    // so one descriptor set serves all four.
+    let build_gltf_pipeline = |raster: &RasterizationState,
+                               blend: &ColorBlendState,
+                               depth: &DepthStencilState| {
+        GraphicsPipeline::new(
+            &vk.device,
+            None,
+            &GraphicsPipelineCreateInfo {
+                stages: &gltf_stages,
+                vertex_input_state: Some(&gltf_vertex_input_state),
+                input_assembly_state: Some(&InputAssemblyState::default()),
+                viewport_state: Some(&ViewportState::default()),
+                rasterization_state: Some(raster),
+                multisample_state: Some(&MultisampleState::default()),
+                color_blend_state: Some(blend),
+                depth_stencil_state: Some(depth),
+                dynamic_state: &[DynamicState::Viewport],
+                subpass: Some((&subpass).into()),
+                ..GraphicsPipelineCreateInfo::new(&gltf_layout)
+            },
+        )
+        .unwrap()
+    };
+
+    let gltf_pipeline = build_gltf_pipeline(&gltf_raster_cull, &gltf_blend_off, &gltf_depth_write);
+    let gltf_pipeline_nocull =
+        build_gltf_pipeline(&gltf_raster_nocull, &gltf_blend_off, &gltf_depth_write);
+    let gltf_pipeline_blend =
+        build_gltf_pipeline(&gltf_raster_cull, &gltf_blend_on, &gltf_depth_readonly);
+    let gltf_pipeline_blend_nocull =
+        build_gltf_pipeline(&gltf_raster_nocull, &gltf_blend_on, &gltf_depth_readonly);
 
     shared.write().unwrap().gltf_pipeline = Some(gltf_pipeline);
+    shared.write().unwrap().gltf_pipeline_nocull = Some(gltf_pipeline_nocull);
+    shared.write().unwrap().gltf_pipeline_blend = Some(gltf_pipeline_blend);
+    shared.write().unwrap().gltf_pipeline_blend_nocull = Some(gltf_pipeline_blend_nocull);
 
     // Descriptor set for GLTF storage buffers at set 1 (set 0 = bindless).
     // Buffers are whole-range bound once; uploads rewrite contents in place.

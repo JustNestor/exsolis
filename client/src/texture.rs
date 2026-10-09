@@ -254,6 +254,7 @@ impl TextureManager {
                 },
                 ImageLayout::ShaderReadOnlyOptimal,
             ) else {
+                bevy_log::warn!("create_sampled_image failed for GLTF texture {}", p.key);
                 continue;
             };
 
