@@ -84,7 +84,11 @@ impl Diagnostics {
     }
 
     pub fn into_result<T>(self, value: T) -> Result<T, Self> {
-        if self.0.is_empty() { Ok(value) } else { Err(self) }
+        if self.0.is_empty() {
+            Ok(value)
+        } else {
+            Err(self)
+        }
     }
 }
 
@@ -145,7 +149,9 @@ impl miette::Diagnostic for Diagnostics {
     }
 
     fn related(&self) -> Option<Box<dyn Iterator<Item = &dyn miette::Diagnostic> + '_>> {
-        Some(Box::new(self.0.iter().map(|e| e as &dyn miette::Diagnostic)))
+        Some(Box::new(
+            self.0.iter().map(|e| e as &dyn miette::Diagnostic),
+        ))
     }
 }
 

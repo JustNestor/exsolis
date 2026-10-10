@@ -112,11 +112,52 @@ impl Expr {
     }
 }
 
-/// What a call targets: a function in this module, or a registered host import.
+/// What a call targets: a function in this module, a registered host import,
+/// or a runtime helper.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum CallTarget {
     Local(usize),
     Host(String),
+    /// The string/array intrinsics of [`crate::runtime`].
+    Intrinsic(Intrinsic),
+}
+
+/// Builtin operations JIT code calls into [`crate::runtime`] for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Intrinsic {
+    /// Wrap `.rodata` bytes as an arena string: `(ptr, len) -> str`.
+    StrWrap,
+    StrLen,
+    StrConcat,
+    StrEq,
+    StrByte,
+    /// `(cap, elem_size) -> array`
+    ArrNew,
+    ArrLen,
+    /// `(array, elem_size, value) -> array`
+    ArrPush,
+    /// `(array, index, elem_size) -> value`
+    ArrGet,
+    /// `(array, index, elem_size, value) -> value`
+    ArrSet,
+}
+
+impl Intrinsic {
+    /// Name of the runtime symbol backing this operation.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Intrinsic::StrWrap => "__tesjit_str_wrap",
+            Intrinsic::StrLen => "__tesjit_str_len",
+            Intrinsic::StrConcat => "__tesjit_str_concat",
+            Intrinsic::StrEq => "__tesjit_str_eq",
+            Intrinsic::StrByte => "__tesjit_str_byte",
+            Intrinsic::ArrNew => "__tesjit_arr_new",
+            Intrinsic::ArrLen => "__tesjit_arr_len",
+            Intrinsic::ArrPush => "__tesjit_arr_push",
+            Intrinsic::ArrGet => "__tesjit_arr_get",
+            Intrinsic::ArrSet => "__tesjit_arr_set",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -167,5 +208,30 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     /// `expr as T`, including the numeric widening/narrowing conversions.
-    Cast { expr: Box<Expr>, to: Ty },
+    Cast {
+        expr: Box<Expr>,
+        to: Ty,
+    },
+    /// A string literal; codegen materializes it from `.rodata` bytes.
+    Str(String),
+    /// `s.length` / `a.length`.
+    Length {
+        target: Box<Expr>,
+    },
+    /// `s[i]` (string byte) / `a[i]` (array element).
+    Index {
+        target: Box<Expr>,
+        index: Box<Expr>,
+    },
+    /// `a[i] = v`.
+    SetIndex {
+        target: Box<Expr>,
+        index: Box<Expr>,
+        value: Box<Expr>,
+    },
+    /// `[a, b, c]` — array literal with a uniform element type.
+    ArrayLit {
+        elems: Vec<Expr>,
+        elem_ty: Ty,
+    },
 }

@@ -9,6 +9,7 @@
 //! in the state struct, because `finalize` consumes it at the end of a
 //! function.
 
+use cranelift_codegen::ir::MachMemFlags;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
 use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, Value, types};
 use cranelift_codegen::isa::TargetFrontendConfig;
@@ -17,8 +18,15 @@ use cranelift_jit::JITModule;
 use cranelift_module::{FuncId, Linkage, Module};
 
 use oxc_ast::ast::{BinaryOperator, LogicalOperator, UnaryOperator};
+use std::collections::HashMap;
 
-use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Stmt};
+/// Plain memory access (no alias-region hints — the arrays are freshly
+/// allocated and never alias a Rust object).
+const fn mem_flags() -> MachMemFlags {
+    MachMemFlags::new()
+}
+
+use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Stmt};
 use crate::ty::Ty;
 
 /// Cranelift function id plus the TS signature it was declared with.
@@ -38,6 +46,8 @@ pub struct FnLowerer<'s, 'm> {
     sigs: &'s [(String, FnSig)],
     /// Local slot → Cranelift variable.
     vars: Vec<Variable>,
+    /// Already-materialized string literals, keyed by their Rust text.
+    rodata: std::collections::HashMap<String, cranelift_module::DataId>,
     /// Local slot → TS type (constants/masks only; no lookup needed).
     slot_tys: Vec<Ty>,
     /// Innermost `(continue_target, break_target)` loop headers.
@@ -124,9 +134,10 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             module,
             sigs,
             vars,
-            slot_tys: f.locals.iter().map(|l| l.ty).collect(),
+            rodata: HashMap::new(),
+            slot_tys: f.locals.iter().map(|l| l.ty.clone()).collect(),
             loops: Vec::new(),
-            ret: f.ret,
+            ret: f.ret.clone(),
         };
         for stmt in &f.body {
             lowerer.stmt(&mut builder, stmt);
@@ -146,7 +157,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         if self.ret == Ty::Void {
             b.ins().return_(&[]);
         } else {
-            let z = self.zero(b, self.ret);
+            let z = self.zero(b, self.ret.clone());
             b.ins().return_(&[z]);
         }
     }
@@ -331,7 +342,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
     /// Type of local `slot` — the checker already validated it, and the JIT
     /// never sees an ill-typed module.
     fn locals_ty(&self, slot: usize) -> Ty {
-        self.slot_tys[slot]
+        self.slot_tys[slot].clone()
     }
 
     // ───────────────────────── expressions ─────────────────────────
@@ -344,24 +355,23 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             ExprKind::I32(v) => ins.iconst(types::I32, i64::from(*v)),
             ExprKind::F64(v) => ins.f64const(*v),
             ExprKind::Bool(v) => ins.iconst(types::I8, i64::from(*v)),
+            ExprKind::Str(text) => self.str_literal(b, text),
             ExprKind::Local(slot) => b.use_var(self.vars[*slot]),
             ExprKind::Unary { op, arg } => {
                 let a = self.expr(b, arg);
-                match (op, arg.ty) {
+                match (op, arg.ty.clone()) {
                     (UnaryOperator::UnaryPlus, _) => a,
                     (UnaryOperator::UnaryNegation, Ty::I32) => b.ins().ineg(a),
                     (UnaryOperator::UnaryNegation, Ty::F64) => b.ins().fneg(a),
                     (UnaryOperator::BitwiseNot, Ty::I32) => b.ins().bnot(a),
-                    (UnaryOperator::LogicalNot, Ty::Bool) => {
-                        b.ins().icmp_imm_s(IntCC::Equal, a, 0)
-                    }
+                    (UnaryOperator::LogicalNot, Ty::Bool) => b.ins().icmp_imm_s(IntCC::Equal, a, 0),
                     _ => unreachable!("checker rejected unary {op:?} on {}", arg.ty),
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
                 let l = self.expr(b, lhs);
                 let r = self.expr(b, rhs);
-                self.arith(b, *op, l, r, lhs.ty)
+                self.arith(b, *op, l, r, lhs.ty.clone())
             }
             ExprKind::Logical { op, lhs, rhs } => match op {
                 LogicalOperator::And => {
@@ -369,8 +379,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     let merge = b.create_block();
                     let res = b.append_block_param(merge, types::I8);
                     let l = self.expr(b, lhs);
-                    b.ins()
-                        .brif(l, rhs_b, &[], merge, &[BlockArg::from(l)]);
+                    b.ins().brif(l, rhs_b, &[], merge, &[BlockArg::from(l)]);
                     b.switch_to_block(rhs_b);
                     b.seal_block(rhs_b);
                     let r = self.expr(b, rhs);
@@ -424,7 +433,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     None => rhs,
                     Some(op) => {
                         let cur = b.use_var(var);
-                        self.arith(b, *op, cur, rhs, value.ty)
+                        self.arith(b, *op, cur, rhs, value.ty.clone())
                     }
                 };
                 b.def_var(var, new);
@@ -457,24 +466,41 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     CallTarget::Host(name) => self
                         .sig_of(name)
                         .expect("checker resolved every call target"),
+                    // Intrinsics are declared as runtime imports by `Jit`.
+                    CallTarget::Intrinsic(intrinsic) => self
+                        .sig_of(intrinsic.symbol())
+                        .expect("runtime helper declared by Jit"),
                 };
+                // The runtime ABI is machine words (`i64`: pointers, lengths,
+                // sizes), so arguments and results are adapted between the TS
+                // type at the call site and the helper signature.
+                let intrinsic = matches!(target, CallTarget::Intrinsic(_));
                 let mut arg_vals = Vec::with_capacity(args.len());
-                for (a, &pty) in args.iter().zip(&sig.params) {
+                for (a, pty) in args.iter().zip(&sig.params) {
                     let v = self.expr(b, a);
-                    debug_assert_eq!(a.ty, pty, "call argument type");
-                    arg_vals.push(v);
+                    if intrinsic {
+                        arg_vals.push(Self::adapt(b, &a.ty, pty, v));
+                    } else {
+                        debug_assert_eq!(&a.ty, pty, "call argument type");
+                        arg_vals.push(v);
+                    }
                 }
                 let fref = self.module.declare_func_in_func(sig.id, b.func);
                 let call = b.ins().call(fref, &arg_vals);
-                if sig.ret == Ty::Void {
+                let result = if sig.ret == Ty::Void {
                     b.ins().iconst(types::I32, 0)
                 } else {
                     b.inst_results(call)[0]
+                };
+                if intrinsic {
+                    Self::adapt(b, &sig.ret, &e.ty, result)
+                } else {
+                    result
                 }
             }
             ExprKind::Cast { expr, to } => {
                 let v = self.expr(b, expr);
-                match (expr.ty, *to) {
+                match (expr.ty.clone(), to.clone()) {
                     (Ty::I32, Ty::F64) => b.ins().fcvt_from_sint(types::F64, v),
                     (Ty::F64, Ty::I32) => b.ins().fcvt_to_sint_sat(types::I32, v),
                     (Ty::Bool, Ty::I32) => b.ins().uextend(types::I32, v),
@@ -485,7 +511,202 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     _ => unreachable!("checker rejected cast {} -> {}", expr.ty, to),
                 }
             }
+            ExprKind::Length { target } => match target.ty.clone() {
+                Ty::Str => {
+                    let s = self.expr(b, target);
+                    self.call_intrinsic(b, Intrinsic::StrLen, &[(&Ty::Str, s)], &Ty::I32)
+                }
+                Ty::Array(_) => {
+                    let a = self.expr(b, target);
+                    self.call_intrinsic(b, Intrinsic::ArrLen, &[(&Ty::Ptr, a)], &Ty::I32)
+                }
+                other => unreachable!("no length on {other}"),
+            },
+            ExprKind::Index { target, index } => match target.ty.elem() {
+                Some(elem) => {
+                    // Bounds-checked read through the runtime: a bad index
+                    // traps instead of touching foreign memory.
+                    let base = self.expr(b, target);
+                    let raw = self.expr(b, index);
+                    let i = Self::adapt(b, &index.ty, &Ty::Ptr, raw);
+                    let size = elem.elem_size().expect("element size") as i64;
+                    let size_v = b.ins().iconst(types::I64, size);
+                    self.call_intrinsic(
+                        b,
+                        Intrinsic::ArrGet,
+                        &[(&Ty::Ptr, base), (&Ty::Ptr, i), (&Ty::Ptr, size_v)],
+                        &elem,
+                    )
+                }
+                None if target.ty == Ty::Str => {
+                    // Strings expose bytes; `str_byte` traps on out-of-bounds.
+                    let s = self.expr(b, target);
+                    let i = self.expr(b, index);
+                    self.call_intrinsic(
+                        b,
+                        Intrinsic::StrByte,
+                        &[(&Ty::Str, s), (&index.ty, i)],
+                        &Ty::I32,
+                    )
+                }
+                None => unreachable!("cannot index {}", target.ty),
+            },
+            ExprKind::SetIndex {
+                target,
+                index,
+                value,
+            } => {
+                let elem = target
+                    .ty
+                    .elem()
+                    .expect("checker only allows indexed assignment to arrays");
+                let base = self.expr(b, target);
+                let raw = self.expr(b, index);
+                let i = Self::adapt(b, &index.ty, &Ty::Ptr, raw);
+                let v = self.expr(b, value);
+                let size = elem.elem_size().expect("element size") as i64;
+                let size_v = b.ins().iconst(types::I64, size);
+                self.call_intrinsic(
+                    b,
+                    Intrinsic::ArrSet,
+                    &[
+                        (&Ty::Ptr, base),
+                        (&Ty::Ptr, i),
+                        (&Ty::Ptr, size_v),
+                        (&value.ty, v),
+                    ],
+                    &elem,
+                )
+            }
+            ExprKind::ArrayLit { elems, elem_ty } => {
+                let size = elem_ty.elem_size().expect("element size");
+                // Allocate room for every element, then push them one by one:
+                // the runtime maintains len/cap and grows on demand.
+                let cap_v = b.ins().iconst(types::I64, elems.len().max(1) as i64);
+                let size_v = b.ins().iconst(types::I64, size as i64);
+                let mut arr = self.call_intrinsic(
+                    b,
+                    Intrinsic::ArrNew,
+                    &[(&Ty::Ptr, cap_v), (&Ty::Ptr, size_v)],
+                    &Ty::Array(Box::new(Ty::I32)),
+                );
+                for (i, el) in elems.iter().enumerate() {
+                    let v = self.expr(b, el);
+                    let index_v = b.ins().iconst(types::I64, i as i64);
+                    let elem_ptr = self.elem_addr(b, arr, index_v, size);
+                    b.ins().store(mem_flags(), v, elem_ptr, 0);
+                    // Keep len in sync with the stored slots.
+                    let len_v = b.ins().iconst(types::I64, (i + 1) as i64);
+                    let header = b.ins().iadd_imm_s(arr, 0);
+                    b.ins().store(mem_flags(), len_v, header, 0);
+                }
+                let _ = &mut arr;
+                arr
+            }
         }
+    }
+
+    /// Convert a value between a TS type and the machine-word runtime ABI
+    /// (used only for intrinsic calls): `i32` ↔ `i64`.
+    fn adapt(b: &mut FunctionBuilder<'_>, from: &Ty, to: &Ty, v: Value) -> Value {
+        if from == to || from.clif() == to.clif() {
+            return v;
+        }
+        match (from, to) {
+            // Widening: zero-extend, so a negative index stays a huge unsigned
+            // value and the runtime bounds check traps on it.
+            (Ty::I32 | Ty::Bool, Ty::Ptr) => b.ins().uextend(types::I64, v),
+            (Ty::Ptr, Ty::I32 | Ty::Bool) => b.ins().ireduce(to.clif(), v),
+            _ => unreachable!("no adaptation between {from} and {to}"),
+        }
+    }
+
+    /// `base + 16 + i * size` — element address inside an array value.
+    fn elem_addr(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        base: Value,
+        i: Value,
+        size: u64,
+    ) -> Value {
+        let data = b.ins().iadd_imm_s(base, 16);
+        if size == 1 {
+            b.ins().iadd(data, i)
+        } else {
+            let offset = b.ins().imul_imm_s(i, size as i64);
+            b.ins().iadd(data, offset)
+        }
+    }
+
+    /// Call a runtime helper, importing it into this function on demand.
+    ///
+    /// Arguments and the result are given as `(TS type, value)` pairs so the
+    /// machine-word runtime ABI (`i64` pointers/sizes) can adapt on the way in
+    /// and out.
+    fn call_intrinsic(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        intrinsic: Intrinsic,
+        args: &[(&Ty, Value)],
+        result: &Ty,
+    ) -> Value {
+        let name = intrinsic.symbol();
+        let sig = self.sig_of(name).expect("intrinsic declared by Jit");
+        let adapted: Vec<Value> = args
+            .iter()
+            .zip(&sig.params)
+            .map(|((ty, v), pty)| {
+                if ty.clif() == pty.clif() {
+                    *v
+                } else {
+                    Self::adapt(b, ty, pty, *v)
+                }
+            })
+            .collect();
+        let fref = self.module.declare_func_in_func(sig.id, b.func);
+        let call = b.ins().call(fref, &adapted);
+        let out = if sig.ret == Ty::Void {
+            b.ins().iconst(types::I32, 0)
+        } else {
+            b.inst_results(call)[0]
+        };
+        if sig.ret.clif() == result.clif() {
+            out
+        } else {
+            Self::adapt(b, &sig.ret, result, out)
+        }
+    }
+
+    /// Materialize a string literal: `.rodata` bytes wrapped by the runtime.
+    fn str_literal(&mut self, b: &mut FunctionBuilder<'_>, text: &str) -> Value {
+        let bytes = text.as_bytes();
+        // One `.rodata` blob per literal, wrapped into the module arena at
+        // runtime; deduplicated by text so repeated literals share memory.
+        if !self.rodata.contains_key(text) {
+            let mut desc = cranelift_module::DataDescription::new();
+            desc.define(bytes.to_vec().into_boxed_slice());
+            let id = self
+                .module
+                .declare_data(
+                    &format!("__tesjit_str_{}", self.rodata.len()),
+                    Linkage::Local,
+                    false,
+                    false,
+                )
+                .expect("declare_data");
+            self.module.define_data(id, &desc).expect("define_data");
+            self.rodata.insert(text.to_owned(), id);
+        }
+        let data_id = self.rodata[text];
+        let gv = self.module.declare_data_in_func(data_id, b.func);
+        let ptr = b.ins().symbol_value(types::I64, gv);
+        let len = b.ins().iconst(types::I64, bytes.len() as i64);
+        self.call_intrinsic(
+            b,
+            Intrinsic::StrWrap,
+            &[(&Ty::Ptr, ptr), (&Ty::Ptr, len)],
+            &Ty::Str,
+        )
     }
 
     /// Binary op on values of a known operand type.
@@ -499,11 +720,31 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
     ) -> Value {
         let ins = b.ins();
         match ty {
+            Ty::Str => match op {
+                BinaryOperator::Addition => {
+                    self.call_intrinsic(b, Intrinsic::StrConcat, &[(&Ty::Str, l), (&Ty::Str, r)], &Ty::Str)
+                }
+                BinaryOperator::Equality | BinaryOperator::StrictEquality => self.call_intrinsic(
+                    b,
+                    Intrinsic::StrEq,
+                    &[(&Ty::Str, l), (&Ty::Str, r)],
+                    &Ty::Bool,
+                ),
+                BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+                    let eq = self.call_intrinsic(
+                        b,
+                        Intrinsic::StrEq,
+                        &[(&Ty::Str, l), (&Ty::Str, r)],
+                        &Ty::Bool,
+                    );
+                    b.ins().icmp_imm_s(IntCC::Equal, eq, 1)
+                }
+                _ => unreachable!("checker rejected {op:?} on string"),
+            },
+            Ty::Array(_) | Ty::Ptr => unreachable!("no operators on arrays/pointers in v1"),
             Ty::I32 => {
                 let cc = match op {
-                    BinaryOperator::Equality | BinaryOperator::StrictEquality => {
-                        Some(IntCC::Equal)
-                    }
+                    BinaryOperator::Equality | BinaryOperator::StrictEquality => Some(IntCC::Equal),
                     BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
                         Some(IntCC::NotEqual)
                     }

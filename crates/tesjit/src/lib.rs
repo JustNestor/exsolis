@@ -36,11 +36,13 @@ pub mod diag;
 pub mod hir;
 pub mod host;
 pub mod jit;
+pub mod runtime;
 pub mod ty;
 
 pub use diag::{CompileError, Diagnostics, SyntaxDiag};
 pub use host::{FnKind, FnTable, HostFn, HostRegistry, HostSig};
 pub use jit::{Compiled, Entry, Jit, JitBuilder};
+pub use runtime::{TesjitRuntime, TrapKind};
 pub use ty::Ty;
 
 #[cfg(test)]

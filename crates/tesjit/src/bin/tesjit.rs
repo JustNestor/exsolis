@@ -18,9 +18,9 @@ extern "C" fn host_log(x: f64) {
 
 fn main() -> miette::Result<()> {
     let mut args = std::env::args().skip(1);
-    let first = args
-        .next()
-        .ok_or_else(|| miette::miette!("usage: tesjit <file.ts> | tesjit check <file.ts> | tesjit bench <file.ts>"))?;
+    let first = args.next().ok_or_else(|| {
+        miette::miette!("usage: tesjit <file.ts> | tesjit check <file.ts> | tesjit bench <file.ts>")
+    })?;
     let mode = match first.as_str() {
         "check" | "bench" => first.clone(),
         _ => "run".to_owned(),

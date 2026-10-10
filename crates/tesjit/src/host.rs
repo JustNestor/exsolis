@@ -47,7 +47,7 @@ impl HostFn {
     pub fn sig(&self) -> HostSig {
         HostSig {
             params: self.params.clone(),
-            ret: self.ret,
+            ret: self.ret.clone(),
         }
     }
 }

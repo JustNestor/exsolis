@@ -6,23 +6,20 @@
 //! pass records a diagnostic and substitutes a dummy expression, so a broken
 //! function still lowers and its neighbours are still checked.
 
-
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
-    AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, Declaration,
-    Expression, ForStatementInit, Function, LogicalOperator, SimpleAssignmentTarget, Statement,
-    TSType, TSTypeName, UnaryOperator, UpdateOperator, VariableDeclaration,
+    AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, Declaration, Expression,
+    ForStatementInit, Function, LogicalOperator, SimpleAssignmentTarget, Statement, TSType,
+    TSTypeName, UnaryOperator, UpdateOperator, VariableDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 
-use crate::diag::{err, CompileError, Diagnostics, Src};
-use miette::{SourceOffset, SourceSpan};
+use crate::diag::{CompileError, Diagnostics, Src, err};
+use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Local, Module, Stmt};
 use crate::host::{FnKind, HostRegistry, HostSig};
-use crate::hir::{
-    CallTarget, Expr, ExprKind, FnDef, Local, Module, Stmt,
-};
 use crate::ty::Ty;
+use miette::{SourceOffset, SourceSpan};
 
 /// Collected pass state for one lowering run.
 pub struct Lowerer<'a> {
@@ -111,7 +108,11 @@ impl<'a> Lowerer<'a> {
             let mut params = Vec::with_capacity(f.params.items.len());
             let mut bad = false;
             for p in &f.params.items {
-                match p.type_annotation.as_ref().map(|a| ty_of(&a.type_annotation)) {
+                match p
+                    .type_annotation
+                    .as_ref()
+                    .map(|a| ty_of(&a.type_annotation))
+                {
                     Some(Ok(ty)) => params.push(ty),
                     Some(Err(e)) => {
                         self.push(e);
@@ -157,10 +158,7 @@ impl<'a> Lowerer<'a> {
                         }
                     }
                     None => {
-                        self.at(
-                            f.span,
-                            format!("no host function `{name}` registered"),
-                        );
+                        self.at(f.span, format!("no host function `{name}` registered"));
                     }
                 }
                 continue;
@@ -217,7 +215,7 @@ impl<'a> Lowerer<'a> {
             };
             locals.push(Local {
                 name: id.name.to_string(),
-                ty: sig.params[i],
+                ty: sig.params[i].clone(),
                 span: id.span,
             });
         }
@@ -228,7 +226,7 @@ impl<'a> Lowerer<'a> {
             locals,
             scopes: vec![0],
             sigs: scope,
-            ret: sig.ret,
+            ret: sig.ret.clone(),
             loop_depth: 0,
         };
         // The function body lives in the function's own (base) scope: locals
@@ -335,11 +333,31 @@ impl<'a, 'l> FnCtx<'a, 'l> {
     fn stmt(&mut self, s: &Statement<'_>) -> Option<Stmt> {
         match s {
             Statement::ExpressionStatement(e) => {
+                // `a.push(v)` may move the array (growth), so the statement
+                // form rebinds the local to the new pointer.
+                if let Expression::CallExpression(c) = &e.expression
+                    && let Expression::StaticMemberExpression(m) = &c.callee
+                    && m.property.name.as_str() == "push"
+                    && let Expression::Identifier(id) = &m.object
+                    && let Some(slot) = self.lookup(id.name.as_str())
+                    && self.locals[slot].ty.elem().is_some()
+                {
+                    let expr = self.expr(&e.expression, None);
+                    return Some(Stmt::Expr {
+                        expr: Expr::new(
+                            ExprKind::Assign {
+                                local: slot,
+                                op: None,
+                                value: Box::new(expr),
+                            },
+                            self.locals[slot].ty.clone(),
+                            e.span,
+                        ),
+                        span: e.span,
+                    });
+                }
                 let expr = self.expr(&e.expression, None);
-                Some(Stmt::Expr {
-                    expr,
-                    span: e.span,
-                })
+                Some(Stmt::Expr { expr, span: e.span })
             }
             Statement::VariableDeclaration(d) => {
                 let decls = self.var_decl(d);
@@ -359,12 +377,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             Statement::ReturnStatement(r) => {
                 let value = match &r.argument {
                     Some(e) => {
-                        let v = self.expr(e, Some(self.ret));
+                        let v = self.expr(e, Some(self.ret.clone()));
                         if v.ty != self.ret {
-                            self.at(
-                                r.span,
-                                format!("returns {}, expected {}", v.ty, self.ret),
-                            );
+                            self.at(r.span, format!("returns {}, expected {}", v.ty, self.ret));
                         }
                         Some(v)
                     }
@@ -375,17 +390,17 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         None
                     }
                 };
-                Some(Stmt::Return { value, span: r.span })
+                Some(Stmt::Return {
+                    value,
+                    span: r.span,
+                })
             }
             Statement::IfStatement(i) => {
                 let cond = self.cond(&i.test);
                 Some(Stmt::If {
                     cond,
                     then: self.stmt_block(&i.consequent),
-                    els: i
-                        .alternate
-                        .as_ref()
-                        .map(|a| self.stmt_block(a)),
+                    els: i.alternate.as_ref().map(|a| self.stmt_block(a)),
                     span: i.span,
                 })
             }
@@ -481,23 +496,18 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             };
             let (init, ty) = match &decl.init {
                 Some(init) => {
-                    let v = self.expr(init, declared);
-                    let ty = v.ty;
+                    let v = self.expr(init, declared.clone());
+                    let ty = v.ty.clone();
                     if let Some(t) = declared
-                        && t != ty {
-                            self.at(
-                                decl.span,
-                                format!("cannot assign {ty} to {t} (use `as`)"),
-                            );
-                        }
+                        && t != ty
+                    {
+                        self.at(decl.span, format!("cannot assign {ty} to {t} (use `as`)"));
+                    }
                     (Some(v), ty)
                 }
                 None => {
                     let Some(t) = declared else {
-                        self.at(
-                            decl.span,
-                            "variable needs a type annotation or initializer",
-                        );
+                        self.at(decl.span, "variable needs a type annotation or initializer");
                         continue;
                     };
                     (None, t)
@@ -519,11 +529,28 @@ impl<'a, 'l> FnCtx<'a, 'l> {
         out
     }
 
+    /// `s.length` / `a.length` member load.
+    fn member_length(&mut self, target: &Expr, span: Span) -> Expr {
+        match target.ty {
+            Ty::Str | Ty::Array(_) => Expr::new(
+                ExprKind::Length {
+                    target: Box::new(target.clone()),
+                },
+                Ty::I32,
+                span,
+            ),
+            _ => self.poison(span, format!("{} has no `length`", target.ty)),
+        }
+    }
+
     /// Boolean condition of `if` / `while` / `for`.
     fn cond(&mut self, e: &Expression<'_>) -> Expr {
         let v = self.expr(e, Some(Ty::Bool));
         if v.ty != Ty::Bool {
-            self.at(e.span(), format!("condition must be boolean, found {}", v.ty));
+            self.at(
+                e.span(),
+                format!("condition must be boolean, found {}", v.ty),
+            );
         }
         v
     }
@@ -548,22 +575,87 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     Expr::new(ExprKind::F64(n.value), Ty::F64, span)
                 }
             }
-            Expression::BooleanLiteral(l) => {
-                Expr::new(ExprKind::Bool(l.value), Ty::Bool, l.span)
+            Expression::BooleanLiteral(l) => Expr::new(ExprKind::Bool(l.value), Ty::Bool, l.span),
+            Expression::StringLiteral(l) => {
+                Expr::new(ExprKind::Str(l.value.to_string()), Ty::Str, l.span)
+            }
+            Expression::ArrayExpression(arr) => {
+                let span = arr.span;
+                // `[1, 2]` typed against `i32[]` lowers its literals as i32.
+                let declared_elem = match expect {
+                    Some(Ty::Array(elem)) => Some(elem.as_ref().clone()),
+                    _ => None,
+                };
+                let mut elems = Vec::with_capacity(arr.elements.len());
+                let mut elem_ty: Option<Ty> = declared_elem.clone();
+                for el in &arr.elements {
+                    let Some(ex) = el.as_expression() else {
+                        self.at(span, "spread elements are not supported");
+                        continue;
+                    };
+                    let v = self.expr(ex, elem_ty.clone().or(declared_elem.clone()));
+                    match &elem_ty {
+                        Some(known) => {
+                            if v.ty != *known {
+                                self.at(ex.span(), format!("array elements must all be {known}"));
+                            }
+                        }
+                        None => {
+                            if v.ty.elem_size().is_none() {
+                                self.at(ex.span(), format!("{} cannot be an array element", v.ty));
+                                continue;
+                            }
+                            elem_ty = Some(v.ty.clone());
+                        }
+                    }
+                    elems.push(v);
+                }
+                let Some(elem_ty) = elem_ty else {
+                    return self.poison(span, "array literal needs at least one element");
+                };
+                let array_ty = Ty::Array(Box::new(elem_ty.clone()));
+                Expr::new(ExprKind::ArrayLit { elems, elem_ty }, array_ty, span)
+            }
+            Expression::StaticMemberExpression(m) => {
+                let target = self.expr(&m.object, None);
+                self.member_length(&target, m.span)
+            }
+            Expression::ComputedMemberExpression(m) => {
+                let target = self.expr(&m.object, None);
+                let elem = target.ty.elem();
+                if target.ty != Ty::Str && elem.is_none() {
+                    return self.poison(
+                        m.span,
+                        format!("cannot index a value of type {}", target.ty),
+                    );
+                }
+                let index = self.expr(&m.expression, Some(Ty::I32));
+                if index.ty != Ty::I32 {
+                    self.at(m.span, "array index must be i32");
+                }
+                // String indexing yields a byte (i32) — there is no char type yet.
+                Expr::new(
+                    ExprKind::Index {
+                        target: Box::new(target),
+                        index: Box::new(index),
+                    },
+                    elem.unwrap_or(Ty::I32),
+                    m.span,
+                )
             }
             Expression::ParenthesizedExpression(p) => self.expr(&p.expression, expect),
             Expression::Identifier(id) => {
                 let Some(slot) = self.lookup(id.name.as_str()) else {
                     return self.poison(id.span, format!("unknown variable `{}`", id.name));
                 };
-                let ty = self.locals[slot].ty;
+                let ty = self.locals[slot].ty.clone();
                 Expr::new(ExprKind::Local(slot), ty, id.span)
             }
             Expression::UnaryExpression(u) => {
                 let a = self.expr(&u.argument, expect);
-                let ty = a.ty;
+                let ty = a.ty.clone();
                 let span = u.span;
-                match (u.operator, ty) {
+                match (u.operator, ty.clone()) {
                     (UnaryOperator::UnaryPlus, Ty::I32 | Ty::F64) => {}
                     (UnaryOperator::UnaryNegation, Ty::I32 | Ty::F64) => {}
                     (UnaryOperator::BitwiseNot, Ty::I32) => {}
@@ -591,15 +683,19 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 let right_is_lit = matches!(&bin.right, Expression::NumericLiteral(_));
                 let (l, r) = if left_is_lit && !right_is_lit {
                     let r = self.expr(&bin.right, operand_expect);
-                    let l = self.expr(&bin.left, Some(r.ty));
+                    let l = self.expr(&bin.left, Some(r.ty.clone()));
                     (l, r)
                 } else {
                     let l = self.expr(&bin.left, operand_expect);
-                    let r = self.expr(&bin.right, Some(l.ty));
+                    let r = self.expr(&bin.right, Some(l.ty.clone()));
                     (l, r)
                 };
-                let ty = if is_cmp { Ty::Bool } else { l.ty };
+                let ty = if is_cmp { Ty::Bool } else { l.ty.clone() };
                 self.check_arith(bin.operator, &l, &r, bin.span);
+                // Strings only concatenate and compare.
+                if l.ty == Ty::Str && !is_cmp && bin.operator != BinaryOperator::Addition {
+                    self.at(bin.span, "only `+` and comparisons work on strings");
+                }
                 Expr::new(
                     ExprKind::Binary {
                         op: bin.operator,
@@ -636,7 +732,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             Expression::ConditionalExpression(c) => {
                 let cond = self.cond(&c.test);
                 let then = self.expr(&c.consequent, expect);
-                let els = self.expr(&c.alternate, Some(then.ty));
+                let els = self.expr(&c.alternate, Some(then.ty.clone()));
                 if els.ty != then.ty {
                     self.at(c.span, "branches of `?:` have different types");
                 }
@@ -651,17 +747,73 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 )
             }
             Expression::AssignmentExpression(a) => {
+                // `a[i] = v` / `a[i] += v`
+                if let AssignmentTarget::ComputedMemberExpression(m) = &a.left {
+                    let target = self.expr(&m.object, None);
+                    let Some(elem) = target.ty.elem() else {
+                        return self.poison(
+                            a.span,
+                            format!("cannot assign into a value of type {}", target.ty),
+                        );
+                    };
+                    let index = self.expr(&m.expression, Some(Ty::I32));
+                    if index.ty != Ty::I32 {
+                        self.at(a.span, "array index must be i32");
+                    }
+                    let rhs = self.expr(&a.right, Some(elem.clone()));
+                    if rhs.ty != elem.clone() {
+                        self.at(a.span, format!("cannot assign {} to {}[]", rhs.ty, elem));
+                    }
+                    let op = if a.operator == AssignmentOperator::Assign {
+                        None
+                    } else {
+                        compound_op(a.operator)
+                    };
+                    // `a[i] += v` must read the element first: the stored value
+                    // is the combined expression, not just `v`.
+                    let value = if let Some(op) = op {
+                        let cur = Expr::new(
+                            ExprKind::Index {
+                                target: Box::new(target.clone()),
+                                index: Box::new(index.clone()),
+                            },
+                            elem.clone(),
+                            a.span,
+                        );
+                        self.check_arith(op, &cur, &rhs, a.span);
+                        Expr::new(
+                            ExprKind::Binary {
+                                op,
+                                lhs: Box::new(cur),
+                                rhs: Box::new(rhs),
+                            },
+                            elem.clone(),
+                            a.span,
+                        )
+                    } else {
+                        rhs
+                    };
+                    return Expr::new(
+                        ExprKind::SetIndex {
+                            target: Box::new(target),
+                            index: Box::new(index),
+                            value: Box::new(value),
+                        },
+                        elem.clone(),
+                        a.span,
+                    );
+                }
                 let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
                     return self.poison(
                         a.span,
-                        "only assignment to plain variables is supported",
+                        "only assignment to plain variables or array elements is supported",
                     );
                 };
                 let Some(slot) = self.lookup(id.name.as_str()) else {
                     return self.poison(a.span, format!("unknown variable `{}`", id.name));
                 };
-                let ty = self.locals[slot].ty;
-                let rhs = self.expr(&a.right, Some(ty));
+                let ty = self.locals[slot].ty.clone();
+                let rhs = self.expr(&a.right, Some(ty.clone()));
                 let op = if a.operator == AssignmentOperator::Assign {
                     None
                 } else {
@@ -676,15 +828,12 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 if let Some(op) = op {
                     self.check_arith(
                         op,
-                        &Expr::new(ExprKind::Local(slot), ty, a.span),
+                        &Expr::new(ExprKind::Local(slot), ty.clone(), a.span),
                         &rhs,
                         a.span,
                     );
                 } else if rhs.ty != ty {
-                    self.at(
-                        a.span,
-                        format!("cannot assign {} to {}", rhs.ty, ty),
-                    );
+                    self.at(a.span, format!("cannot assign {} to {}", rhs.ty, ty));
                 }
                 Expr::new(
                     ExprKind::Assign {
@@ -692,7 +841,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         op,
                         value: Box::new(rhs),
                     },
-                    ty,
+                    ty.clone(),
                     a.span,
                 )
             }
@@ -703,8 +852,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 let Some(slot) = self.lookup(id.name.as_str()) else {
                     return self.poison(u.span, format!("unknown variable `{}`", id.name));
                 };
-                let ty = self.locals[slot].ty;
-                if !ty.is_numeric() {
+                let ty = self.locals[slot].ty.clone();
+                if !ty.clone().is_numeric() {
                     self.at(u.span, "++/-- need a number");
                 }
                 Expr::new(
@@ -718,10 +867,45 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 )
             }
             Expression::CallExpression(c) => {
+                // `a.push(v)` — the only builtin method call for now.
+                if let Expression::StaticMemberExpression(m) = &c.callee
+                    && m.property.name.as_str() == "push"
+                {
+                    let target = self.expr(&m.object, None);
+                        let Some(elem) = target.ty.elem() else {
+                            return self.poison(c.span, "`push` is only available on arrays");
+                        };
+                        if c.arguments.len() != 1 {
+                            return self.poison(c.span, "`push` takes exactly one argument");
+                        }
+                        let Some(arg) = c.arguments.first().and_then(|a| a.as_expression()) else {
+                            return self.poison(c.span, "`push` takes exactly one argument");
+                        };
+                        let value = self.expr(arg, Some(elem.clone()));
+                        if value.ty != elem.clone() {
+                            self.at(
+                                arg.span(),
+                                format!("cannot push {} into {}[]", value.ty, elem),
+                            );
+                        }
+                        let elem_size = Expr::new(
+                            ExprKind::I32(elem.elem_size().unwrap() as i32),
+                            Ty::I32,
+                            c.span,
+                        );
+                        return Expr::new(
+                            ExprKind::Call {
+                                target: CallTarget::Intrinsic(Intrinsic::ArrPush),
+                                args: vec![target, elem_size, value],
+                            },
+                            Ty::Array(Box::new(elem)),
+                            c.span,
+                        );
+                }
                 let Expression::Identifier(callee) = &c.callee else {
                     return self.poison(
                         c.span,
-                        "only calls to named functions are supported",
+                        "only calls to named functions or `array.push` are supported",
                     );
                 };
                 let name = callee.name.as_str();
@@ -731,9 +915,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 let (params, ret) = match &kind {
                     FnKind::Local => {
                         let sig = self.sigs.sig(name).expect("local fn has a signature");
-                        (sig.params.clone(), sig.ret)
+                        (sig.params.clone(), sig.ret.clone())
                     }
-                    FnKind::Host(sig) => (sig.params.clone(), sig.ret),
+                    FnKind::Host(sig) => (sig.params.clone(), sig.ret.clone()),
                 };
                 if c.arguments.len() != params.len() {
                     return self.poison(
@@ -743,18 +927,15 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 }
                 let mut args = Vec::with_capacity(params.len());
                 let mut bad = false;
-                for (a, &pty) in c.arguments.iter().zip(&params) {
+                for (a, pty) in c.arguments.iter().zip(&params) {
                     let Some(ex) = a.as_expression() else {
                         self.at(c.span, "spread arguments are not supported");
                         bad = true;
                         continue;
                     };
-                    let v = self.expr(ex, Some(pty));
-                    if v.ty != pty {
-                        self.at(
-                            ex.span(),
-                            format!("argument is {}, expected {}", v.ty, pty),
-                        );
+                    let v = self.expr(ex, Some(pty.clone()));
+                    if v.ty != *pty {
+                        self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
                         bad = true;
                     }
                     args.push(v);
@@ -769,7 +950,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 Expr::new(ExprKind::Call { target, args }, ret, c.span)
             }
             Expression::TSAsExpression(a) => {
-                let target = match ty_of(&a.type_annotation) {
+                let to = match ty_of(&a.type_annotation) {
                     Ok(ty) => ty,
                     Err(e) => {
                         self.at(a.span, e.to_string());
@@ -777,7 +958,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     }
                 };
                 let v = self.expr(&a.expression, None);
-                match (v.ty, target) {
+                let cast_ty = to.clone();
+                match (v.ty.clone(), cast_ty.clone()) {
                     (x, y) if x == y => v,
                     (Ty::I32, Ty::F64)
                     | (Ty::F64, Ty::I32)
@@ -785,15 +967,12 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     | (Ty::Bool, Ty::F64) => Expr::new(
                         ExprKind::Cast {
                             expr: Box::new(v),
-                            to: target,
+                            to,
                         },
-                        target,
+                        cast_ty,
                         a.span,
                     ),
-                    (x, y) => self.poison(
-                        a.span,
-                        format!("cannot cast {x} to {y}"),
-                    ),
+                    (x, y) => self.poison(a.span, format!("cannot cast {x} to {y}")),
                 }
             }
             other => self.poison(other.span(), "unsupported expression"),
@@ -805,35 +984,45 @@ impl<'a, 'l> FnCtx<'a, 'l> {
         if l.ty != r.ty {
             self.at(
                 span,
-                format!(
-                    "operand types differ: {} vs {} (use `as`)",
-                    l.ty, r.ty
-                ),
+                format!("operand types differ: {} vs {} (use `as`)", l.ty, r.ty),
             );
             return;
         }
-        let supported = match (l.ty, op) {
-            (Ty::I32, _) => matches!(
+        let supported = match (l.ty.clone(), op) {
+            (Ty::Str, _) => matches!(
                 op,
                 BinaryOperator::Addition
-                    | BinaryOperator::Subtraction
-                    | BinaryOperator::Multiplication
-                    | BinaryOperator::Division
-                    | BinaryOperator::Remainder
-                    | BinaryOperator::BitwiseAnd
-                    | BinaryOperator::BitwiseOR
-                    | BinaryOperator::BitwiseXOR
-                    | BinaryOperator::ShiftLeft
-                    | BinaryOperator::ShiftRight
-                    | BinaryOperator::ShiftRightZeroFill
-            ) || is_comparison(op),
-            (Ty::F64, _) => matches!(
-                op,
-                BinaryOperator::Addition
-                    | BinaryOperator::Subtraction
-                    | BinaryOperator::Multiplication
-                    | BinaryOperator::Division
-            ) || is_comparison(op),
+                    | BinaryOperator::Equality
+                    | BinaryOperator::Inequality
+                    | BinaryOperator::StrictEquality
+                    | BinaryOperator::StrictInequality
+            ),
+            (Ty::Array(_) | Ty::Ptr, _) => false,
+            (Ty::I32, _) => {
+                matches!(
+                    op,
+                    BinaryOperator::Addition
+                        | BinaryOperator::Subtraction
+                        | BinaryOperator::Multiplication
+                        | BinaryOperator::Division
+                        | BinaryOperator::Remainder
+                        | BinaryOperator::BitwiseAnd
+                        | BinaryOperator::BitwiseOR
+                        | BinaryOperator::BitwiseXOR
+                        | BinaryOperator::ShiftLeft
+                        | BinaryOperator::ShiftRight
+                        | BinaryOperator::ShiftRightZeroFill
+                ) || is_comparison(op)
+            }
+            (Ty::F64, _) => {
+                matches!(
+                    op,
+                    BinaryOperator::Addition
+                        | BinaryOperator::Subtraction
+                        | BinaryOperator::Multiplication
+                        | BinaryOperator::Division
+                ) || is_comparison(op)
+            }
             (Ty::Bool, _) => matches!(
                 op,
                 BinaryOperator::Equality
@@ -844,10 +1033,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             (Ty::Void, _) => false,
         };
         if !supported {
-            self.at(
-                span,
-                format!("operator {op:?} not supported on {}", l.ty),
-            );
+            self.at(span, format!("operator {op:?} not supported on {}", l.ty));
         }
     }
 }
@@ -891,6 +1077,8 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
     match t {
         TSType::TSNumberKeyword(_) => Ok(Ty::F64),
         TSType::TSBooleanKeyword(_) => Ok(Ty::Bool),
+        TSType::TSStringKeyword(_) => Ok(Ty::Str),
+        TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of(&arr.element_type)?))),
         TSType::TSVoidKeyword(_) => Ok(Ty::Void),
         TSType::TSTypeReference(r) => match &r.type_name {
             TSTypeName::IdentifierReference(id) => match id.name.as_str() {
@@ -937,10 +1125,7 @@ impl ModuleScope {
     }
 
     fn sig(&self, name: &str) -> Option<&FnSig> {
-        self.fns
-            .iter()
-            .find(|(n, _)| n == name)
-            .map(|(_, s)| s)
+        self.fns.iter().find(|(n, _)| n == name).map(|(_, s)| s)
     }
 
     fn index(&self, name: &str) -> usize {
