@@ -44,7 +44,7 @@ use std::rc::Rc;
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use bevy_log::{error, info, warn};
+use bevy_log::{debug, error, info, warn};
 use mlua::{Lua, MultiValue, Table, Value};
 
 use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId, ServerMessage};
@@ -182,6 +182,34 @@ enum ScriptRequest {
         default_key: String,
         description: String,
         category: String,
+    },
+    /// `api.spawn_entity(kind, { x, y, z, model, scale })`. Ids are
+    /// allocated by the server; the request carries no id because a mod
+    /// cannot be trusted to pick a unique one.
+    SpawnEntity {
+        kind: String,
+        x: f32,
+        y: f32,
+        z: f32,
+        yaw: f32,
+        model: Option<String>,
+        scale: f32,
+    },
+    /// `api.despawn_entity(entity_id)`.
+    DespawnEntity {
+        entity_id: u64,
+    },
+    /// `api.set_entity_state(entity_id, { x, y, z, yaw })`.
+    SetEntityState {
+        entity_id: u64,
+        x: f32,
+        y: f32,
+        z: f32,
+        yaw: f32,
+    },
+    /// `api.get_block_entity(x, y, z)` -> the entity id, or nil.
+    QueryBlockEntity {
+        pos: BlockPos,
     },
 }
 
@@ -609,6 +637,94 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         )?;
     }
 
+    // --- api.spawn_entity(kind, opts) : queue an entity spawn -------------
+    // The server allocates the id, so a mod cannot pick a colliding one.
+    // Returns nothing; read the id back with `api.get_block_entity` or
+    // keep the id from `api.spawn_block_entity` below.
+    {
+        let outbox = outbox.clone();
+        api.set(
+            "spawn_entity",
+            lua.create_function(move |_, (kind, opts): (String, mlua::Table)| {
+                let x: f32 = opts.get("x").unwrap_or(0.0);
+                let y: f32 = opts.get("y").unwrap_or(0.0);
+                let z: f32 = opts.get("z").unwrap_or(0.0);
+                let yaw: f32 = opts.get("yaw").unwrap_or(0.0);
+                let scale: f32 = opts.get("scale").unwrap_or(1.0);
+                let model: Option<String> = opts.get("model").unwrap_or(None);
+                if let Some(ref m) = model
+                    && m.len() > exsolis_common::MODEL_PATH_MAX_LEN
+                {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "spawn_entity: model path too long ({})",
+                        exsolis_common::MODEL_PATH_MAX_LEN
+                    )));
+                }
+                if !scale.is_finite() || scale <= 0.0 || scale > 1000.0 {
+                    return Err(mlua::Error::RuntimeError(
+                        "spawn_entity: scale must be in (0, 1000]".to_string(),
+                    ));
+                }
+                outbox.borrow_mut().push(ScriptRequest::SpawnEntity {
+                    kind,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                    model,
+                    scale,
+                });
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // --- api.despawn_entity(entity_id) ---------------------------------
+    {
+        let outbox = outbox.clone();
+        api.set(
+            "despawn_entity",
+            lua.create_function(move |_, entity_id: Value| {
+                let id = pop_entity_id(&mut std::iter::once(entity_id))
+                    .map_err(mlua::Error::RuntimeError)?;
+                outbox
+                    .borrow_mut()
+                    .push(ScriptRequest::DespawnEntity { entity_id: id });
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // --- api.set_entity_state(entity_id, opts) -------------------------
+    {
+        let outbox = outbox.clone();
+        api.set(
+            "set_entity_state",
+            lua.create_function(move |_, (id, opts): (Value, mlua::Table)| {
+                let entity_id =
+                    pop_entity_id(&mut std::iter::once(id)).map_err(mlua::Error::RuntimeError)?;
+                let x: f32 = opts.get("x").unwrap_or(f32::NAN);
+                let y: f32 = opts.get("y").unwrap_or(f32::NAN);
+                let z: f32 = opts.get("z").unwrap_or(f32::NAN);
+                let yaw: f32 = opts.get("yaw").unwrap_or(0.0);
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() || !yaw.is_finite() {
+                    return Err(mlua::Error::RuntimeError(
+                        "set_entity_state: x, y, z and yaw are required and must be finite"
+                            .to_string(),
+                    ));
+                }
+                outbox.borrow_mut().push(ScriptRequest::SetEntityState {
+                    entity_id,
+                    x,
+                    y,
+                    z,
+                    yaw,
+                });
+                Ok(())
+            })?,
+        )?;
+    }
+
     // Pull-based world-read helpers (`get_player_pos`, `get_block`,
     // `list_players`) are NOT installed here, because they need to
     // borrow live ECS state (`Query`, `Res<ChunkWorld>`) that only
@@ -639,6 +755,24 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
 /// through this pair.
 fn player_id_to_lua(id: PlayerId) -> String {
     id.to_string()
+}
+
+/// Parse a mod-supplied entity id.
+///
+/// Same `u64`-through-Lua caveat as [`pop_player_id`]: ids go to and from
+/// Lua as decimal strings, because a Lua number cannot represent every
+/// `u64`. Small integers are tolerated for convenience.
+fn pop_entity_id(it: &mut impl Iterator<Item = Value>) -> Result<u64, String> {
+    match it.next() {
+        Some(Value::String(s)) => s
+            .to_str()
+            .map_err(|e| e.to_string())?
+            .parse::<u64>()
+            .map_err(|_| format!("'{s:?}' is not a valid entity_id")),
+        Some(Value::Integer(i)) if i >= 0 => Ok(i as u64),
+        Some(Value::Number(n)) if n >= 0.0 && n.fract() == 0.0 => Ok(n as u64),
+        other => Err(format!("expected entity_id (string), got {other:?}")),
+    }
 }
 
 fn pop_player_id(it: &mut impl Iterator<Item = Value>) -> mlua::Result<PlayerId> {
@@ -899,6 +1033,7 @@ fn run_on_tick(
     runtime: NonSend<ScriptRuntime>,
     positions: Query<(&Player, &PlayerPosition)>,
     world: Res<ChunkWorld>,
+    registry: Res<crate::entities::EntityRegistry>,
 ) {
     let positions: HashMap<PlayerId, (f32, f32, f32)> = positions
         .iter()
@@ -949,6 +1084,33 @@ fn run_on_tick(
         })?;
         api.set("get_block", get_block)?;
 
+        // The entity id of the block entity at a position, or nil. Same
+        // string-id caveat as every other id crossing into Lua.
+        let registry = &registry;
+        let get_block_entity = scope.create_function(|lua, (x, y, z): (i32, i32, i32)| {
+            match registry.at_block(BlockPos::new(x, y, z)) {
+                Some(id) => Ok(Value::String(lua.create_string(id.to_string())?)),
+                None => Ok(Value::Nil),
+            }
+        })?;
+        api.set("get_block_entity", get_block_entity)?;
+
+        // Every live entity, as { id = "...", kind = "...", x, y, z }.
+        let list_entities = scope.create_function(|lua, ()| {
+            let t = lua.create_table()?;
+            for (i, record) in registry.records().iter().enumerate() {
+                let e = lua.create_table()?;
+                e.set("id", record.id.to_string())?;
+                e.set("kind", format!("{:?}", record.kind).to_lowercase())?;
+                e.set("x", record.state.x)?;
+                e.set("y", record.state.y)?;
+                e.set("z", record.state.z)?;
+                t.raw_set(i + 1, e)?;
+            }
+            Ok(t)
+        })?;
+        api.set("list_entities", list_entities)?;
+
         runtime.tick();
         Ok(())
     });
@@ -975,7 +1137,11 @@ fn run_on_tick(
 // that needs to run strictly after it has to reference it by name.
 pub(crate) fn drain_script_requests(
     runtime: NonSend<ScriptRuntime>,
+    mut commands: Commands,
     mut world: ResMut<ChunkWorld>,
+    registry: Res<crate::entities::EntityRegistry>,
+    mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
+    mut despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
 ) {
@@ -1030,8 +1196,152 @@ pub(crate) fn drain_script_requests(
             ScriptRequest::SetBlock { pos, block } => {
                 set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by);
             }
+            ScriptRequest::SpawnEntity {
+                kind,
+                x,
+                y,
+                z,
+                yaw,
+                model,
+                scale,
+            } => {
+                // An unknown kind is a warning, never a panic: the string
+                // came from a mod.
+                let Ok(kind) = parse_entity_kind(&kind) else {
+                    warn!("scripting: api.spawn_entity: unknown kind {kind:?}");
+                    continue;
+                };
+                if let Some(block_pos) = block_pos_from_state(kind, x, y, z) {
+                    if registry.at_block(block_pos).is_some() {
+                        warn!(
+                            "scripting: api.spawn_entity: a block entity already exists at {block_pos:?}"
+                        );
+                        continue;
+                    }
+                }
+                let mut extra = crate::entities::SpawnExtra::None;
+                let mut block_pos = None;
+                if kind == exsolis_common::EntityKind::Block {
+                    let block = block_pos_from_state(kind, x, y, z)
+                        .map(|p| block_at(&world, p))
+                        .unwrap_or(BlockType::Chest);
+                    if !crate::entities::is_block_entity(block) {
+                        warn!(
+                            "scripting: api.spawn_entity: {:?} is not a block entity",
+                            block
+                        );
+                        continue;
+                    }
+                    extra = crate::entities::SpawnExtra::BlockEntity(block);
+                    block_pos = block_pos_from_state(kind, x, y, z);
+                }
+                spawns.write(crate::entities::SpawnEntityRequest {
+                    kind,
+                    state: exsolis_common::EntityState {
+                        x,
+                        y,
+                        z,
+                        yaw,
+                        ..Default::default()
+                    },
+                    model,
+                    scale,
+                    block_pos,
+                    extra,
+                    player_token: None,
+                });
+            }
+            ScriptRequest::DespawnEntity { entity_id } => {
+                despawns.write(crate::entities::DespawnEntityRequest(entity_id));
+            }
+            ScriptRequest::SetEntityState {
+                entity_id,
+                x,
+                y,
+                z,
+                yaw,
+            } => {
+                let Some(record) = registry.get(entity_id) else {
+                    warn!("scripting: api.set_entity_state: unknown entity {entity_id}");
+                    continue;
+                };
+                if !x.is_finite() || !y.is_finite() || !z.is_finite() || !yaw.is_finite() {
+                    warn!("scripting: api.set_entity_state: non-finite state for {entity_id}");
+                    continue;
+                }
+                commands
+                    .entity(record.entity)
+                    .insert(crate::entities::EntityTransform(
+                        exsolis_common::EntityState {
+                            x,
+                            y,
+                            z,
+                            yaw,
+                            ..record.state
+                        },
+                    ));
+                // Push it out immediately rather than waiting for the next
+                // sync: a mod that moves an entity expects clients to see it
+                // move now.
+                outgoing.write(OutgoingPacket::broadcast_unreliable(
+                    ServerMessage::EntityStateUpdate {
+                        entity_id,
+                        state: exsolis_common::EntityState {
+                            x,
+                            y,
+                            z,
+                            yaw,
+                            ..record.state
+                        },
+                    },
+                ));
+            }
+            ScriptRequest::QueryBlockEntity { pos } => {
+                // Mods get the id synchronously from `get_block_entity`, so
+                // this variant only exists to make the lookup requestable
+                // from a context without world access; the answer is logged
+                // rather than pushed back into Lua.
+                debug!(
+                    "scripting: block entity at {pos:?} is {:?}",
+                    registry.at_block(pos)
+                );
+            }
         }
     }
+}
+
+/// Parse a mod-supplied entity kind name.
+fn parse_entity_kind(name: &str) -> Result<exsolis_common::EntityKind, ()> {
+    use exsolis_common::EntityKind;
+    match name {
+        "player" => Ok(EntityKind::Player),
+        "block" => Ok(EntityKind::Block),
+        "item" => Ok(EntityKind::Item),
+        "prop" => Ok(EntityKind::Prop),
+        _ => Err(()),
+    }
+}
+
+/// The block position an entity state refers to, for block-kind entities.
+fn block_pos_from_state(
+    kind: exsolis_common::EntityKind,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> Option<BlockPos> {
+    (kind == exsolis_common::EntityKind::Block)
+        .then(|| BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32))
+}
+
+/// The block currently at `pos`, or `Air`.
+fn block_at(world: &ChunkWorld, pos: BlockPos) -> BlockType {
+    let (coord, idx) = world_to_chunk_index(pos);
+    world
+        .ready
+        .get(&coord)
+        .and_then(|c| c.unpack())
+        .map(|blocks| blocks[idx])
+        .unwrap_or(BlockType::Air)
 }
 
 const MOD_ACTION_MAX_DEPTH: usize = 8;
@@ -1254,4 +1564,52 @@ fn set_block_and_broadcast(
 
 fn reload_mods_system(runtime: NonSend<ScriptRuntime>) {
     runtime.check_and_reload_mods();
+}
+
+#[cfg(test)]
+mod entity_api_tests {
+    use super::*;
+
+    /// Ids cross into Lua as decimal strings because a Lua number cannot
+    /// represent every `u64`. Getting this wrong silently truncates ids
+    /// above 2^53, so the string path is the one that matters.
+    #[test]
+    fn entity_ids_parse_from_strings_and_small_numbers() {
+        let lua = mlua::Lua::new();
+        let big = lua.create_string("18446744073709551615").unwrap();
+        assert_eq!(
+            pop_entity_id(&mut std::iter::once(Value::String(big))).unwrap(),
+            u64::MAX,
+            "ids above 2^53 must survive the round trip, which is why they go as strings"
+        );
+        assert_eq!(
+            pop_entity_id(&mut std::iter::once(Value::Integer(42))).unwrap(),
+            42
+        );
+    }
+
+    #[test]
+    fn entity_ids_reject_junk() {
+        for bad in [
+            pop_entity_id(&mut std::iter::once(Value::Nil)),
+            pop_entity_id(&mut std::iter::once(Value::Integer(-1))),
+            pop_entity_id(&mut std::iter::once(Value::Number(-2.0))),
+            pop_entity_id(&mut std::iter::once(Value::Number(1.5))),
+        ] {
+            assert!(bad.is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn entity_kinds_are_a_closed_set() {
+        for name in ["player", "block", "item", "prop"] {
+            assert!(parse_entity_kind(name).is_ok(), "{name} should parse");
+        }
+        for name in ["", "PLAYER", "npc", "players"] {
+            assert!(
+                parse_entity_kind(name).is_err(),
+                "{name:?} should not parse"
+            );
+        }
+    }
 }

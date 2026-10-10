@@ -102,6 +102,14 @@ impl EntityRegistry {
         self.records.is_empty()
     }
 
+    /// Every live record, in stable id order so mod-facing listings do not
+    /// reshuffle between ticks.
+    pub fn records(&self) -> Vec<&EntityRecord> {
+        let mut out: Vec<&EntityRecord> = self.records.values().collect();
+        out.sort_by_key(|r| r.id);
+        out
+    }
+
     pub fn get(&self, id: EntityId) -> Option<&EntityRecord> {
         self.records.get(&id)
     }
