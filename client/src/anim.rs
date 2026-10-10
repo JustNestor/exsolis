@@ -22,7 +22,7 @@
 
 use bevy_ecs::prelude::*;
 use bevy_log::{debug, warn};
-use glam::{Mat4, Quat, Vec3};
+use glam::{EulerRot, Mat4, Quat, Vec3};
 
 pub mod rig;
 
@@ -180,6 +180,16 @@ impl AnimChannel {
                 out.rotation = qa.slerp(qb, f).normalize();
             }
         }
+    }
+}
+
+/// Interpolate two local poses. Rotations go through slerp so a joint does
+/// not shrink through the midpoint; translations and scales lerp.
+fn blend_transform(a: Transform, b: Transform, t: f32) -> Transform {
+    Transform {
+        translation: a.translation.lerp(b.translation, t),
+        rotation: a.rotation.slerp(b.rotation, t).normalize(),
+        scale: a.scale.lerp(b.scale, t),
     }
 }
 
@@ -434,14 +444,18 @@ pub struct PlayState {
 
 /// Drives one animated instance: which clip is playing, how far through it,
 /// and how far into a cross-fade we are.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, bevy_ecs::component::Component)]
 pub struct Animator {
     pub current: PlayState,
     /// The outgoing clip during a transition; `None` when settled.
     pub previous: Option<PlayState>,
     /// Seconds since the transition started.
     pub blend_elapsed: f32,
+    /// Authoritative horizontal speed in blocks/second, pushed by the
+    /// server with each entity state update. Drives both clip choice and
+    /// playback rate.
     pub speed: f32,
+    pub airborne: bool,
     /// Additive head look, radians. Applied on top of whatever clip is
     /// playing, because the head is an independent branch of this rig.
     pub head_yaw: f32,
@@ -459,7 +473,8 @@ impl Animator {
             current: PlayState { clip: 0, time: 0.0 },
             previous: None,
             blend_elapsed: 0.0,
-            speed: 1.0,
+            speed: 0.0,
+            airborne: false,
             head_yaw: 0.0,
             head_pitch: 0.0,
         }
@@ -467,7 +482,7 @@ impl Animator {
 
     /// Ask for `clip`. Does nothing if it is already playing, so callers can
     /// request the locomotion clip every frame without churn.
-    pub fn play(&mut self, clip: u32, transition: Transition) {
+    pub fn play(&mut self, clip: u32, _transition: Transition) {
         if clip == self.current.clip {
             return;
         }
@@ -475,7 +490,13 @@ impl Animator {
         self.current.clip = clip;
         self.current.time = 0.0;
         self.blend_elapsed = 0.0;
-        let _ = transition;
+    }
+
+    /// Point the head additively, in radians relative to the body's facing.
+    /// Clamped so the avatar never folds over backwards.
+    pub fn look(&mut self, yaw: f32, pitch: f32) {
+        self.head_yaw = yaw.clamp(-HEAD_YAW_LIMIT, HEAD_YAW_LIMIT);
+        self.head_pitch = pitch.clamp(-HEAD_PITCH_LIMIT, HEAD_PITCH_LIMIT);
     }
 
     /// Blend weight of the outgoing clip, 1 at the start of a transition and
@@ -532,6 +553,72 @@ impl Skeleton {
         // Threshold sits above a brisk walk and below a jog; the clips
         // themselves decide the actual playback rate via `natural_speed`.
         Some(if speed > 3.2 { run } else { walk })
+    }
+
+    /// The role a clip was assigned, so a transition can look up the right
+    /// `(from, to)` edge in the graph.
+    pub fn role_of(&self, clip: u32) -> ClipRole {
+        self.clips
+            .get(clip as usize)
+            .map(|c| c.role)
+            .unwrap_or(ClipRole::Unknown(u16::MAX))
+    }
+
+    /// The transition to use between two clips.
+    pub fn transition(&self, from_clip: u32, to_clip: u32) -> Transition {
+        Transition::between(self.role_of(from_clip), self.role_of(to_clip))
+    }
+
+    /// Compose the bone palette for a pose that may be mid-transition.
+    ///
+    /// `blend` is `None` once a transition has settled, in which case this
+    /// is just [`Skeleton::compose_palette`]. Otherwise the two poses are
+    /// blended **per joint** according to the transition's [`Mask`] and then
+    /// composed once.
+    ///
+    /// Blending the finished bone matrices instead would be wrong for a
+    /// masked transition: a lower-body blend has to leave the head's
+    /// matrices exactly as the incoming clip posed them, and averaging two
+    /// world-space matrices is not the same as posing the joint once.
+    pub fn compose_blend(
+        &self,
+        locals: &mut [Transform],
+        previous: Option<(u32, f32, Transition, f32)>,
+        worlds: &mut [Mat4],
+        bones: &mut [Mat4],
+        scratch_locals: &mut Vec<Transform>,
+    ) {
+        let Some((from_clip, from_time, transition, weight)) = previous else {
+            self.compose_palette(locals, worlds, bones);
+            return;
+        };
+        if transition.duration <= f32::EPSILON || weight <= 0.0 {
+            self.compose_palette(locals, worlds, bones);
+            return;
+        }
+        let eased = transition.easing.apply(weight);
+
+        scratch_locals.clear();
+        scratch_locals.resize(self.joints.len(), Transform::default());
+        self.sample(from_clip, from_time, scratch_locals);
+
+        for (index, slot) in locals.iter_mut().enumerate() {
+            let Some(from) = scratch_locals.get(index).copied() else {
+                continue;
+            };
+            let blended = blend_transform(from, *slot, eased);
+            *slot = match transition.mask {
+                Mask::Full => blended,
+                // A masked joint keeps the pose it already had — for
+                // `LowerBody` that is the incoming clip's upper body, which
+                // is what makes walk -> run readable instead of a full-body
+                // mush.
+                Mask::LowerBody if self.is_upper_body(index) => *slot,
+                Mask::UpperBody if !self.is_upper_body(index) => *slot,
+                Mask::LowerBody | Mask::UpperBody => blended,
+            };
+        }
+        self.compose_palette(locals, worlds, bones);
     }
 
     /// Sample `clip` at `time` into `out`, one entry per joint. Joints the
@@ -906,5 +993,145 @@ models/test.glb
         a.advance(10.0, 1.0);
         assert_eq!(a.current.time, 10.0);
         // The clip itself wraps during sampling.
+    }
+
+    #[test]
+    fn head_look_is_clamped_so_the_avatar_never_folds_over() {
+        let mut a = Animator::new();
+        a.look(10.0, -10.0);
+        assert_eq!(a.head_yaw, HEAD_YAW_LIMIT);
+        assert_eq!(a.head_pitch, -HEAD_PITCH_LIMIT);
+        a.look(0.1, 0.2);
+        assert!((a.head_yaw - 0.1).abs() < 1e-6);
+        assert!((a.head_pitch - 0.2).abs() < 1e-6);
+    }
+
+    /// The head and legs are separate branches of this rig, which is what
+    /// makes a lower-body mask possible at all.
+    #[test]
+    fn upper_body_classification_separates_legs_from_the_head() {
+        let skeleton = Skeleton {
+            joints: vec![
+                Joint {
+                    name: "Head_822".into(),
+                    parent: None,
+                    rest_local: Transform::default(),
+                    static_prefix: Mat4::IDENTITY,
+                    inv_bind: Mat4::IDENTITY,
+                },
+                Joint {
+                    name: "LeftLeg_52".into(),
+                    parent: None,
+                    rest_local: Transform::default(),
+                    static_prefix: Mat4::IDENTITY,
+                    inv_bind: Mat4::IDENTITY,
+                },
+                Joint {
+                    name: "RightFoot_95".into(),
+                    parent: None,
+                    rest_local: Transform::default(),
+                    static_prefix: Mat4::IDENTITY,
+                    inv_bind: Mat4::IDENTITY,
+                },
+            ],
+            clips: Vec::new(),
+            upper_body: vec![true, false, false],
+        };
+        assert!(skeleton.is_upper_body(0), "head is upper body");
+        assert!(!skeleton.is_upper_body(1), "thigh is lower body");
+        assert!(!skeleton.is_upper_body(2), "foot is lower body");
+    }
+
+    /// A lower-body transition must leave the head's pose alone. If the
+    /// mask were applied to the composed matrices instead of the local
+    /// poses, the head would drift halfway toward the other clip.
+    #[test]
+    fn a_lower_body_transition_leaves_the_head_at_the_incoming_pose() {
+        let skeleton = Skeleton {
+            joints: vec![
+                Joint {
+                    name: "Head_822".into(),
+                    parent: None,
+                    rest_local: Transform::default(),
+                    static_prefix: Mat4::IDENTITY,
+                    inv_bind: Mat4::IDENTITY,
+                },
+                Joint {
+                    name: "LeftLeg_52".into(),
+                    parent: None,
+                    rest_local: Transform::default(),
+                    static_prefix: Mat4::IDENTITY,
+                    inv_bind: Mat4::IDENTITY,
+                },
+            ],
+            clips: Vec::new(),
+            upper_body: vec![true, false],
+        };
+        // Incoming pose: head rotated, leg at rest.
+        let mut locals = vec![
+            Transform {
+                rotation: Quat::from_rotation_y(1.0),
+                ..Default::default()
+            },
+            Transform::default(),
+        ];
+        let mut worlds = vec![Mat4::IDENTITY; 2];
+        let mut bones = vec![Mat4::IDENTITY; 2];
+        let mut scratch = Vec::new();
+        skeleton.compose_blend(
+            &mut locals,
+            // Outgoing pose would have put the head somewhere else; with no
+            // clips the sampler falls back to rest, so the head must end up
+            // exactly where the incoming pose put it.
+            Some((
+                0,
+                0.0,
+                Transition::between(ClipRole::Walk, ClipRole::Run),
+                0.5,
+            )),
+            &mut worlds,
+            &mut bones,
+            &mut scratch,
+        );
+        assert!(
+            (locals[0].rotation.to_euler(EulerRot::YXZ).0 - 1.0).abs() < 1e-3,
+            "head moved during a lower-body blend: {:?}",
+            locals[0].rotation
+        );
+    }
+
+    #[test]
+    fn a_full_body_blend_does_move_everything() {
+        let skeleton = Skeleton {
+            joints: vec![Joint {
+                name: "Head_822".into(),
+                parent: None,
+                rest_local: Transform::default(),
+                static_prefix: Mat4::IDENTITY,
+                inv_bind: Mat4::IDENTITY,
+            }],
+            clips: Vec::new(),
+            upper_body: vec![true],
+        };
+        let mut locals = vec![Transform {
+            rotation: Quat::from_rotation_y(1.0),
+            ..Default::default()
+        }];
+        let mut worlds = vec![Mat4::IDENTITY];
+        let mut bones = vec![Mat4::IDENTITY];
+        let mut scratch = Vec::new();
+        skeleton.compose_blend(
+            &mut locals,
+            Some((0, 0.0, Transition::DEFAULT, 0.5)),
+            &mut worlds,
+            &mut bones,
+            &mut scratch,
+        );
+        // Halfway from rest to the incoming pose.
+        let yaw = locals[0].rotation.to_euler(EulerRot::YXZ).0;
+        assert!(
+            (yaw - 0.5).abs() < 1e-3,
+            "expected a half-way blend, got {yaw}"
+        );
     }
 }

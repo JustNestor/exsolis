@@ -63,6 +63,11 @@ use super::allocator::{GpuMeshAllocation, MeshBufferAllocator};
 use super::ui_pass::{self, UiDrawList, UiPassGpu};
 
 // GLTF shader modules (inline like mesh.rs)
+//
+// The vertex shader's palette stride is hardcoded to 256 and must match
+// `MAX_GLTF_JOINTS`. Changing one without the other silently skins every
+// vertex with the wrong bone rather than failing.
+pub(super) const MAX_GLTF_JOINTS: u64 = 256;
 pub mod gltf_vs {
     vulkano_shaders::shader! {
         ty: "vertex",
@@ -105,6 +110,7 @@ pub mod gltf_vs {
         layout(location = 2) in vec2 uv;
         layout(location = 3) in vec4 color;
         layout(location = 4) in vec4 tangent;
+        layout(location = 5) in uint joint;
 
         layout(set = 1, binding = 0, std430) readonly buffer InstanceData {
             mat4 model_matrices[];
@@ -113,6 +119,14 @@ pub mod gltf_vs {
         layout(set = 1, binding = 1, std430) readonly buffer MaterialData {
             GltfMaterial materials[];
         } materials;
+
+        // Bone palettes, laid out [instance][joint] with a fixed stride of
+        // MAX_GLTF_JOINTS. A per-model stride would save memory but would
+        // have to be threaded through the push constants, which the vertex
+        // and fragment stages must agree on byte for byte.
+        layout(set = 1, binding = 2, std430) readonly buffer PaletteData {
+            mat4 bones[];
+        } palette;
 
         layout(location = 0) out vec3 v_world_pos;
         layout(location = 1) out vec3 v_world_normal;
@@ -123,14 +137,25 @@ pub mod gltf_vs {
         void main() {
             uint instance_id = gl_InstanceIndex;
             mat4 model = instances.model_matrices[instance_id];
-            mat3 normal_matrix = transpose(inverse(mat3(model)));
 
-            vec4 world_pos = model * vec4(position, 1.0);
+            // Skinning. These models are rigidly bound (node hierarchy, one
+            // influence per vertex), so this is a single matrix, not a
+            // weighted blend — but it lives in the vertex shader so a whole
+            // body is one draw call instead of one per bone.
+            mat4 skin = palette.bones[instance_id * 256u + joint];
+            mat4 model_skinned = model * skin;
+
+            mat3 normal_matrix = transpose(inverse(mat3(model_skinned)));
+
+            vec4 world_pos = model_skinned * vec4(position, 1.0);
             v_world_pos = world_pos.xyz;
             v_world_normal = normalize(normal_matrix * normal);
             v_uv = uv;
             v_color = color;
-            v_tangent = tangent;
+            v_tangent = vec4(
+                normalize((model_skinned * vec4(tangent.xyz, 0.0)).xyz),
+                tangent.w
+            );
 
             gl_Position = push_constants.view_proj * world_pos;
         }
@@ -370,6 +395,8 @@ pub(crate) struct RenderStateShared {
     pub gltf_material_buffer_id: Option<Id<Buffer>>,
     /// GLTF instance buffer (model matrices)
     pub gltf_instance_buffer_id: Option<Id<Buffer>>,
+    /// Bone palettes, laid out `[instance][MAX_GLTF_JOINTS]`.
+    pub gltf_palette_buffer_id: Option<Id<Buffer>>,
     /// Number of GLTF instances to draw
     pub gltf_instance_count: u32,
     /// Per-primitive GLTF draws for the current frame (built by sync).
@@ -419,6 +446,8 @@ pub(crate) struct FrameData {
     pub gltf_instance_buffer_id: Id<Buffer>,
     pub gltf_instance_count: u32,
     pub gltf_material_buffer_id: Id<Buffer>,
+    /// Bone palette storage buffer, bound alongside the instance matrices.
+    pub gltf_palette_buffer_id: Id<Buffer>,
     /// GLTF primitive draws for this frame
     pub gltf_draws: Vec<GltfDrawCall>,
 }
@@ -672,6 +701,8 @@ pub struct RenderState {
     pub(crate) index_buffer_id: Id<Buffer>,
     pub(crate) gltf_vertex_buffer_id: Id<Buffer>,
     pub(crate) gltf_index_buffer_id: Id<Buffer>,
+    /// Bone palettes, `[instance][MAX_GLTF_JOINTS]`.
+    pub(crate) gltf_palette_buffer_id: Id<Buffer>,
     pub(crate) depth_image_id: Id<Image>,
     pub(crate) virtual_swapchain_id: Id<Swapchain>,
     pub(crate) virtual_depth_id: Id<Image>,
@@ -746,15 +777,18 @@ pub(crate) fn upload_gltf_writes(
     index_buffer_id: Id<Buffer>,
     material_buffer_id: Id<Buffer>,
     instance_buffer_id: Id<Buffer>,
+    palette_buffer_id: Id<Buffer>,
     vertex_writes: &[PendingWrite<GltfGpuVertex>],
     index_writes: &[PendingWrite<u32>],
     material_writes: &[PendingWrite<crate::gltf::GltfGpuMaterial>],
     instance_writes: &[PendingWrite<Mat4>],
+    palette_writes: &[PendingWrite<Mat4>],
 ) {
     if vertex_writes.is_empty()
         && index_writes.is_empty()
         && material_writes.is_empty()
         && instance_writes.is_empty()
+        && palette_writes.is_empty()
     {
         return;
     }
@@ -795,6 +829,11 @@ pub(crate) fn upload_gltf_writes(
                     tcx.try_write_buffer::<[Mat4]>(instance_buffer_id, write.offset_bytes..end)?
                         .copy_from_slice(&write.data);
                 }
+                for write in palette_writes {
+                    let end = write.offset_bytes + (write.data.len() * size_of::<Mat4>()) as u64;
+                    tcx.try_write_buffer::<[Mat4]>(palette_buffer_id, write.offset_bytes..end)?
+                        .copy_from_slice(&write.data);
+                }
                 Ok(())
             },
             [
@@ -802,6 +841,7 @@ pub(crate) fn upload_gltf_writes(
                 (index_buffer_id, HostAccessType::Write),
                 (material_buffer_id, HostAccessType::Write),
                 (instance_buffer_id, HostAccessType::Write),
+                (palette_buffer_id, HostAccessType::Write),
             ],
             [],
             [],
@@ -943,6 +983,35 @@ pub(super) fn setup_renderer(
         )
         .unwrap();
 
+    // Bone palette buffer: `[instance][MAX_GLTF_JOINTS]` matrices. 256 joints
+    // per instance at 64 bytes is 16 KiB, so even the full 1024-instance
+    // budget would be 16 MiB — but far fewer instances carry a skeleton, and
+    // the buffer is sized for what actually draws.
+    const MAX_PALETTE_INSTANCES: u32 = 64;
+    let gltf_palette_buffer_size =
+        size_of::<Mat4>() as u64 * MAX_GLTF_JOINTS * MAX_PALETTE_INSTANCES as u64;
+    let gltf_palette_layout = DeviceLayout::new(
+        NonZero::new(gltf_palette_buffer_size).unwrap(),
+        DeviceAlignment::new(align_of::<Mat4>() as u64).unwrap(),
+    )
+    .expect("gltf palette buffer layout exceeds device limits");
+
+    let gltf_palette_buffer_id = vk
+        .resources
+        .create_buffer(
+            &BufferCreateInfo {
+                usage: BufferUsage::STORAGE_BUFFER,
+                ..Default::default()
+            },
+            &AllocationCreateInfo {
+                memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE
+                    | MemoryTypeFilter::PREFER_DEVICE,
+                ..Default::default()
+            },
+            gltf_palette_layout,
+        )
+        .unwrap();
+
     // Dedicated GLTF vertex/index buffers (GltfGpuVertex stride differs from ChunkVertex)
     let gltf_vertex_buffer_size: DeviceSize = MAX_GLTF_VERTICES * size_of::<GltfGpuVertex>() as u64;
     let gltf_index_buffer_size: DeviceSize = MAX_GLTF_INDICES * size_of::<u32>() as u64;
@@ -1006,6 +1075,7 @@ pub(super) fn setup_renderer(
         gltf_pipeline_blend_nocull: None,
         gltf_material_buffer_id: Some(gltf_material_buffer_id),
         gltf_instance_buffer_id: Some(gltf_instance_buffer_id),
+        gltf_palette_buffer_id: Some(gltf_palette_buffer_id),
         gltf_instance_count: 0,
         gltf_draws: Vec::new(),
         gltf_descriptors: None,
@@ -1029,6 +1099,7 @@ pub(super) fn setup_renderer(
     task_graph.add_host_buffer_access(gltf_index_buffer_id, HostAccessType::Write);
     task_graph.add_host_buffer_access(gltf_material_buffer_id, HostAccessType::Write);
     task_graph.add_host_buffer_access(gltf_instance_buffer_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(gltf_palette_buffer_id, HostAccessType::Write);
     let compute_task = super::effects_gpu::EffectComputeTask {
         shared: Arc::clone(&shared),
         arena_id: effect_arena_id,
@@ -1120,6 +1191,7 @@ pub(super) fn setup_renderer(
         .buffer_access(gltf_index_buffer_id, AccessTypes::INDEX_READ)
         .buffer_access(gltf_material_buffer_id, effect_storage_access())
         .buffer_access(gltf_instance_buffer_id, effect_storage_access())
+        .buffer_access(gltf_palette_buffer_id, effect_storage_access())
         .build();
 
     // GLTF draws after chunks
@@ -1233,6 +1305,15 @@ pub(super) fn setup_renderer(
                     binding: 1,
                     descriptor_count: 1,
                     stages: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                    ..DescriptorSetLayoutBinding::new(
+                        vulkano::descriptor_set::layout::DescriptorType::StorageBuffer,
+                    )
+                },
+                // Bone palettes, read by the vertex shader only.
+                DescriptorSetLayoutBinding {
+                    binding: 2,
+                    descriptor_count: 1,
+                    stages: ShaderStages::VERTEX,
                     ..DescriptorSetLayoutBinding::new(
                         vulkano::descriptor_set::layout::DescriptorType::StorageBuffer,
                     )
@@ -1358,12 +1439,19 @@ pub(super) fn setup_renderer(
             offset: 0,
             range: None,
         };
+        let palette_buf = vk.resources.buffer(gltf_palette_buffer_id).buffer().clone();
+        let palette_info = DescriptorBufferInfo {
+            buffer: Some(&palette_buf),
+            offset: 0,
+            range: None,
+        };
         match DescriptorSet::new(
             &allocator,
             &gltf_local_layout,
             &[
                 WriteDescriptorSet::buffer(0, &instance_info),
                 WriteDescriptorSet::buffer(1, &material_info),
+                WriteDescriptorSet::buffer(2, &palette_info),
             ],
             &[],
         ) {
@@ -1387,6 +1475,7 @@ pub(super) fn setup_renderer(
         index_buffer_id,
         gltf_vertex_buffer_id,
         gltf_index_buffer_id,
+        gltf_palette_buffer_id,
         depth_image_id,
         virtual_swapchain_id,
         virtual_depth_id,
@@ -1514,6 +1603,7 @@ pub(super) fn render_frame(
             shared.gltf_draws.clone(),
         )
     };
+    let gltf_palette_buffer_id = render_state.gltf_palette_buffer_id;
 
     let frame = FrameData {
         frame_index: render_state.frame_index,
@@ -1536,6 +1626,7 @@ pub(super) fn render_frame(
         gltf_instance_buffer_id,
         gltf_instance_count,
         gltf_material_buffer_id,
+        gltf_palette_buffer_id,
         gltf_draws,
     };
     render_state.frame_index = render_state.frame_index.wrapping_add(1);

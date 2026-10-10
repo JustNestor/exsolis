@@ -6,13 +6,15 @@
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
-use bevy_log::{info, warn};
+use bevy_log::{debug, info, warn};
+use bevy_time::Time;
 use bevy_transform::prelude::{GlobalTransform, Transform};
 use exsolis_common::ServerMessage;
 use vulkano::buffer::BufferContents;
 use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano_taskgraph::descriptor_set::SampledImageId;
 
+use crate::anim::{Animator, ClipRole, Skeleton, Transform as JointTransform};
 use crate::{
     assets::{AssetCacheChanged, AssetHandlerRegistry, AssetLoader, LoadedAsset},
     mesh::ChunkVertex,
@@ -81,6 +83,13 @@ pub struct GltfGpuVertex {
     pub color: [f32; 4],
     #[format(R32G32B32A32_SFLOAT)]
     pub tangent: [f32; 4], // xyz = tangent, w = bitangent sign
+    /// Bone palette index. These models use node hierarchies with rigid
+    /// binding rather than linear blend skinning, so every vertex has
+    /// exactly one influence — but it is carried per *vertex* rather than
+    /// per primitive because that is what lets a whole body merge into a
+    /// single draw call.
+    #[format(R32_UINT)]
+    pub joint: u32,
 }
 
 /// GPU-side mesh representation uploaded to vertex/index buffers.
@@ -645,6 +654,7 @@ pub fn gltf_vertices_to_gpu_vertices(
             uv: v.uv,
             color: v.color,
             tangent: tangents[i],
+            joint: v.joint as u32,
         })
         .collect()
 }
@@ -839,6 +849,10 @@ pub struct ModelEntityId(pub u64);
 #[derive(Resource, Default)]
 pub struct GltfModels {
     pub uploaded: std::collections::HashMap<String, UploadedGltf>,
+    /// Joints and clips per model, kept out of `uploaded` because they are
+    /// immutable after load and are read every frame by the palette
+    /// composition (which holds a shared borrow of `uploaded` at the time).
+    pub skeletons: std::collections::HashMap<String, Skeleton>,
     pub pending_paths: std::collections::HashSet<String>,
     /// `TextureManager::generation` textures were last uploaded into.
     pub texture_generation: u64,
@@ -911,6 +925,7 @@ pub fn upload_gltf_assets(
         if let Some(old) = models.uploaded.remove(path) {
             render_state.gltf_allocator.free(old.mesh.allocation);
         }
+        models.skeletons.remove(path);
     }
     if !changed_glb.is_empty() {
         // Textures are re-uploaded below; the old bindless ids are retained
@@ -928,6 +943,45 @@ pub fn upload_gltf_assets(
         let Some(asset) = assets.get::<GltfAsset>(path) else {
             continue;
         };
+        // Keep the skeleton alongside the uploaded mesh, and stamp clip
+        // roles from the authoritative manifest for this model.
+        if let Some(skeleton) = &asset.skeleton {
+            let mut skeleton = skeleton.clone();
+            let manifest: Vec<(String, ClipRole)> = crate::anim::builtin_roles(path)
+                .iter()
+                .map(|(key, role)| {
+                    (
+                        key.rsplit('#')
+                            .next()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap_or(0)
+                            .to_string(),
+                        *role,
+                    )
+                })
+                .collect();
+            if manifest.is_empty() {
+                debug!(
+                    "gltf {path}: no clip manifest, {} clip(s) classified structurally",
+                    skeleton.clips.len()
+                );
+            } else {
+                crate::anim::apply_manifest(&mut skeleton.clips, &manifest);
+            }
+            info!(
+                "gltf {path}: {} joints, {} clips ({})",
+                skeleton.joints.len(),
+                skeleton.clips.len(),
+                skeleton
+                    .clips
+                    .iter()
+                    .map(|c| c.role.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            models.skeletons.insert(path.clone(), skeleton);
+        }
         let indices = textures.load_gltf_textures(&vk, &asset.model.textures);
         let ok = indices.iter().filter(|i| i.is_some()).count();
         if ok < indices.len() {
@@ -1024,28 +1078,34 @@ pub fn upload_gltf_assets(
         render_state.gltf_index_buffer_id,
         material_buf,
         instance_buf,
+        render_state.gltf_palette_buffer_id,
         &vertex_writes,
         &index_writes,
         &material_writes,
+        &[],
         &[],
     );
     models.texture_generation = textures.generation;
 }
 
-/// Collect `GltfModelInstance` transforms into the instance buffer and stage
-/// per-primitive draws for the frame. Instances whose model is not uploaded
-/// (still downloading, failed, or skipped) are skipped with a one-time warn.
+/// Collect `GltfModelInstance` transforms into the instance buffer, sample
+/// each animated instance's bone palette, and stage per-primitive draws for
+/// the frame. Instances whose model is not uploaded (still downloading,
+/// failed, or skipped) are skipped with a one-time warn.
 pub fn sync_gltf_instances(
     vk: Option<Res<VulkanContext>>,
     render_state: Option<ResMut<RenderState>>,
     mut models: ResMut<GltfModels>,
-    instances: Query<(&GltfModelInstance, &GlobalTransform)>,
+    mut instances: Query<(&GltfModelInstance, &GlobalTransform, Option<&mut Animator>)>,
+    time: Res<Time>,
 ) {
     let (Some(vk), Some(mut render_state)) = (vk, render_state) else {
         return;
     };
 
-    for (instance, _) in instances.iter() {
+    let dt = time.delta_secs();
+
+    for (instance, _, _) in instances.iter() {
         if !models.uploaded.contains_key(&instance.model_path)
             && models.warned_missing.insert(instance.model_path.clone())
         {
@@ -1061,11 +1121,30 @@ pub fn sync_gltf_instances(
     paths.sort();
 
     let mut matrices: Vec<glam::Mat4> = Vec::new();
+    let mut palette: Vec<glam::Mat4> = Vec::new();
     let mut draws: Vec<GltfDrawCall> = Vec::new();
+    // Scratch reused across instances: composing a palette allocates three
+    // vectors per joint, and doing that per entity per frame is the single
+    // easiest way to make this path allocate.
+    let mut locals = Vec::new();
+    let mut worlds = Vec::new();
+    let mut bones = Vec::new();
+    let mut scratch = Vec::new();
+
     for path in paths {
-        let uploaded = &models.uploaded[path];
+        // The borrow of `models.uploaded` has to end before the animator is
+        // mutated below, so take the two pieces apart first.
+        let (mesh, materials, material_base) = {
+            let uploaded = &models.uploaded[path];
+            (
+                uploaded.mesh.clone(),
+                uploaded.materials.clone(),
+                uploaded.material_base,
+            )
+        };
+        let skeleton = models.skeletons.get(path).cloned();
         let first_instance = matrices.len() as u32;
-        for (instance, transform) in instances.iter() {
+        for (instance, transform, animator) in instances.iter_mut() {
             if instance.model_path != *path {
                 continue;
             }
@@ -1074,23 +1153,33 @@ pub fn sync_gltf_instances(
                 break;
             }
             matrices.push(transform.to_matrix());
+            push_palette(
+                skeleton.as_ref(),
+                animator,
+                dt,
+                &mut locals,
+                &mut worlds,
+                &mut bones,
+                &mut scratch,
+                &mut palette,
+            );
         }
         let instance_count = matrices.len() as u32 - first_instance;
         if instance_count == 0 {
             continue;
         }
-        for prim in &uploaded.mesh.primitives {
-            let mat = uploaded.materials.get(prim.material_index);
+        for prim in &mesh.primitives {
+            let mat = materials.get(prim.material_index);
             let double_sided = mat.is_some_and(|m| m.double_sided != 0);
             let alpha_blend = mat.is_some_and(|m| m.alpha_mode == 2);
             draws.push(GltfDrawCall {
                 index_count: prim.index_count,
-                first_index: uploaded.mesh.allocation.first_index() + prim.first_index,
+                first_index: mesh.allocation.first_index() + prim.first_index,
                 // Indices are pre-offset to model-global at upload, so only
                 // the allocation base applies here (adding prim.vertex_offset
                 // again double-counts and scatters multi-primitive models).
-                vertex_offset: uploaded.mesh.allocation.vertex_offset(),
-                material_index: uploaded.material_base + prim.material_index as u32,
+                vertex_offset: mesh.allocation.vertex_offset(),
+                material_index: material_base + prim.material_index as u32,
                 first_instance,
                 instance_count,
                 double_sided,
@@ -1111,12 +1200,21 @@ pub fn sync_gltf_instances(
     if matrices.is_empty() {
         return;
     }
+    let palette_writes = if palette.is_empty() {
+        Vec::new()
+    } else {
+        vec![PendingWrite {
+            offset_bytes: 0,
+            data: palette,
+        }]
+    };
     upload_gltf_writes(
         &vk,
         render_state.gltf_vertex_buffer_id,
         render_state.gltf_index_buffer_id,
         material_buf,
         instance_buf,
+        render_state.gltf_palette_buffer_id,
         &[],
         &[],
         &[],
@@ -1124,7 +1222,103 @@ pub fn sync_gltf_instances(
             offset_bytes: 0,
             data: matrices,
         }],
+        &palette_writes,
     );
+}
+
+/// Bones per instance row in the palette buffer. Must match the stride
+/// hardcoded in the glTF vertex shader.
+const PALETTE_STRIDE: usize = 256;
+
+/// Compose one instance's bone palette row.
+///
+/// The row is always [`PALETTE_STRIDE`] matrices so the shader's
+/// `[instance * STRIDE + joint]` indexing works for models of any joint
+/// count. Models without a skeleton get an identity row, which leaves them
+/// exactly where they were before skinning existed.
+#[allow(clippy::too_many_arguments)]
+fn push_palette(
+    skeleton: Option<&Skeleton>,
+    animator: Option<Mut<Animator>>,
+    dt: f32,
+    locals: &mut Vec<JointTransform>,
+    worlds: &mut Vec<glam::Mat4>,
+    bones: &mut Vec<glam::Mat4>,
+    scratch: &mut Vec<JointTransform>,
+    out: &mut Vec<glam::Mat4>,
+) {
+    let Some(skeleton) = skeleton else {
+        out.resize(out.len() + PALETTE_STRIDE, glam::Mat4::IDENTITY);
+        return;
+    };
+    let joint_count = skeleton.joints.len();
+
+    locals.clear();
+    locals.resize(joint_count, JointTransform::default());
+    worlds.clear();
+    worlds.resize(joint_count, glam::Mat4::IDENTITY);
+    bones.clear();
+    bones.resize(joint_count, glam::Mat4::IDENTITY);
+
+    match animator {
+        Some(mut animator) => {
+            let animator: &mut Animator = &mut animator;
+            // Locomotion comes from the server's authoritative speed rather
+            // than from differencing client-side positions: those arrive on
+            // the unreliable channel, and a dropped update would flicker the
+            // walk/run blend.
+            if let Some(clip) = skeleton.locomotion_for_speed(animator.speed) {
+                let transition = skeleton.transition(animator.current.clip, clip);
+                animator.play(clip, transition);
+            }
+            let rate = playback_rate(skeleton, animator.current.clip, animator.speed);
+            animator.advance(dt, rate);
+            skeleton.sample(animator.current.clip, animator.current.time, locals);
+
+            // A masked cross-fade needs the outgoing clip's pose and the
+            // weight it still carries.
+            let blend = animator.previous.and_then(|prev| {
+                let transition = skeleton.transition(prev.clip, animator.current.clip);
+                animator
+                    .previous_weight(transition.duration)
+                    .map(|weight| (prev.clip, prev.time, transition, weight))
+            });
+            skeleton.compose_blend(locals, blend, worlds, bones, scratch);
+        }
+        None => {
+            // No animator on this entity: rest pose.
+            for (slot, joint) in locals.iter_mut().zip(skeleton.joints.iter()) {
+                *slot = joint.rest_local;
+            }
+            skeleton.compose_palette(locals, worlds, bones);
+        }
+    }
+
+    let start = out.len();
+    out.resize(start + PALETTE_STRIDE, glam::Mat4::IDENTITY);
+    let used = bones.len().min(PALETTE_STRIDE);
+    out[start..start + used].copy_from_slice(&bones[..used]);
+}
+
+/// Playback rate that matches the clip's footfall cadence to the
+/// authoritative movement speed.
+///
+/// A clip authored at some natural stride plays back faster when the entity
+/// moves faster; the vertical bob and footfall timing are preserved because
+/// the whole clip is scaled rather than just its translation.
+fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32) -> f32 {
+    let natural = skeleton
+        .clips
+        .get(clip as usize)
+        .map(|c| c.natural_speed)
+        .unwrap_or(0.0);
+    // In-place clips (no horizontal root motion) play at a fixed cadence
+    // rather than dividing by zero.
+    const IN_PLACE_RATE: f32 = 1.0;
+    if natural <= f32::EPSILON {
+        return IN_PLACE_RATE;
+    }
+    (speed / natural).clamp(0.25, 4.0)
 }
 
 /// TEMPORARY test API: spawn/despawn model entities from server messages.
