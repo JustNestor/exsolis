@@ -397,6 +397,10 @@ pub(crate) struct RenderStateShared {
     pub gltf_instance_buffer_id: Option<Id<Buffer>>,
     /// Bone palettes, laid out `[instance][MAX_GLTF_JOINTS]`.
     pub gltf_palette_buffer_id: Option<Id<Buffer>>,
+    /// First-person arms: draws + live instance count, staged by
+    /// `sync_gltf_instances` like the world model draws.
+    pub viewmodel_draws: Vec<GltfDrawCall>,
+    pub viewmodel_instance_count: u32,
     /// Number of GLTF instances to draw
     pub gltf_instance_count: u32,
     /// Per-primitive GLTF draws for the current frame (built by sync).
@@ -449,6 +453,15 @@ pub(crate) struct FrameData {
     pub gltf_palette_buffer_id: Id<Buffer>,
     /// GLTF primitive draws for this frame
     pub gltf_draws: Vec<GltfDrawCall>,
+    /// First-person arms. Drawn in their own pass against their own depth
+    /// buffer with a much shorter near/far range, so the hands can never
+    /// clip into a wall the player is standing against.
+    pub viewmodel_draws: Vec<GltfDrawCall>,
+    pub viewmodel_instance_count: u32,
+    /// Projection for the viewmodel pass: same orientation as the world
+    /// camera but a 0.01..0.6 range so the arms are not clipped by the
+    /// world near plane and never intersect world geometry.
+    pub viewmodel_view_proj: Mat4,
 }
 
 struct ChunkRenderTask {
@@ -570,13 +583,22 @@ struct GltfRenderTask {
     virtual_swapchain_id: Id<Swapchain>,
     virtual_depth_id: Id<Image>,
     shared: Arc<RwLock<RenderStateShared>>,
+    /// Draw the first-person arms against this task's own depth buffer
+    /// instead of the world one.
+    viewmodel: bool,
 }
 
 impl Task for GltfRenderTask {
     type World = FrameData;
 
-    fn clear_values(&self, _clear_values: &mut ClearValues<'_>, _world: &Self::World) {
-        // No clears - we draw on top of the existing framebuffer
+    fn clear_values(&self, clear_values: &mut ClearValues<'_>, _world: &Self::World) {
+        if self.viewmodel {
+            // A dedicated depth buffer, cleared once. The arms are the only
+            // thing in it, so they can never intersect world geometry — the
+            // usual first-person clipping problem does not exist.
+            clear_values.set(self.virtual_depth_id, ClearValue::Depth(0.0));
+        }
+        // Color is never cleared here: the world pass has already drawn it.
     }
 
     unsafe fn execute(
@@ -585,7 +607,20 @@ impl Task for GltfRenderTask {
         _tcx: &mut TaskContext<'_>,
         world: &Self::World,
     ) -> TaskResult {
-        if world.gltf_draws.is_empty() || world.gltf_instance_count == 0 {
+        let (draws, instance_count, view_proj) = if self.viewmodel {
+            (
+                &world.viewmodel_draws,
+                world.viewmodel_instance_count,
+                world.viewmodel_view_proj,
+            )
+        } else {
+            (
+                &world.gltf_draws,
+                world.gltf_instance_count,
+                world.view_proj,
+            )
+        };
+        if draws.is_empty() || instance_count == 0 {
             return Ok(());
         }
 
@@ -641,8 +676,7 @@ impl Task for GltfRenderTask {
                     (true, true) => pipeline_blend_nocull,
                 };
                 cbf.bind_pipeline(pipe);
-                for draw in world
-                    .gltf_draws
+                for draw in draws
                     .iter()
                     .filter(|d| d.double_sided == double_sided && d.alpha_blend == blend)
                 {
@@ -650,7 +684,7 @@ impl Task for GltfRenderTask {
                         pipe.layout(),
                         0,
                         &gltf_vs::PushConstants {
-                            view_proj: world.view_proj.to_cols_array_2d(),
+                            view_proj: view_proj.to_cols_array_2d(),
                             pixel_sampler_id: world.pixel_sampler_id,
                             linear_sampler_id: world.linear_sampler_id,
                             camera_position: [
@@ -1060,6 +1094,8 @@ pub(super) fn setup_renderer(
         gltf_material_buffer_id: Some(gltf_material_buffer_id),
         gltf_instance_buffer_id: Some(gltf_instance_buffer_id),
         gltf_palette_buffer_id: Some(gltf_palette_buffer_id),
+        viewmodel_draws: Vec::new(),
+        viewmodel_instance_count: 0,
         gltf_instance_count: 0,
         gltf_draws: Vec::new(),
         gltf_descriptors: None,
@@ -1145,6 +1181,7 @@ pub(super) fn setup_renderer(
         virtual_swapchain_id,
         virtual_depth_id,
         shared: Arc::clone(&shared),
+        viewmodel: false,
     };
     let mut gltf_node = task_graph.create_task_node(
         "GltfModels",
@@ -1180,6 +1217,57 @@ pub(super) fn setup_renderer(
 
     // GLTF draws after chunks
     task_graph.add_edge(chunk_node_id, gltf_node_id).unwrap();
+
+    // First-person viewmodel: its own depth buffer, cleared at the start of
+    // the pass. The hands share the world colour target and the world
+    // geometry buffers, but nothing in the world can occlude them and they
+    // can never occlude the world either.
+    let virtual_viewmodel_depth_id = task_graph.add_image(&ImageCreateInfo {
+        format: Format::D32_SFLOAT,
+        ..Default::default()
+    });
+    let viewmodel_task = GltfRenderTask {
+        vertex_buffer_id: gltf_vertex_buffer_id,
+        index_buffer_id: gltf_index_buffer_id,
+        virtual_swapchain_id,
+        virtual_depth_id: virtual_viewmodel_depth_id,
+        shared: Arc::clone(&shared),
+        viewmodel: true,
+    };
+    let mut viewmodel_node = task_graph.create_task_node(
+        "Viewmodel",
+        vulkano_taskgraph::QueueFamilyType::Graphics,
+        viewmodel_task,
+    );
+    let viewmodel_node_id = viewmodel_node
+        .framebuffer(virtual_framebuffer_id)
+        .color_attachment(
+            virtual_swapchain_id.current_image_id(),
+            AccessTypes::COLOR_ATTACHMENT_WRITE,
+            Optimal,
+            &AttachmentInfo {
+                clear: false,
+                ..Default::default()
+            },
+        )
+        .depth_stencil_attachment(
+            virtual_viewmodel_depth_id,
+            AccessTypes::DEPTH_STENCIL_ATTACHMENT_WRITE,
+            Optimal,
+            &AttachmentInfo {
+                clear: true,
+                ..Default::default()
+            },
+        )
+        .buffer_access(gltf_vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
+        .buffer_access(gltf_index_buffer_id, AccessTypes::INDEX_READ)
+        .buffer_access(gltf_material_buffer_id, effect_storage_access())
+        .buffer_access(gltf_instance_buffer_id, effect_storage_access())
+        .buffer_access(gltf_palette_buffer_id, effect_storage_access())
+        .build();
+    task_graph
+        .add_edge(gltf_node_id, viewmodel_node_id)
+        .unwrap();
 
     let task_graph = unsafe {
         task_graph
@@ -1596,6 +1684,21 @@ pub(super) fn render_frame(
         )
     };
     let gltf_palette_buffer_id = render_state.gltf_palette_buffer_id;
+    let (viewmodel_draws, viewmodel_instance_count) = {
+        let shared = render_state.shared.read().unwrap();
+        (
+            shared.viewmodel_draws.clone(),
+            shared.viewmodel_instance_count,
+        )
+    };
+    // Same orientation as the world camera, but a short depth range so the
+    // hands sit comfortably in front of everything and are never clipped by
+    // the world near plane.
+    let viewmodel_view_proj = camera
+        .iter()
+        .next()
+        .map(|(transform, cam)| cam.view_projection_range(transform, aspect, 0.01, 0.6))
+        .unwrap_or(Mat4::IDENTITY);
 
     let frame = FrameData {
         frame_index: render_state.frame_index,
@@ -1619,6 +1722,9 @@ pub(super) fn render_frame(
         gltf_material_buffer_id,
         gltf_palette_buffer_id,
         gltf_draws,
+        viewmodel_draws,
+        viewmodel_instance_count,
+        viewmodel_view_proj,
     };
     render_state.frame_index = render_state.frame_index.wrapping_add(1);
 

@@ -25,12 +25,10 @@ use exsolis_common::{
     ServerMessage,
 };
 
-/// Model path used for every player avatar. A catalog asset path, so the
-/// client resolves it through the same pak download as any other model.
-pub const PLAYER_MODEL: &str = "models/girl.glb";
-/// The girl model is authored around a ~2.5 unit tall figure with its feet
-/// near y=0; scale it to the ~1.8 block player height.
-pub const PLAYER_MODEL_SCALE: f32 = 0.72;
+/// Model path used for every player avatar, and the scale that makes it the
+/// right size. Declared in the lib because the client needs the same pair to
+/// build the local first-person viewmodel.
+pub use exsolis_server::{PLAYER_MODEL, PLAYER_MODEL_SCALE};
 
 /// Upper bound on live entities. Bounded so a mod that spawns in a loop
 /// cannot exhaust memory or flood the reliable channel; hitting it drops the
@@ -276,6 +274,7 @@ pub fn spawn_requested(
             state: req.state,
             model,
             scale,
+            player_id: req.player_token,
         }));
     }
 }
@@ -342,13 +341,18 @@ fn sync_player_entities(
         state.yaw = look.yaw;
         state.pitch = look.pitch;
         // Exponential smoothing: the raw per-tick delta is far too spiky to
-        // drive a clip blend directly.
+        // drive a clip blend directly. Must match `SPEED_SMOOTHING` in the
+        // client's `player::drive_local_animator`, or the local player's
+        // hands and everyone else's avatars would cross the walk/run
+        // threshold at different speeds.
+        const SPEED_SMOOTHING: f32 = 8.0;
         let instant = if now > f32::EPSILON {
             horizontal.length() / now
         } else {
-            0.0
+            state.speed
         };
-        state.speed = state.speed + (instant - state.speed) * 0.35;
+        let alpha = (1.0 - (-SPEED_SMOOTHING * now).exp()).clamp(0.0, 1.0);
+        state.speed += (instant - state.speed) * alpha;
         // No gravity/ground query yet; the client treats a large downward
         // step between updates as airborne, so leave this false here rather
         // than guessing.

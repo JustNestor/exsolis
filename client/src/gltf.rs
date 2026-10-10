@@ -838,6 +838,12 @@ pub struct GltfModelInstance {
     /// Uniform scale applied to every instance of this model. Set from the
     /// server's `SpawnEntity` so a mod can spawn a giant duck.
     pub scale: f32,
+    /// Draw this instance's arms as a first-person viewmodel instead of as
+    /// part of the body. Only meaningful for the local player.
+    pub first_person: bool,
+    /// Where the viewmodel instance is placed relative to the eye. Ignored
+    /// unless `first_person` is set.
+    pub viewmodel_offset: glam::Vec3,
 }
 
 impl GltfModelInstance {
@@ -845,11 +851,21 @@ impl GltfModelInstance {
         Self {
             model_path: model_path.into(),
             scale: 1.0,
+            first_person: false,
+            viewmodel_offset: glam::Vec3::ZERO,
         }
     }
 
     pub fn with_scale(mut self, scale: f32) -> Self {
         self.scale = scale;
+        self
+    }
+
+    /// Draw this instance's arms as a first-person viewmodel instead of as
+    /// part of the body.
+    pub fn first_person(mut self, offset: glam::Vec3) -> Self {
+        self.first_person = true;
+        self.viewmodel_offset = offset;
         self
     }
 }
@@ -875,6 +891,9 @@ pub struct GltfModels {
     /// immutable after load and are read every frame by the palette
     /// composition (which holds a shared borrow of `uploaded` at the time).
     pub skeletons: std::collections::HashMap<String, Skeleton>,
+    /// Arms-only meshes, keyed by the same asset path as `uploaded`. These
+    /// reuse the body's materials, so they carry no material of their own.
+    pub viewmodels: std::collections::HashMap<String, GltfGpuMesh>,
     pub pending_paths: std::collections::HashSet<String>,
     /// `TextureManager::generation` textures were last uploaded into.
     pub texture_generation: u64,
@@ -948,6 +967,9 @@ pub fn upload_gltf_assets(
             render_state.gltf_allocator.free(old.mesh.allocation);
         }
         models.skeletons.remove(path);
+        if let Some(old) = models.viewmodels.remove(path) {
+            render_state.gltf_allocator.free(old.allocation);
+        }
     }
     if !changed_glb.is_empty() {
         // Textures are re-uploaded below; the old bindless ids are retained
@@ -1051,6 +1073,31 @@ pub fn upload_gltf_assets(
                         material_base: 0, // assigned below
                     },
                 );
+
+                // The first-person viewmodel reuses the body's materials, so
+                // it has none of its own and must borrow the base assigned
+                // below. A model without arms simply gets no viewmodel.
+                if let Some(viewmodel) = &asset.viewmodel {
+                    match upload_gltf_model(&mut render_state.gltf_allocator, viewmodel, &indices) {
+                        Ok(vm) => {
+                            info!("gltf {path}: viewmodel {} verts", vm.vertices.len());
+                            let offset_v = vm.mesh.allocation.vertex_slot() as u64
+                                * std::mem::size_of::<GltfGpuVertex>() as u64;
+                            let offset_i = vm.mesh.allocation.index_slot() as u64
+                                * std::mem::size_of::<u32>() as u64;
+                            vertex_writes.push(PendingWrite {
+                                offset_bytes: offset_v,
+                                data: vm.vertices,
+                            });
+                            index_writes.push(PendingWrite {
+                                offset_bytes: offset_i,
+                                data: vm.indices,
+                            });
+                            models.viewmodels.insert(path.clone(), vm.mesh);
+                        }
+                        Err(e) => warn!("gltf viewmodel upload failed for {path}: {e}"),
+                    }
+                }
             }
             Err(e) => warn!("gltf upload failed for {path}: {e}"),
         }
@@ -1119,6 +1166,7 @@ pub fn sync_gltf_instances(
     render_state: Option<ResMut<RenderState>>,
     mut models: ResMut<GltfModels>,
     mut instances: Query<(&GltfModelInstance, &GlobalTransform, Option<&mut Animator>)>,
+    camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
     time: Res<Time>,
 ) {
     let (Some(vk), Some(mut render_state)) = (vk, render_state) else {
@@ -1126,6 +1174,16 @@ pub fn sync_gltf_instances(
     };
 
     let dt = time.delta_secs();
+
+    // The viewmodel is positioned from the eye, and faces the direction the
+    // camera looks. Its projection is built the same way in `render_frame`,
+    // so the two agree on where "in front of the camera" is.
+    let eye = camera.iter().next().map(|(transform, camera)| {
+        (
+            camera.eye_position(transform),
+            glam::Quat::from_rotation_y(camera.yaw),
+        )
+    });
 
     for (instance, _, _) in instances.iter() {
         if !models.uploaded.contains_key(&instance.model_path)
@@ -1145,6 +1203,7 @@ pub fn sync_gltf_instances(
     let mut matrices: Vec<glam::Mat4> = Vec::new();
     let mut palette: Vec<glam::Mat4> = Vec::new();
     let mut draws: Vec<GltfDrawCall> = Vec::new();
+    let mut viewmodel_draws: Vec<GltfDrawCall> = Vec::new();
     // Scratch reused across instances: composing a palette allocates three
     // vectors per joint, and doing that per entity per frame is the single
     // easiest way to make this path allocate.
@@ -1165,9 +1224,16 @@ pub fn sync_gltf_instances(
             )
         };
         let skeleton = models.skeletons.get(path).cloned();
-        let first_instance = matrices.len() as u32;
+        let viewmodel = models.viewmodels.get(path).cloned();
+
+        // Body instances and viewmodel instances are kept in separate
+        // contiguous ranges. A draw call covers a whole `first_instance ..
+        // first_instance + instance_count` range, so a first-person player
+        // sharing the body draw with everyone else would put their own body
+        // in front of the camera.
+        let body_first = matrices.len() as u32;
         for (instance, transform, animator) in instances.iter_mut() {
-            if instance.model_path != *path {
+            if instance.model_path != *path || instance.first_person {
                 continue;
             }
             if matrices.len() >= MAX_GLTF_INSTANCES {
@@ -1190,27 +1256,85 @@ pub fn sync_gltf_instances(
                 &mut palette,
             );
         }
-        let instance_count = matrices.len() as u32 - first_instance;
-        if instance_count == 0 {
-            continue;
+        let body_count = matrices.len() as u32 - body_first;
+
+        // The viewmodel instance is placed relative to the eye rather than
+        // the entity's feet, and reuses the same palette row shape so the
+        // arms animate with whatever body clip is playing.
+        let viewmodel_first = matrices.len() as u32;
+        let mut viewmodel_count = 0u32;
+        if viewmodel.is_some() {
+            for (instance, transform, animator) in instances.iter_mut() {
+                if instance.model_path != *path || !instance.first_person {
+                    continue;
+                }
+                if matrices.len() >= MAX_GLTF_INSTANCES {
+                    break;
+                }
+                matrices.push(viewmodel_matrix(
+                    transform,
+                    &instance.viewmodel_offset,
+                    instance.scale,
+                    eye,
+                ));
+                push_palette(
+                    skeleton.as_ref(),
+                    animator,
+                    dt,
+                    &mut locals,
+                    &mut worlds,
+                    &mut bones,
+                    &mut scratch,
+                    &mut palette,
+                );
+                viewmodel_count += 1;
+            }
         }
-        for prim in &mesh.primitives {
-            let mat = materials.get(prim.material_index);
-            let double_sided = mat.is_some_and(|m| m.double_sided != 0);
-            let alpha_blend = mat.is_some_and(|m| m.alpha_mode == 2);
-            draws.push(GltfDrawCall {
-                index_count: prim.index_count,
-                first_index: mesh.allocation.first_index() + prim.first_index,
-                // Indices are pre-offset to model-global at upload, so only
-                // the allocation base applies here (adding prim.vertex_offset
-                // again double-counts and scatters multi-primitive models).
-                vertex_offset: mesh.allocation.vertex_offset(),
-                material_index: material_base + prim.material_index as u32,
-                first_instance,
-                instance_count,
-                double_sided,
-                alpha_blend,
-            });
+
+        if body_count > 0 {
+            for prim in &mesh.primitives {
+                let mat = materials.get(prim.material_index);
+                let double_sided = mat.is_some_and(|m| m.double_sided != 0);
+                let alpha_blend = mat.is_some_and(|m| m.alpha_mode == 2);
+                draws.push(GltfDrawCall {
+                    index_count: prim.index_count,
+                    first_index: mesh.allocation.first_index() + prim.first_index,
+                    // Indices are pre-offset to model-global at upload, so
+                    // only the allocation base applies here (adding
+                    // prim.vertex_offset again double-counts and scatters
+                    // multi-primitive models).
+                    vertex_offset: mesh.allocation.vertex_offset(),
+                    material_index: material_base + prim.material_index as u32,
+                    first_instance: body_first,
+                    instance_count: body_count,
+                    double_sided,
+                    alpha_blend,
+                });
+            }
+        }
+        // The arms live in the same vertex/index buffers as the body, so
+        // they differ only in which instances are drawn and which depth
+        // range they are drawn against.
+        if viewmodel_count > 0
+            && let Some(viewmodel) = &viewmodel
+        {
+            for prim in &viewmodel.primitives {
+                viewmodel_draws.push(GltfDrawCall {
+                    index_count: prim.index_count,
+                    first_index: viewmodel.allocation.first_index() + prim.first_index,
+                    vertex_offset: viewmodel.allocation.vertex_offset(),
+                    // The arms share the body's material slot; the viewmodel
+                    // model deliberately carries no materials of its own.
+                    material_index: material_base + prim.material_index as u32,
+                    first_instance: viewmodel_first,
+                    instance_count: viewmodel_count,
+                    double_sided: true,
+                    alpha_blend: false,
+                });
+            }
+        }
+        if body_count == 0 && viewmodel_count == 0 {
+            continue;
         }
     }
 
@@ -1218,6 +1342,8 @@ pub fn sync_gltf_instances(
         let mut shared = render_state.shared.write().unwrap();
         shared.gltf_instance_count = matrices.len() as u32;
         shared.gltf_draws = draws;
+        shared.viewmodel_draws = viewmodel_draws;
+        shared.viewmodel_instance_count = matrices.len() as u32;
         (
             shared.gltf_instance_buffer_id.unwrap(),
             shared.gltf_material_buffer_id.unwrap(),
@@ -1255,6 +1381,31 @@ pub fn sync_gltf_instances(
 /// Bones per instance row in the palette buffer. Must match the stride
 /// hardcoded in the glTF vertex shader.
 const PALETTE_STRIDE: usize = 256;
+
+/// Where the first-person arms sit relative to the eye.
+///
+/// The arms' vertices are in model space at roughly shoulder height, so the
+/// instance origin goes slightly below and in front of the eye to bring the
+/// hands into frame. Tuned by eye; the depth range keeps them from clipping.
+fn viewmodel_matrix(
+    transform: &GlobalTransform,
+    offset: &glam::Vec3,
+    scale: f32,
+    eye: Option<(glam::Vec3, glam::Quat)>,
+) -> glam::Mat4 {
+    let (position, rotation) = match eye {
+        Some((eye, facing)) => (eye + facing * offset, facing),
+        // No camera yet (first frame): fall back to the entity's own
+        // transform so the hands appear somewhere sensible rather than at
+        // the origin.
+        None => (transform.translation() + *offset, transform.rotation()),
+    };
+    glam::Mat4::from_scale_rotation_translation(
+        glam::Vec3::splat(scale.max(0.0001)),
+        rotation,
+        position,
+    )
+}
 
 /// Compose one instance's bone palette row.
 ///

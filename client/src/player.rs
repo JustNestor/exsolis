@@ -68,6 +68,26 @@ impl FlyCamera {
         proj.y_axis.y *= -1.0;
         proj * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
     }
+
+    /// The same view with an explicit depth range.
+    ///
+    /// The first-person viewmodel uses a much shorter range than the world
+    /// (0.01..0.6 rather than 0.1..1000) so the hands have usable depth
+    /// precision right in front of the camera. The world near plane is far
+    /// too coarse for an arm held half a metre from the eye.
+    pub fn view_projection_range(
+        &self,
+        transform: &Transform,
+        aspect: f32,
+        near: f32,
+        far: f32,
+    ) -> glam::Mat4 {
+        let eye = self.eye_position(transform);
+        let forward = transform.rotation * Vec3::NEG_Z;
+        let mut proj = glam::Mat4::perspective_rh(self.fov_y, aspect, near, far);
+        proj.y_axis.y *= -1.0;
+        proj * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
+    }
 }
 
 pub struct PlayerPlugin;
@@ -96,8 +116,13 @@ fn spawn_local_player(mut commands: Commands) {
         ServerTarget::default(),
         // The local player is an entity too, so the first-person hands and a
         // third-person view of yourself go through the same avatar/animation
-        // path a remote player does.
+        // path a remote player does. `first_person` draws only the arms, in
+        // their own depth range, from in front of the camera.
         crate::anim::Animator::new(),
+        crate::gltf::GltfModelInstance::new(exsolis_server::PLAYER_MODEL)
+            .with_scale(exsolis_server::PLAYER_MODEL_SCALE)
+            .first_person(VIEWMODEL_OFFSET),
+        bevy_transform::prelude::GlobalTransform::default(),
     ));
 
     commands.spawn((
@@ -368,6 +393,11 @@ fn drive_local_animator(
         animator.look(wrap_angle(camera.yaw - body_yaw), -camera.pitch);
     }
 }
+
+/// Where the first-person arms sit relative to the eye: down and slightly
+/// forward, so the hands sit in the lower part of the frame the way a
+/// first-person arm does.
+const VIEWMODEL_OFFSET: Vec3 = Vec3::new(0.30, -0.42, -0.35);
 
 /// How fast the smoothed local speed chases the measured one. Must match
 /// `entities::sync_player_entities` on the server.
