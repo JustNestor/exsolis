@@ -19,6 +19,7 @@ use crate::anim::Animator;
 use crate::gltf::GltfModelInstance;
 use crate::net::{GameplaySet, IncomingPacket};
 use crate::player::ServerTarget;
+use crate::streaming::LocalPlayerId;
 
 /// The avatar model faces local +Z while the camera looks along -Z, so
 /// entity yaw has to be turned by PI to make the body face its direction of
@@ -110,6 +111,7 @@ fn receive_entity_messages(
     mut commands: Commands,
     mut incoming: MessageReader<IncomingPacket>,
     mut entities: ResMut<ClientEntities>,
+    local_player: Res<LocalPlayerId>,
 ) {
     for packet in incoming.read() {
         match &packet.0 {
@@ -150,7 +152,17 @@ fn receive_entity_messages(
                 }
                 // Only entities with a model draw anything; a block entity
                 // renders through its block, not a mesh.
-                if let Some(path) = model {
+                //
+                // The local player's own entity deliberately gets no body
+                // mesh: the camera sits at its eye position, so a body drawn
+                // at its feet surrounds the viewpoint and the player ends up
+                // staring at the inside of their own skull. Their avatar is
+                // the first-person viewmodel instance created at startup,
+                // which draws the arms only.
+                let is_local_player = player_id.is_some() && *player_id == local_player.0;
+                if let Some(path) = model
+                    && !is_local_player
+                {
                     commands.entity(entity).insert((
                         GltfModelInstance::new(path.clone()).with_scale(*scale),
                         GlobalTransform::default(),

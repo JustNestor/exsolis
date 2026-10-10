@@ -32,6 +32,15 @@ use crate::{
 const MAX_GLTF_MATERIALS: usize = 256;
 /// Max model instances drawn per frame (matches the instance buffer).
 const MAX_GLTF_INSTANCES: usize = 1024;
+/// Max instances that can carry a bone palette row.
+///
+/// Every instance reserves a row — including ones whose model has no
+/// skeleton — so this, not [`MAX_GLTF_INSTANCES`], is what bounds the
+/// per-frame instance loop. At 256 joints and 64 bytes a row is 16 KiB, so
+/// the palette buffer is `PALETTE_STRIDE * 64 * 16 KiB` = 256 MiB if these
+/// were equal; keeping it small is the point. The palette buffer is sized
+/// from this same constant so the two cannot drift apart.
+pub const MAX_PALETTE_INSTANCES: usize = 64;
 
 /// A loaded GLTF model containing meshes and their associated data.
 #[derive(Debug, Clone)]
@@ -1247,8 +1256,8 @@ pub fn sync_gltf_instances(
             if instance.model_path != *path || instance.first_person {
                 continue;
             }
-            if matrices.len() >= MAX_GLTF_INSTANCES {
-                warn!("gltf instance overflow ({MAX_GLTF_INSTANCES}); dropping extras");
+            if matrices.len() >= MAX_PALETTE_INSTANCES {
+                warn!("gltf instance overflow ({MAX_PALETTE_INSTANCES}); dropping extras");
                 break;
             }
             matrices.push(glam::Mat4::from_scale_rotation_translation(
@@ -1279,7 +1288,7 @@ pub fn sync_gltf_instances(
                 if instance.model_path != *path || !instance.first_person {
                     continue;
                 }
-                if matrices.len() >= MAX_GLTF_INSTANCES {
+                if matrices.len() >= MAX_PALETTE_INSTANCES {
                     break;
                 }
                 matrices.push(viewmodel_matrix(

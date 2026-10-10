@@ -688,6 +688,8 @@ mod tests {
     /// every node matrix over its primitives' accessor bounds. Guards the
     /// static bake.
     const BOUNDS: [f32; 3] = [1.3697, 3.1928, 3.1391];
+    /// Lowest point of the figure in the rest pose.
+    const BOUNDS_FLOOR: f32 = -0.0053;
 
     fn load(
         name: &str,
@@ -947,6 +949,73 @@ mod tests {
             "Tail_182",
         ] {
             assert!(!is_arm_joint(name), "{name} should not be an arm joint");
+        }
+    }
+
+    /// What the runtime actually does every frame: sample a locomotion clip
+    /// and compose its palette, then check the figure still holds together.
+    ///
+    /// This is the check that catches a bone assigning a transform to only
+    /// part of the body. Because the model is 795 separate boxes, a wrong
+    /// per-vertex bone scatters boxes rather than distorting a mesh, so a
+    /// posed figure must stay within roughly the rest pose's extent.
+    #[test]
+    fn a_walk_pose_keeps_the_figure_together() {
+        let (document, buffers, _images) = load("girl.glb");
+        let rig = Rig::build(&document, &buffers).expect("rig");
+        let skeleton = rig.skeleton.clone();
+        let (_, meshes, _) = rig.into_parts();
+        let vertices = &meshes[0].primitives[0].vertices;
+
+        let bounds = |palette: &[Mat4]| {
+            let (mut lo, mut hi) = ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]);
+            for v in vertices {
+                let p = palette[v.joint as usize].transform_point3(Vec3::from_array(v.position));
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+            (lo, hi)
+        };
+
+        let walk = skeleton
+            .clip_with_role(ClipRole::Walk)
+            .expect("the avatar has a walk clip");
+
+        for &(clip, time) in &[(walk, 0.0), (walk, 0.25), (walk, 0.5), (walk, 0.75)] {
+            let n = skeleton.joints.len();
+            let mut locals = vec![crate::anim::Transform::default(); n];
+            let mut worlds = vec![Mat4::IDENTITY; n];
+            let mut palette = vec![Mat4::IDENTITY; n];
+            skeleton.sample(clip, time, &mut locals);
+            skeleton.compose_palette(&locals, &mut worlds, &mut palette);
+
+            for (i, m) in palette.iter().enumerate() {
+                assert!(
+                    m.to_cols_array().iter().all(|c| c.is_finite()),
+                    "clip {clip} t={time}: bone {i} ({}) has a non-finite matrix",
+                    skeleton.joints[i].name
+                );
+            }
+
+            let (lo, hi) = bounds(&palette);
+            let size = [hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]];
+            for axis in 0..3 {
+                assert!(
+                    size[axis] < BOUNDS[axis] * 1.5 && size[axis] > BOUNDS[axis] * 0.5,
+                    "clip {clip} t={time}: axis {axis} is {:.3}, rest is {:.3} — \
+                     the pose is exploding or collapsing",
+                    size[axis],
+                    BOUNDS[axis]
+                );
+            }
+            // And the feet must not sink through the floor or levitate.
+            assert!(
+                lo[1] > BOUNDS_FLOOR - 0.5 && lo[1] < BOUNDS_FLOOR + 0.5,
+                "clip {clip} t={time}: feet at y={:.3}, expected near {BOUNDS_FLOOR}",
+                lo[1]
+            );
         }
     }
 

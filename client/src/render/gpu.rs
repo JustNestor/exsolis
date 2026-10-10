@@ -1029,13 +1029,11 @@ pub(super) fn setup_renderer(
         )
         .unwrap();
 
-    // Bone palette buffer: `[instance][MAX_GLTF_JOINTS]` matrices. 256 joints
-    // per instance at 64 bytes is 16 KiB, so even the full 1024-instance
-    // budget would be 16 MiB — but far fewer instances carry a skeleton, and
-    // the buffer is sized for what actually draws.
-    const MAX_PALETTE_INSTANCES: u32 = 64;
+    // Bone palette buffer: `[instance][MAX_GLTF_JOINTS]` matrices, sized from
+    // the same constant the per-frame instance loop is bounded by so the two
+    // can never disagree about how many rows exist.
     let gltf_palette_buffer_size =
-        size_of::<Mat4>() as u64 * MAX_GLTF_JOINTS * MAX_PALETTE_INSTANCES as u64;
+        size_of::<Mat4>() as u64 * MAX_GLTF_JOINTS * crate::gltf::MAX_PALETTE_INSTANCES as u64;
     let gltf_palette_layout = DeviceLayout::new(
         NonZero::new(gltf_palette_buffer_size).unwrap(),
         DeviceAlignment::new(align_of::<Mat4>() as u64).unwrap(),
