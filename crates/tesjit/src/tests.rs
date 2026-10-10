@@ -47,13 +47,14 @@ fn fib_and_loop() {
         }
         "#,
     );
+    let guard = c.enter();
     unsafe {
         let fib: extern "C" fn(i32) -> i32 = c.get("fib").unwrap();
         let sum: extern "C" fn(i32) -> f64 = c.get("sum").unwrap();
         assert_eq!(fib(20), 6765);
         assert_eq!(sum(100), 4950.0);
     }
-}
+    drop(guard);}
 
 #[test]
 fn host_call() {
@@ -63,10 +64,12 @@ fn host_call() {
         export function go(dt: f64): void { log(dt * 2); }
         "#,
     );
+    let guard = c.enter();
     unsafe {
         let go: extern "C" fn(f64) = c.get("go").unwrap();
         go(1.5);
     }
+    drop(guard);
     assert_eq!(f64::from_bits(LAST.load(Ordering::SeqCst)), 3.0);
 }
 
@@ -129,6 +132,7 @@ fn control_flow_and_logical_ops() {
         function both(a: boolean): boolean { return a && a; }
         "#,
     );
+    let guard = c.enter();
     unsafe {
         let pick: extern "C" fn(i32) -> i32 = c.get("pick").unwrap();
         let tern: extern "C" fn(i32) -> i32 = c.get("tern").unwrap();
@@ -142,6 +146,7 @@ fn control_flow_and_logical_ops() {
         assert!(and(true, true));
         assert!(!both(false));
     }
+    drop(guard);
 }
 
 #[test]
@@ -159,6 +164,7 @@ fn updates_and_bool_to_float_cast() {
         function truth(b: boolean): f64 { return b as f64; }
         "#,
     );
+    let _guard = c.enter();
     unsafe {
         let bump: extern "C" fn(i32) -> i32 = c.get("bump").unwrap();
         let pre: extern "C" fn(i32) -> i32 = c.get("pre").unwrap();
@@ -197,10 +203,12 @@ fn check_and_compile_agree() {
     jit.compile(src).unwrap();
     let compiled: Jit = jit;
     let c: super::Compiled = compiled.finish().unwrap();
+    let guard = c.enter();
     unsafe {
         let ok: extern "C" fn(i32) -> i32 = c.get("ok").unwrap();
         assert_eq!(ok(21), 42);
     }
+    drop(guard);
 }
 
 // ───────────────────────────── strings ─────────────────────────────
@@ -347,7 +355,7 @@ fn array_literal_index_and_length() {
         let make: extern "C" fn(i32) -> i64 = c.get("make").unwrap();
 
         let arr = make(7);
-        assert_eq!(sum(arr), 0 + 1 + 2 + 7);
+        assert_eq!(sum(arr), 10);
 
         // Bounds checks: reads and writes outside the array trap instead of
         // touching foreign memory.
@@ -422,4 +430,89 @@ fn arrays_of_strings() {
         drop(guard);
         assert_eq!(string_bytes(s), b"a");
     }
+}
+
+// ───────────────────────────── sandbox: fuel ─────────────────────────────
+//
+// Every function entry and loop back-edge costs one unit of fuel. When the
+// budget runs out the handler returns its zero value and records a trap, so a
+// runaway mod can never wedge the server.
+
+#[test]
+fn runaway_loop_is_trapped_not_hung() {
+    let c = build_arr(
+        r#"
+        export function spin(): i32 {
+          let n: i32 = 0;
+          while (true) { n += 1; }
+          return n;
+        }
+        export function ok(): i32 { return 1; }
+        "#,
+    );
+    c.runtime().reset_fuel(10_000);
+    let guard = c.enter();
+    unsafe {
+        let spin: extern "C" fn() -> i32 = c.get("spin").unwrap();
+        assert_eq!(spin(), 0, "trapped handler must return zero");
+    }
+    drop(guard);
+    assert_eq!(
+        c.trap().map(|t| t.message()),
+        Some("fuel exhausted (runaway handler)")
+    );
+    c.clear_trap();
+
+    // With fuel re-armed, the same module is usable again.
+    c.runtime().reset_fuel(10_000);
+    let guard = c.enter();
+    unsafe {
+        let ok: extern "C" fn() -> i32 = c.get("ok").unwrap();
+        assert_eq!(ok(), 1);
+    }
+    drop(guard);
+    assert!(c.trap().is_none());
+}
+
+#[test]
+fn unbounded_recursion_is_trapped() {
+    let c = build_arr(
+        r#"
+        export function down(n: i32): i32 { return down(n - 1) + 1; }
+        "#,
+    );
+    c.runtime().reset_fuel(5_000);
+    let guard = c.enter();
+    unsafe {
+        // Recursion is bounded by fuel, so this returns instead of blowing the
+        // stack; the return value is whatever the unwound frames produced.
+        let down: extern "C" fn(i32) -> i32 = c.get("down").unwrap();
+        let _ = down(0);
+    }
+    drop(guard);
+    assert_eq!(
+        c.trap().map(|t| t.message()),
+        Some("fuel exhausted (runaway handler)")
+    );
+}
+
+#[test]
+fn default_fuel_covers_a_million_iterations() {
+    let c = build_arr(
+        r#"
+        export function sum(n: i32): i32 {
+          let total: i32 = 0;
+          for (let i: i32 = 0; i < n; i++) { total += i; }
+          return total;
+        }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let sum: extern "C" fn(i32) -> i32 = c.get("sum").unwrap();
+        // 0+1+...+999999 = 499_999_500_000, truncated to i32.
+        assert_eq!(sum(1_000_000), 499999500000_i64 as i32);
+    }
+    drop(guard);
+    assert!(c.trap().is_none(), "default fuel should not run out");
 }

@@ -29,6 +29,10 @@ use std::sync::Arc;
 /// Largest allocation the arena will serve before trapping.
 pub const ARENA_CAP: usize = 64 * 1024 * 1024;
 
+/// Default per-call fuel budget: function entries and loop back-edges each
+/// cost one unit, so this bounds both total work and recursion depth.
+pub const DEFAULT_FUEL: u64 = 10_000_000;
+
 /// Trap codes, surfaced to the host through [`crate::Compiled::trap`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TrapKind {
@@ -38,6 +42,8 @@ pub enum TrapKind {
     ArrayOverflow,
     /// The arena ran out of memory.
     OutOfMemory,
+    /// The fuel budget ran out (runaway loop or unbounded recursion).
+    FuelExhausted,
 }
 
 impl TrapKind {
@@ -46,6 +52,7 @@ impl TrapKind {
             TrapKind::IndexOutOfBounds => "index out of bounds",
             TrapKind::ArrayOverflow => "array capacity exceeded",
             TrapKind::OutOfMemory => "out of memory",
+            TrapKind::FuelExhausted => "fuel exhausted (runaway handler)",
         }
     }
 }
@@ -131,6 +138,8 @@ impl Drop for Arena {
 pub struct TesjitRuntime {
     arena: RefCell<Arena>,
     trap: RefCell<Option<TrapKind>>,
+    /// Remaining fuel for the current call.
+    fuel: std::cell::Cell<u64>,
 }
 
 impl Default for TesjitRuntime {
@@ -147,7 +156,31 @@ impl TesjitRuntime {
         Self {
             arena: RefCell::new(Arena::new()),
             trap: RefCell::new(None),
+            fuel: std::cell::Cell::new(DEFAULT_FUEL),
         }
+    }
+
+    /// Arm (or re-arm) the fuel budget for the next call into module code.
+    ///
+    /// Hosts call this before invoking a handler so every entry starts fresh.
+    pub fn reset_fuel(&self, fuel: u64) {
+        self.fuel.set(fuel);
+    }
+
+    /// Fuel still available.
+    pub fn fuel(&self) -> u64 {
+        self.fuel.get()
+    }
+
+    /// Consume one unit; returns false when the budget is spent.
+    fn spend_fuel(&self) -> bool {
+        let left = self.fuel.get();
+        if left == 0 {
+            *self.trap.borrow_mut() = Some(TrapKind::FuelExhausted);
+            return false;
+        }
+        self.fuel.set(left - 1);
+        true
     }
 
     /// Bytes handed out so far (diagnostics/benchmarks).
@@ -203,7 +236,7 @@ fn current() -> &'static TesjitRuntime {
     let raw: *const TesjitRuntime = CURRENT.with(|c| {
         c.borrow()
             .as_ref()
-            .map(|r| Arc::as_ptr(r) as *const TesjitRuntime)
+            .map(Arc::as_ptr)
             .unwrap_or(std::ptr::null())
     });
     assert!(!raw.is_null(), "tesjit runtime not entered");
@@ -390,9 +423,19 @@ extern "C" fn arr_set(a: i64, i: i64, elem_size: i64, value: i64) -> i64 {
     value
 }
 
+/// Fuel check on function entry and loop back-edges.
+///
+/// Returns 1 while fuel remains, 0 when it ran out (with the trap recorded) —
+/// the caller branches to the function's trap block, so the handler returns
+/// immediately instead of spinning forever.
+extern "C" fn fuel() -> i64 {
+    i64::from(current().spend_fuel())
+}
+
 /// Named runtime symbols to register for one module.
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
+        ("__tesjit_fuel", fuel as *const u8),
         ("__tesjit_alloc", alloc as *const u8),
         ("__tesjit_str_wrap", str_wrap as *const u8),
         ("__tesjit_str_len", str_len as *const u8),

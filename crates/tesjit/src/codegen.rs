@@ -52,6 +52,9 @@ pub struct FnLowerer<'s, 'm> {
     slot_tys: Vec<Ty>,
     /// Innermost `(continue_target, break_target)` loop headers.
     loops: Vec<(ir::Block, ir::Block)>,
+    /// Block the function jumps to when a runtime guard trips (fuel, traps):
+    /// it returns the function's zero value instead of unwinding into the host.
+    trap_block: ir::Block,
     ret: Ty,
 }
 
@@ -130,15 +133,48 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             vars.push(var);
         }
 
+        // Sandbox guard: every function starts with a fuel check and jumps to a
+        // dedicated block that returns the zero value. A runaway mod therefore
+        // stays inside its own frame — the host sees a normal return plus a
+        // trap, never an unwind into Rust.
+        //
+        // `trap_block` is only *created* here and filled afterwards: blocks are
+        // laid out in fill order, and the entry block (with the parameters)
+        // must stay first.
+        let trap_block = builder.create_block();
+        let fuel = Self::fuel_check(module, sigs, &mut builder);
+        let body_block = builder.create_block();
+        builder
+            .ins()
+            .brif(fuel, body_block, &[], trap_block, &[]);
+        builder.switch_to_block(body_block);
+        builder.seal_block(body_block);
+
+        builder.switch_to_block(trap_block);
+        if f.ret != Ty::Void {
+            let zero = match f.ret.clone() {
+                Ty::F64 => builder.ins().f64const(0.0),
+                other => builder.ins().iconst(other.clif(), 0),
+            };
+            builder.ins().return_(&[zero]);
+        } else {
+            builder.ins().return_(&[]);
+        }
+        // NOT sealed: loops branch into `trap_block` (declaring predecessors)
+        // long after this point; `seal_all_blocks` at the end covers it.
+        builder.switch_to_block(body_block);
+
         let mut lowerer = FnLowerer {
             module,
             sigs,
             vars,
             rodata: HashMap::new(),
+            trap_block,
             slot_tys: f.locals.iter().map(|l| l.ty.clone()).collect(),
             loops: Vec::new(),
             ret: f.ret.clone(),
         };
+
         for stmt in &f.body {
             lowerer.stmt(&mut builder, stmt);
         }
@@ -146,6 +182,9 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         builder.seal_all_blocks();
         builder.finalize(target);
 
+        if std::env::var_os("TESJIT_DUMP_IR").is_some() {
+            eprintln!("--- {} ---\n{}", f.name, ctx.func.display());
+        }
         // NOTE: `clear_context` must run *after* `define_function` — the
         // function lives in `ctx`, and clearing it first would wipe it.
         module
@@ -249,10 +288,16 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             Stmt::While { cond, body, .. } => {
                 let header = b.create_block();
                 let body_b = b.create_block();
+                let cond_b = b.create_block();
                 let exit = b.create_block();
                 b.ins().jump(header, &[]);
 
                 b.switch_to_block(header);
+                // Each iteration costs fuel; when it runs out the loop jumps to
+                // the function's trap block instead of spinning.
+                let ok = self.guard_check(b);
+                b.ins().brif(ok, cond_b, &[], self.trap_block, &[]);
+                b.switch_to_block(cond_b);
                 let c = self.expr(b, cond);
                 b.ins().brif(c, body_b, &[], exit, &[]);
 
@@ -286,6 +331,12 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 b.ins().jump(header, &[]);
 
                 b.switch_to_block(header);
+                // Same fuel accounting as `while`: the guard branches to a
+                // fresh test block, which then decides the next iteration.
+                let ok = self.guard_check(b);
+                let test_b = b.create_block();
+                b.ins().brif(ok, test_b, &[], self.trap_block, &[]);
+                b.switch_to_block(test_b);
                 match cond {
                     Some(c) => {
                         let v = self.expr(b, c);
@@ -604,6 +655,31 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 arr
             }
         }
+    }
+
+    /// Emit the fuel guard call; true while budget remains.
+    ///
+    /// Called on function entry (before the `FnLowerer` exists) and on every
+    /// loop back-edge, so it does not depend on instance state.
+    fn fuel_check(
+        module: &mut JITModule,
+        sigs: &[(String, FnSig)],
+        b: &mut FunctionBuilder<'_>,
+    ) -> Value {
+        let sig = sigs
+            .iter()
+            .find(|(name, _)| name == Intrinsic::Fuel.symbol())
+            .map(|(_, sig)| sig.clone())
+            .expect("fuel helper declared by Jit");
+        let fref = module.declare_func_in_func(sig.id, b.func);
+        let call = b.ins().call(fref, &[]);
+        Self::adapt(b, &sig.ret, &Ty::Bool, b.inst_results(call)[0])
+    }
+
+    /// Loop/recursion back-edge guard: branch to the function's trap block
+    /// when the budget is spent.
+    fn guard_check(&mut self, b: &mut FunctionBuilder<'_>) -> Value {
+        Self::fuel_check(self.module, self.sigs, b)
     }
 
     /// Convert a value between a TS type and the machine-word runtime ABI

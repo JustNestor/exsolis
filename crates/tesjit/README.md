@@ -69,6 +69,18 @@ tesjit check <file.ts>    # type-check only, print every diagnostic
 tesjit bench <file.ts>    # fib benchmark driver
 ```
 
+## Sandbox (Phase 4)
+
+Mod code cannot take the process down:
+
+| Guard | Mechanism |
+|---|---|
+| Bounds checks | Every string byte / array element read and write goes through the runtime (`arr_get`/`arr_set`/`str_byte`), which traps before touching memory |
+| Fuel | Each function entry and loop back-edge costs one unit (`Compiled::reset_fuel`, default 10M); when it runs out the handler returns zero and records a trap |
+| Memory | One stable (never reallocated) 64 MB arena per module, so JIT-held pointers stay valid; exhaustion traps |
+| Traps | Recorded in the runtime, read by the host via `Compiled::trap()` / `clear_trap()`; the handler returns normally, one buggy mod never unwinds into Rust |
+| Stack | Cranelift stack probes enabled (`enable_probestack`), so large frames cannot skip the guard page |
+
 ## Tests
 
 ```sh

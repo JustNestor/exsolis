@@ -125,6 +125,8 @@ pub enum CallTarget {
 /// Builtin operations JIT code calls into [`crate::runtime`] for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Intrinsic {
+    /// Fuel guard: `() -> boolean` (false when the budget ran out).
+    Fuel,
     /// Wrap `.rodata` bytes as an arena string: `(ptr, len) -> str`.
     StrWrap,
     StrLen,
@@ -146,6 +148,7 @@ impl Intrinsic {
     /// Name of the runtime symbol backing this operation.
     pub fn symbol(self) -> &'static str {
         match self {
+            Intrinsic::Fuel => "__tesjit_fuel",
             Intrinsic::StrWrap => "__tesjit_str_wrap",
             Intrinsic::StrLen => "__tesjit_str_len",
             Intrinsic::StrConcat => "__tesjit_str_concat",

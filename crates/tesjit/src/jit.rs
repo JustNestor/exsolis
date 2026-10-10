@@ -207,8 +207,11 @@ impl Jit {
         flag_builder
             .set("preserve_frame_pointers", "false")
             .map_err(|e| crate::diag::plain(format!("cranelift config: {e}")))?;
+        // Stack probes: with them off, a function with a large frame can skip
+        // the guard page and corrupt memory below the stack. Bounded recursion
+        // is handled by fuel, but "deep and legal" still has to be safe.
         flag_builder
-            .set("enable_probestack", "false")
+            .set("enable_probestack", "true")
             .map_err(|e| crate::diag::plain(format!("cranelift config: {e}")))?;
         flag_builder
             .set("enable_alias_analysis", "true")
@@ -367,6 +370,7 @@ impl Jit {
     fn runtime_signatures() -> Vec<(&'static str, Vec<Ty>, Ty)> {
         use Ty::{Ptr, Str};
         vec![
+            ("__tesjit_fuel", vec![], Ty::Ptr),
             ("__tesjit_alloc", vec![Ptr], Ptr),
             ("__tesjit_str_wrap", vec![Ptr, Ptr], Str),
             ("__tesjit_str_len", vec![Str], Ptr),
