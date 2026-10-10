@@ -84,10 +84,16 @@ pub struct Rig {
     /// first-person viewmodel. `None` when no joint matched, which is
     /// reported as a warning rather than silently rendering nothing.
     pub arms: Option<Vec<BakedPrimitive>>,
-    /// Where the arms were shifted from (model space). The arm vertices have
-    /// `arms_pivot` subtracted, so the bone palette used with them must be
-    /// conjugated by this translation: `T(-p) * bone * T(p)`.
+    /// Where the arms pivot, in model space: the shoulder line.
+    ///
+    /// Applied once, as `T(-arms_pivot)` at the front of the viewmodel's
+    /// instance matrix. The geometry itself is left where the body has it, and
+    /// the bone palette is left exactly as the body's — see [`arm_shoulder`]
+    /// for why doing it any other way explodes the mesh.
     pub arms_pivot: [f32; 3],
+    /// Names of the joints the arm cut kept, after the far-away garment bones
+    /// were pruned. Diagnostics and the regression tests read this.
+    pub arm_joints: Vec<String>,
 }
 
 impl Rig {
@@ -218,9 +224,9 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        let (arms, arms_pivot) = match build_arms(&joints, &world, &primitives) {
-            Some((arms, pivot)) => (Some(arms), pivot),
-            None => (None, [0.0; 3]),
+        let (arms, arms_pivot, arm_joints) = match build_arms(&joints, &world, &primitives) {
+            Some((arms, pivot, arm_joints)) => (Some(arms), pivot, arm_joints),
+            None => (None, [0.0; 3], Vec::new()),
         };
         let primitives = merge_by_material(primitives);
 
@@ -247,6 +253,7 @@ impl Rig {
             primitives,
             arms,
             arms_pivot,
+            arm_joints,
         })
     }
 
@@ -291,12 +298,17 @@ fn to_meshes(primitives: Vec<BakedPrimitive>) -> Vec<GltfMesh> {
 /// The same joint indices are kept, so the viewmodel animates with the very
 /// same bone palette as the body — the arms swing because the walk clip says
 /// so, not because a second animation was authored for them.
+///
+/// The geometry is **not** moved and the palette is **not** rewritten: the
+/// caller translates the whole instance by the returned pivot instead. See
+/// [`arms_pivot`] for why doing it per-bone is the thing that exploded.
 fn build_arms(
     joints: &[JointBuild],
     world: &[glam::Mat4],
     primitives: &[BakedPrimitive],
-) -> Option<(Vec<BakedPrimitive>, [f32; 3])> {
+) -> Option<(Vec<BakedPrimitive>, [f32; 3], Vec<String>)> {
     let arm_set = arm_joint_set(&joints.iter().map(|j| &j.joint).collect::<Vec<_>>()[..]);
+    let arm_set = prune_far_garments(joints, world, arm_set);
     let pivot = arm_shoulder(joints, world);
 
     let kept: Vec<BakedPrimitive> = primitives
@@ -314,14 +326,15 @@ fn build_arms(
         );
         return None;
     }
-    let kept_joints: std::collections::HashSet<u16> = kept.iter().map(|p| p.joint).collect();    let total_verts: usize = primitives.iter().map(|p| p.vertices.len()).sum();
+    let kept_joints: std::collections::HashSet<u16> = kept.iter().map(|p| p.joint).collect();
+    let total_verts: usize = primitives.iter().map(|p| p.vertices.len()).sum();
     let kept_verts: usize = kept.iter().map(|p| p.vertices.len()).sum();
     let share = kept_verts as f32 / total_verts.max(1) as f32;
     // An arms-only viewmodel should be a small fraction of the body. If it
     // is most of the model the bone names must have changed, and silently
     // drawing a headless-but-mostly-intact avatar in first person is worse
     // than drawing nothing.
-    if share > 0.35 {
+    if share > 0.25 {
         let mut names: Vec<&str> = kept_joints
             .iter()
             .filter_map(|j| joints.get(*j as usize))
@@ -347,29 +360,23 @@ fn build_arms(
         pivot[1],
         pivot[2]
     );
-    Some(shift_arms(kept, pivot))
+    let mut names: Vec<String> = arm_set
+        .iter()
+        .filter_map(|&index| joints.get(index as usize))
+        .map(|joint| joint.joint.name.clone())
+        .collect();
+    names.sort();
+    Some((kept, pivot, names))
 }
 
-/// Every joint that belongs to the first-person arms.
+/// The joints that hang below the two upper-arm joints — the arms, by
+/// hierarchy, whatever the exporter named anything.
 ///
-/// Chosen by **hierarchy first, name second**:
-///
-/// 1. Everything below the two upper-arm joints is an arm, whatever the
-///    exporter called it. `girl.glb` binds its left hand/finger cubes to
-///    `spLeft_963` and its right ones to `RightHand_1006` — both hang off the
-///    forearm, and neither looks like an "arm" bone. Name lists alone can
-///    never cover that, which is exactly how the hands ended up torn off.
-/// 2. Garment bones that follow the arms but are parented to the chest
-///    (`Hoodie_Left`, `H_above_Left`, `H_hm_*`, ...) are added by prefix, so
-///    sleeves do not stay behind in the world.
-fn arm_joint_set(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u16> {
-    let mut arm_set: std::collections::HashSet<u16> = joints
-        .iter()
-        .enumerate()
-        .filter(|(_, j)| is_arm_joint(&j.name))
-        .map(|(index, _)| index as u16)
-        .collect();
-
+/// `girl.glb` binds its left hand/finger cubes to `spLeft_963` and its right
+/// ones to `RightHand_1006`; both sit between the upper arm and the forearm
+/// and neither looks like an "arm" bone. A name list alone can never cover
+/// that, which is exactly how the hands ended up torn off.
+fn arm_subtree(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u16> {
     let roots: Vec<u16> = joints
         .iter()
         .enumerate()
@@ -388,11 +395,103 @@ fn arm_joint_set(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u1
             joints.len()
         );
     }
+    let mut subtree: std::collections::HashSet<u16> = std::collections::HashSet::new();
     for root in roots {
         // `Joint::parent` is the nearest *joint* ancestor, so the joint tree is
         // closed under descendants and this walk reaches the whole arm subtree
         // without needing the node graph.
-        mark_subtree(root, joints, &mut arm_set);
+        mark_subtree(root, joints, &mut subtree);
+    }
+    subtree
+}
+
+/// Every joint that belongs to the first-person arms, by hierarchy and name.
+///
+/// [`arm_subtree`] plus the garment bones that follow the arms but are
+/// parented to the chest (`Hoodie_Left`, `H_above_Left`, `H_hm_*`).
+///
+fn arm_joint_set(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u16> {
+    let mut arm_set = arm_subtree(joints);
+    for (index, joint) in joints.iter().enumerate() {
+        if is_arm_joint(&joint.name) {
+            arm_set.insert(index as u16);
+        }
+    }
+    arm_set
+}
+
+/// Keep only the garment joints that actually sit next to the arm.
+///
+/// `H_hm_*` and friends are parented to the hoodie/chest, so a few of them
+/// live at the hip or the ankles (`H_hm_Left_895` rests at y ≈ 0.86,
+/// `H_above_Left_c2_869` at y ≈ −0.09, on a rig whose shoulders are at
+/// y ≈ 1.99). Keeping them dragged that geometry into the viewmodel, which is
+/// what made the first-person hands look like the whole lower body arriving.
+///
+/// Only the **name-matched** joints are tested, and only against the rest
+/// world origins of the *hierarchy* arm joints. Testing against the full
+/// candidate set (as this first did) is tautological — every joint is
+/// trivially near itself.
+fn prune_far_garments(
+    joints: &[JointBuild],
+    world: &[glam::Mat4],
+    mut arm_set: std::collections::HashSet<u16>,
+) -> std::collections::HashSet<u16> {
+    let subtree = arm_subtree(&joints.iter().map(|j| &j.joint).collect::<Vec<_>>()[..]);
+    let arm_origins: Vec<glam::Vec3> = subtree
+        .iter()
+        .filter_map(|&index| joints.get(index as usize))
+        .filter_map(|joint| world.get(joint.node_index))
+        .map(|matrix| matrix.transform_point3(glam::Vec3::ZERO))
+        .collect();
+    if arm_origins.is_empty() {
+        return arm_set;
+    }
+    // Reach scales off the arm itself, so this is not a magic number: longer
+    // arms keep longer sleeves.
+    let reach = {
+        let top = arm_origins
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::NEG_INFINITY, f32::max);
+        let bottom = arm_origins
+            .iter()
+            .map(|p| p.y)
+            .fold(f32::INFINITY, f32::min);
+        ((top - bottom).abs() * 0.75).max(0.35)
+    };
+
+    let far: Vec<u16> = arm_set
+        .iter()
+        .copied()
+        .filter(|&index| !subtree.contains(&index))
+        .filter(|&index| is_arm_joint(&joints[index as usize].joint.name))
+        .filter(|&index| {
+            let Some(at) = world
+                .get(joints[index as usize].node_index)
+                .map(|matrix| matrix.transform_point3(glam::Vec3::ZERO))
+            else {
+                return false;
+            };
+            !arm_origins
+                .iter()
+                .any(|origin| origin.distance(at) <= reach)
+        })
+        .collect();
+    if !far.is_empty() {
+        let names: Vec<&str> = far
+            .iter()
+            .filter_map(|&index| joints.get(index as usize))
+            .map(|joint| joint.joint.name.as_str())
+            .collect();
+        debug!(
+            "viewmodel: dropped {} garment joint(s) that sit away from the arms: {:?}",
+            names.len(),
+            names
+        );
+        for index in &far {
+            arm_set.remove(index);
+        }
     }
     arm_set
 }
@@ -414,10 +513,18 @@ fn mark_subtree(
 /// Where the arms pivot, in model space: the shoulder line.
 ///
 /// The rest **world** translation of the two upper-arm joints is the exact
-/// point the arm rotates about, which is the only pivot the shifted geometry
-/// and the conjugated bone palette can agree on. The previous version
-/// estimated it as the centroid of the top 10% slice of the arm *geometry*,
-/// which drifts with every sleeve cube the exporter adds above the shoulder.
+/// point the arm rotates about, so it is the only origin the viewmodel can be
+/// placed from. The earlier version estimated it as the centroid of the top
+/// 10% slice of the arm *geometry*, which drifts with every sleeve cube the
+/// exporter adds above the shoulder.
+///
+/// This is applied ONCE, as a `T(-pivot)` at the front of the viewmodel's
+/// instance matrix — never to the geometry, and never to the bone palette.
+/// Doing it to both (shift the vertices, then conjugate every bone by
+/// `T(-p) * A * T(p)`) nets to the same place only when the two pivots agree
+/// exactly; let them drift and the error is `(A - I) * (p_geom - p_palette)`,
+/// which is a different translation for every bone — the mesh comes apart
+/// into long needles. That is what produced the exploded viewmodel.
 fn arm_shoulder(joints: &[JointBuild], world: &[glam::Mat4]) -> [f32; 3] {
     let mut sum = [0f64; 3];
     let mut count = 0u32;
@@ -445,34 +552,6 @@ fn arm_shoulder(joints: &[JointBuild], world: &[glam::Mat4]) -> [f32; 3] {
         sum[1] as f32 / count as f32,
         sum[2] as f32 / count as f32,
     ]
-}
-
-/// Move the arms so the viewmodel's origin is between the shoulders.
-///
-/// The vertices are baked into model space — the space the body draw uses —
-/// where the shoulders sit around `y = 2.0` for a 3.1-unit-tall avatar. The
-/// viewmodel instance matrix is placed relative to the eye, so without this
-/// the arms float a metre and a half above the camera instead of hanging in
-/// front of it.
-///
-/// Only a translation is applied. NOTE: the bone palette rotates about the
-/// ORIGINAL joint positions, so it does NOT line up with the shifted
-/// geometry on its own. Callers must conjugate every bone by the returned
-/// pivot (`T(-p) * bone * T(p)`) or the arms shear apart as soon as the pose
-/// leaves the rest pose.
-fn shift_arms(arms: Vec<BakedPrimitive>, pivot: [f32; 3]) -> (Vec<BakedPrimitive>, [f32; 3]) {
-    let shifted = arms
-        .into_iter()
-        .map(|mut p| {
-            for v in &mut p.vertices {
-                for k in 0..3 {
-                    v.position[k] -= pivot[k];
-                }
-            }
-            p
-        })
-        .collect();
-    (shifted, pivot)
 }
 
 /// A joint plus the bookkeeping the builder needs but the runtime does not.
@@ -1149,6 +1228,7 @@ mod tests {
     fn the_avatar_yields_an_arms_only_viewmodel() {
         let (document, buffers, _images) = load("girl.glb");
         let rig = Rig::build(&document, &buffers).expect("rig");
+        let pivot = rig.arms_pivot;
         let (_, body, arms) = rig.into_parts();
 
         let arms = arms.expect("the avatar must have arms to extract");
@@ -1184,10 +1264,12 @@ mod tests {
             assert!((v.joint as usize) < joint_count);
         }
 
-        // The arms must be centred on the viewmodel origin, not left at body
-        // shoulder height. Untranslated they sit around y = 2.5 on an avatar
-        // 3.2 units tall, which would float a metre and a half above the
-        // camera when the viewmodel instance is placed relative to the eye.
+        // The arms are NOT moved to the viewmodel origin on the CPU any more:
+        // `viewmodel_matrix` applies `T(-pivot)` in one go, so the geometry
+        // stays in true model space and only the instance matrix knows about
+        // the pivot. Assert against that: relative to the pivot, the arms must
+        // hang below the shoulder line and straddle it in x, so that when the
+        // instance matrix subtracts the pivot they end up below the eye.
         let (lo, hi) = arms
             .iter()
             .flat_map(|m| m.primitives.iter())
@@ -1202,32 +1284,116 @@ mod tests {
                     (lo, hi)
                 },
             );
+        let pivot_y = pivot[1];
+        let top = hi[1] - pivot_y;
+        let bottom = lo[1] - pivot_y;
         assert!(
-            hi[1] < 0.5 && lo[1] > -2.0,
-            "arms should hang below a shoulder-level origin, but span y {:.2}..{:.2} — \
-             they were not recentred",
-            lo[1],
-            hi[1]
+            top < 0.6 && bottom > -2.0,
+            "relative to the shoulder the arms span y {:.2}..{:.2} — they are not an arm-sized \
+             piece hanging off the shoulder",
+            bottom,
+            top
         );
-        assert!(
-            lo[0] < 0.0 && hi[0] > 0.0,
-            "arms should straddle the viewmodel origin, but span x {:.2}..{:.2}",
-            lo[0],
-            hi[0]
-        );
-        // Arms still hang *down* from the shoulders, so most of the geometry
-        // is below the origin rather than above it.
-        let vertices: Vec<_> = arms
+        // ...and they sit *below* the pivot, mostly, so the hands hang down.
+        let below = arms
             .iter()
             .flat_map(|m| m.primitives.iter())
             .flat_map(|p| p.vertices.iter())
-            .collect();
-        let below = vertices.iter().filter(|v| v.position[1] < 0.0).count();
+            .filter(|v| v.position[1] < pivot_y)
+            .count();
+        let total = arms
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .flat_map(|p| p.vertices.iter())
+            .count();
         assert!(
-            below * 2 > vertices.len(),
-            "only {below} of {} arm verts are below the origin — the arms are not hanging down",
-            vertices.len()
+            below * 2 > total,
+            "only {below} of {total} arm verts are below the shoulder — the arms are not \
+             hanging down"
         );
+    }
+
+    /// The viewmodel arms must move *as one body* under a posed clip.
+    ///
+    /// This is the regression test for the exploded viewmodel. The arms are
+    /// drawn with the body's bone palette and one instance matrix, so a vertex
+    /// on a forearm cube moves by exactly as much as its neighbour on the same
+    /// bone. What it must NOT do is scatter, which is what a per-bone offset
+    /// error produces: `T(-p) * A * T(p)` applied to geometry that was never
+    /// shifted by `-p` leaves `(A - I) * p` of extra translation, and `p` is
+    /// shoulder height — metres, different for every bone. Every triangle then
+    /// stretches into a needle.
+    ///
+    /// Checked through the same math the shader runs: `instance * bone *
+    /// vertex`, at the rest pose and half-way through the walk clip. With the
+    /// pose driven, a vertex may move some distance (the arm swings), but a
+    /// *pair* of vertices sharing a bone must move by nearly the same amount.
+    #[test]
+    fn posed_arms_move_as_one_body() {
+        use crate::anim::Transform as JointTransform;
+        let (document, buffers, _images) = load("girl.glb");
+        let rig = Rig::build(&document, &buffers).expect("rig");
+        let skeleton = &rig.skeleton;
+        let arms = rig.arms.as_ref().expect("arms");
+        let n = skeleton.joints.len();
+
+        let mut world = vec![glam::Mat4::IDENTITY; n];
+        let posed = |skeleton: &crate::anim::Skeleton, locals: &[JointTransform]| -> Vec<glam::Mat4> {
+            let mut world = vec![glam::Mat4::IDENTITY; n];
+            let mut bones = vec![glam::Mat4::IDENTITY; n];
+            skeleton.compose_palette(locals, &mut world, &mut bones);
+            bones
+        };
+
+        // Rest pose.
+        let mut locals = vec![JointTransform::default(); n];
+        for (slot, joint) in locals.iter_mut().zip(skeleton.joints.iter()) {
+            *slot = joint.rest_local;
+        }
+        let rest_bones = posed(skeleton, &locals);
+
+        // Half-way into the walk clip (clip 1, measured at 1.0 s).
+        let walk = skeleton
+            .clips
+            .iter()
+            .position(|c| c.role == ClipRole::Walk)
+            .expect("the manifest marks a walk clip");
+        skeleton.sample(walk as u32, 0.5, &mut locals);
+        let posed_bones = posed(skeleton, &locals);
+
+        // Group the arm vertices by their bone and look at how far each group
+        // moved. A per-bone offset error shows up as a group displacement of
+        // metres; real animation keeps an arm-sized group within an arm.
+        let mut by_bone: std::collections::HashMap<u16, Vec<(glam::Vec3, glam::Vec3)>> =
+            std::collections::HashMap::new();
+        for m in arms {
+            for v in &m.vertices {
+                let joint = v.joint;
+                if joint as usize >= n {
+                    panic!("arm vertex references joint {joint}, only {n} exist");
+                }
+                let from = rest_bones[joint as usize]
+                    .transform_point3(glam::Vec3::from_array(v.position));
+                let to = posed_bones[joint as usize]
+                    .transform_point3(glam::Vec3::from_array(v.position));
+                by_bone
+                    .entry(joint)
+                    .or_default()
+                    .push((from, to));
+            }
+        }
+
+        for (joint, verts) in &by_bone {
+            let mut max_drift = 0.0f32;
+            for (from, to) in verts {
+                max_drift = max_drift.max((to - from).length());
+            }
+            assert!(
+                max_drift < 2.0,
+                "joint {joint}: {max_drift:.2} units of per-vertex drift under the walk \
+                 clip — the pose is scattering the vertices (a per-bone offset error)"
+            );
+        }
     }
 
     #[test]

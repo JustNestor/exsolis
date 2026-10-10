@@ -1249,6 +1249,7 @@ pub fn sync_gltf_instances(
     let mut palette: Vec<glam::Mat4> = Vec::new();
     let mut draws: Vec<GltfDrawCall> = Vec::new();
     let mut viewmodel_draws: Vec<GltfDrawCall> = Vec::new();
+    let mut viewmodel_total = 0u32;
     // Scratch reused across instances: composing a palette allocates three
     // vectors per joint, and doing that per entity per frame is the single
     // easiest way to make this path allocate.
@@ -1326,6 +1327,7 @@ pub fn sync_gltf_instances(
                     transform,
                     &instance.viewmodel_offset,
                     instance.scale,
+                    viewmodel_pivot,
                     eye.as_ref()
                         .map(|(eye, yaw_only, facing)| (*eye, *yaw_only, *facing)),
                     swing.angle(),
@@ -1341,19 +1343,11 @@ pub fn sync_gltf_instances(
                     &mut scratch,
                     &mut palette,
                 );
-                // The arm vertices were shifted by `-pivot` when the
-                // viewmodel was cut, but every bone rotates about the
-                // ORIGINAL joint positions. Re-express each bone in the
-                // shifted space, `T(-p) * bone * T(p)`; otherwise the arms
-                // only look right in the rest pose and fall apart (or fly
-                // off) as soon as the clip moves.
-                let row_start = palette.len() - PALETTE_STRIDE;
-                let into_shifted = glam::Mat4::from_translation(-viewmodel_pivot);
-                let out_of_shifted = glam::Mat4::from_translation(viewmodel_pivot);
-                for bone in &mut palette[row_start..] {
-                    *bone = into_shifted * *bone * out_of_shifted;
-                }
+                // No per-bone conjugation: the arm geometry stays in true
+                // model space and the shoulder pivot moved into the instance
+                // matrix above, so the palette row is the body's row exactly.
                 viewmodel_count += 1;
+                viewmodel_total += 1;
             }
         }
 
@@ -1409,7 +1403,7 @@ pub fn sync_gltf_instances(
         shared.gltf_instance_count = matrices.len() as u32;
         shared.gltf_draws = draws;
         shared.viewmodel_draws = viewmodel_draws;
-        shared.viewmodel_instance_count = matrices.len() as u32;
+        shared.viewmodel_instance_count = viewmodel_total;
         (
             shared.gltf_instance_buffer_id.unwrap(),
             shared.gltf_material_buffer_id.unwrap(),
@@ -1450,13 +1444,16 @@ const PALETTE_STRIDE: usize = 256;
 
 /// Where the first-person arms sit relative to the eye.
 ///
-/// The arms' vertices are in model space at roughly shoulder height, so the
-/// instance origin goes slightly below and in front of the eye to bring the
-/// hands into frame. Tuned by eye; the depth range keeps them from clipping.
+/// The arms' vertices are in model space at shoulder height. The shoulder
+/// pivot (in model space) is baked into the instance matrix as `T(-pivot)`
+/// so the geometry stays in true model space and the bone palette is left
+/// exactly as the body's — see [`crate::anim::rig::arm_shoulder`] for why
+/// doing it any other way explodes the mesh.
 fn viewmodel_matrix(
     transform: &GlobalTransform,
     offset: &glam::Vec3,
     scale: f32,
+    pivot: glam::Vec3,
     eye: Option<(glam::Vec3, glam::Quat, glam::Quat)>,
     swing: f32,
 ) -> glam::Mat4 {
@@ -1473,13 +1470,16 @@ fn viewmodel_matrix(
     // the hand arc forward rather than slide sideways, and the pivot is
     // offset so the shoulder stays put instead of the whole arm spinning
     // about the eye.
-    let pivot = rotation * glam::Vec3::new(0.0, 0.0, 0.25);
+    let local_pivot = rotation * glam::Vec3::new(0.0, 0.0, 0.25);
     let swing_rotation = glam::Quat::from_rotation_x(swing);
+    // Order matters: translate the model space first (so the swing about the
+    // camera-local pivot acts on a shoulder-centred mesh), then rotate, then
+    // place. `from_scale_rotation_translation` composes as T * R * S.
     glam::Mat4::from_scale_rotation_translation(
         glam::Vec3::splat(scale.max(0.0001)),
         rotation * swing_rotation,
-        position - pivot + swing_rotation * pivot,
-    )
+        position - local_pivot + swing_rotation * local_pivot,
+    ) * glam::Mat4::from_translation(-pivot)
 }
 
 /// Compose one instance's bone palette row.
