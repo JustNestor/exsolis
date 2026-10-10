@@ -135,7 +135,50 @@ impl Rig {
             // throws away the outside of the part and shows its inside.
             let mirrored = to_joint.determinant() < 0.0;
 
+            // Skinned exports (one mesh, a `skin`, JOINTS_0/WEIGHTS_0) store
+            // vertices already in bind space, where the rest pose IS model
+            // space, and the mesh node's own transform is ignored by the
+            // spec. The engine skins rigidly (one joint per vertex), so each
+            // vertex goes to its dominant influence; for box-modelled
+            // avatars that is weight 1.0 anyway.
+            let skin_nodes: Option<Vec<usize>> = node
+                .skin()
+                .map(|skin| skin.joints().map(|j| j.index()).collect());
+
             for primitive in mesh.primitives() {
+                if let Some(skin_nodes) = &skin_nodes {
+                    let loaded = crate::gltf::load_gltf_primitive(&primitive, buffers)?;
+                    let reader = primitive.reader(|b| Some(&buffers[b.index()]));
+                    let joints_attr: Option<Vec<[u16; 4]>> =
+                        reader.read_joints(0).map(|j| j.into_u16().collect());
+                    let weights_attr: Option<Vec<[f32; 4]>> =
+                        reader.read_weights(0).map(|w| w.into_f32().collect());
+                    if let (Some(js), Some(ws)) = (joints_attr, weights_attr)
+                        && js.len() == loaded.vertices.len()
+                        && ws.len() == loaded.vertices.len()
+                    {
+                        let mut vertices = loaded.vertices;
+                        for (v, (j, w)) in vertices.iter_mut().zip(js.iter().zip(ws.iter())) {
+                            let mut best = 0;
+                            for k in 1..4 {
+                                if w[k] > w[best] {
+                                    best = k;
+                                }
+                            }
+                            v.joint = skin_nodes
+                                .get(j[best] as usize)
+                                .and_then(|&n| joint_of_node[n])
+                                .unwrap_or(STATIC_JOINT)
+                                as u16;
+                        }
+                        primitives.extend(split_by_joint(
+                            vertices,
+                            loaded.indices,
+                            loaded.material_index,
+                        ));
+                        continue;
+                    }
+                }
                 let mut loaded = crate::gltf::load_gltf_primitive(&primitive, buffers)?;
                 if mirrored {
                     for tri in loaded.indices.chunks_exact_mut(3) {
@@ -380,6 +423,63 @@ fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> (Vec<BakedPrimitive>, [f3
 struct JointBuild {
     joint: Joint,
     node_index: usize,
+}
+
+/// Split one skinned primitive into one primitive per joint, so the
+/// per-primitive `joint` that `build_arms` filters on means something.
+/// A triangle goes to the group of its first vertex; vertices keep their own
+/// joint, so a triangle straddling two bones still skins correctly.
+fn split_by_joint(
+    vertices: Vec<GltfVertex>,
+    indices: Vec<u32>,
+    material_index: Option<usize>,
+) -> Vec<BakedPrimitive> {
+    struct Group {
+        remap: std::collections::HashMap<u32, u32>,
+        vertices: Vec<GltfVertex>,
+        indices: Vec<u32>,
+    }
+    let mut groups: std::collections::HashMap<u16, Group> = std::collections::HashMap::new();
+    let mut order: Vec<u16> = Vec::new();
+    for tri in indices.chunks_exact(3) {
+        let key = vertices[tri[0] as usize].joint;
+        if !groups.contains_key(&key) {
+            order.push(key);
+            groups.insert(
+                key,
+                Group {
+                    remap: Default::default(),
+                    vertices: Vec::new(),
+                    indices: Vec::new(),
+                },
+            );
+        }
+        let group = groups.get_mut(&key).unwrap();
+        for &i in tri {
+            let new = match group.remap.get(&i) {
+                Some(n) => *n,
+                None => {
+                    group.vertices.push(vertices[i as usize]);
+                    let n = (group.vertices.len() - 1) as u32;
+                    group.remap.insert(i, n);
+                    n
+                }
+            };
+            group.indices.push(new);
+        }
+    }
+    order
+        .into_iter()
+        .map(|key| {
+            let g = groups.remove(&key).unwrap();
+            BakedPrimitive {
+                vertices: g.vertices,
+                indices: g.indices,
+                material_index,
+                joint: key,
+            }
+        })
+        .collect()
 }
 
 /// Concatenate primitives sharing a material into one primitive each,

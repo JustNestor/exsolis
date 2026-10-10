@@ -596,7 +596,12 @@ impl Task for GltfRenderTask {
             // A dedicated depth buffer, cleared once. The arms are the only
             // thing in it, so they can never intersect world geometry — the
             // usual first-person clipping problem does not exist.
-            clear_values.set(self.virtual_depth_id, ClearValue::Depth(0.0));
+            //
+            // Must be 1.0, matching the world pass: every glTF pipeline
+            // (shared with this pass) uses standard depth with
+            // `CompareOp::Less`. Clearing to 0.0 made every fragment fail
+            // the depth test, so the arms were never visible.
+            clear_values.set(self.virtual_depth_id, ClearValue::Depth(1.0));
         }
         // Color is never cleared here: the world pass has already drawn it.
     }
@@ -1740,13 +1745,16 @@ pub(super) fn render_frame(
             shared.viewmodel_instance_count,
         )
     };
-    // Same orientation as the world camera, but a short depth range so the
-    // hands sit comfortably in front of everything and are never clipped by
-    // the world near plane.
+    // Same orientation as the world camera, but its own near/far range so the
+    // hands are never clipped by the world near plane. The far plane has to
+    // cover the WHOLE arm model: the arms span ~1 model unit and the instance
+    // sits wherever `viewmodel_offset` puts it, so a 0.6 far plane sliced
+    // them into shards. The viewmodel has a private depth buffer, so a deep
+    // range costs no precision for anything else.
     let viewmodel_view_proj = camera
         .iter()
         .next()
-        .map(|(transform, cam)| cam.view_projection_range(transform, aspect, 0.01, 0.6))
+        .map(|(transform, cam)| cam.view_projection_range(transform, aspect, 0.02, 64.0))
         .unwrap_or(Mat4::IDENTITY);
 
     let frame = FrameData {
