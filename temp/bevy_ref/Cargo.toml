@@ -9,3 +9,4 @@ edition = "2021"
 
 [dependencies]
 bevy = "0.19"
+bevy_image = {version="0.19", features=["webp"]}

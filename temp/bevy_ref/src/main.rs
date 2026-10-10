@@ -70,10 +70,11 @@ fn main() {
 
 fn setup(mut commands: Commands, server: Res<AssetServer>) {
     let models = [
-        "models/duck.glb",
-        "models/avocado.glb",
-        "models/dragon/result.glb",
+        // "models/duck.glb",
+        // "models/avocado.glb",
+        // "models/dragon/result.glb",
         "models/girl/result.glb",
+        "models/girl.glb",
     ];
 
     for (slot, path) in models.iter().enumerate() {

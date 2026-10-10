@@ -95,7 +95,11 @@ impl Plugin for EntityClientPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClientEntities>().add_systems(
             Update,
-            (receive_entity_messages, follow_entity_targets)
+            (
+                receive_entity_messages,
+                hide_local_player_body,
+                follow_entity_targets,
+            )
                 .chain()
                 .in_set(GameplaySet),
         );
@@ -189,6 +193,28 @@ fn receive_entity_messages(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// Strip the body mesh from the local player's entity.
+///
+/// `receive_entity_messages` only knows the local `PlayerId` if it arrived
+/// before the player's own `SpawnEntity`. When it arrives later the body gets
+/// a model anyway, so the check is repeated every frame: any non-viewmodel
+/// model instance on the local player's entity is removed. The first-person
+/// viewmodel (arms) is a separate instance and is left alone.
+fn hide_local_player_body(
+    mut commands: Commands,
+    local_player: Res<LocalPlayerId>,
+    bodies: Query<(Entity, &PlayerIdComponent, &GltfModelInstance)>,
+) {
+    let Some(local_id) = local_player.0 else {
+        return;
+    };
+    for (entity, player_id, instance) in &bodies {
+        if player_id.0 == local_id && !instance.first_person {
+            commands.entity(entity).try_remove::<GltfModelInstance>();
         }
     }
 }

@@ -79,6 +79,10 @@ pub struct Rig {
     /// first-person viewmodel. `None` when no joint matched, which is
     /// reported as a warning rather than silently rendering nothing.
     pub arms: Option<Vec<BakedPrimitive>>,
+    /// Where the arms were shifted from (model space). The arm vertices have
+    /// `arms_pivot` subtracted, so the bone palette used with them must be
+    /// conjugated by this translation: `T(-p) * bone * T(p)`.
+    pub arms_pivot: [f32; 3],
 }
 
 impl Rig {
@@ -125,8 +129,19 @@ impl Rig {
                 it[2][2],
             ]);
 
+            // A node with a negative-determinant world matrix (a mirrored
+            // part) flips triangle winding once its vertices are baked. The
+            // indices must be reversed to compensate, or back-face culling
+            // throws away the outside of the part and shows its inside.
+            let mirrored = to_joint.determinant() < 0.0;
+
             for primitive in mesh.primitives() {
-                let loaded = crate::gltf::load_gltf_primitive(&primitive, buffers)?;
+                let mut loaded = crate::gltf::load_gltf_primitive(&primitive, buffers)?;
+                if mirrored {
+                    for tri in loaded.indices.chunks_exact_mut(3) {
+                        tri.swap(1, 2);
+                    }
+                }
                 primitives.push(BakedPrimitive {
                     vertices: loaded
                         .vertices
@@ -155,7 +170,10 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        let arms = build_arms(&joints, &primitives);
+        let (arms, arms_pivot) = match build_arms(&joints, &primitives) {
+            Some((arms, pivot)) => (Some(arms), pivot),
+            None => (None, [0.0; 3]),
+        };
         let primitives = merge_by_material(primitives);
 
         let skeleton = Skeleton {
@@ -180,6 +198,7 @@ impl Rig {
             skeleton,
             primitives,
             arms,
+            arms_pivot,
         })
     }
 
@@ -224,7 +243,10 @@ fn to_meshes(primitives: Vec<BakedPrimitive>) -> Vec<GltfMesh> {
 /// The same joint indices are kept, so the viewmodel animates with the very
 /// same bone palette as the body — the arms swing because the walk clip says
 /// so, not because a second animation was authored for them.
-fn build_arms(joints: &[JointBuild], primitives: &[BakedPrimitive]) -> Option<Vec<BakedPrimitive>> {
+fn build_arms(
+    joints: &[JointBuild],
+    primitives: &[BakedPrimitive],
+) -> Option<(Vec<BakedPrimitive>, [f32; 3])> {
     let arm_set: std::collections::HashSet<u16> = joints
         .iter()
         .enumerate()
@@ -256,12 +278,21 @@ fn build_arms(joints: &[JointBuild], primitives: &[BakedPrimitive]) -> Option<Ve
     // drawing a headless-but-mostly-intact avatar in first person is worse
     // than drawing nothing.
     if share > 0.35 {
+        let mut names: Vec<&str> = kept_joints
+            .iter()
+            .filter_map(|j| joints.get(*j as usize))
+            .map(|j| j.joint.name.as_str())
+            .collect();
+        names.sort_unstable();
         warn!(
-            "viewmodel: arm joints matched {:.0}% of the geometry ({} joints) — bone \
-             names probably changed",
+            "viewmodel: arm joints matched {:.0}% of the geometry ({} joints) - bone \
+             names probably changed; drawing NO first-person arms rather than the \
+             whole avatar. Matched: {:?}",
             share * 100.0,
-            kept_joints.len()
+            kept_joints.len(),
+            names
         );
+        return None;
     }
     debug!(
         "viewmodel: {} arm joints, {} of {} verts",
@@ -280,13 +311,15 @@ fn build_arms(joints: &[JointBuild], primitives: &[BakedPrimitive]) -> Option<Ve
 /// the arms float a metre and a half above the camera instead of hanging in
 /// front of it.
 ///
-/// Only a translation is applied, so the arms keep exactly the pose the
-/// skeleton gives them; and because the bone palette is composed in model
-/// space, the bone transforms still line up with the shifted geometry. The
+/// Only a translation is applied. NOTE: the bone palette rotates about the
+/// ORIGINAL joint positions, so it does NOT line up with the shifted
+/// geometry on its own. Callers must conjugate every bone by the returned
+/// pivot (`T(-p) * bone * T(p)`) or the arms shear apart as soon as the pose
+/// leaves the rest pose. The
 /// shoulder line is estimated as the centroid of the top slice of the arm
 /// geometry, which is the clavicle/shoulder region on a humanoid rig and
 /// degrades gracefully on anything else.
-fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> Vec<BakedPrimitive> {
+fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> (Vec<BakedPrimitive>, [f32; 3]) {
     /// Fraction of the arm geometry, measured from the top, treated as the
     /// shoulder region. The hands and forearms are lower down, so this stays
     /// well clear of them.
@@ -317,7 +350,7 @@ fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> Vec<BakedPrimitive> {
         }
     }
     if count == 0.0 {
-        return arms;
+        return (arms, [0.0; 3]);
     }
     let pivot = [
         sum[0] as f32 / count as f32,
@@ -329,7 +362,8 @@ fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> Vec<BakedPrimitive> {
         pivot[0], pivot[1], pivot[2]
     );
 
-    arms.into_iter()
+    let shifted = arms
+        .into_iter()
         .map(|mut p| {
             for v in &mut p.vertices {
                 for k in 0..3 {
@@ -338,7 +372,8 @@ fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> Vec<BakedPrimitive> {
             }
             p
         })
-        .collect()
+        .collect();
+    (shifted, pivot)
 }
 
 /// A joint plus the bookkeeping the builder needs but the runtime does not.

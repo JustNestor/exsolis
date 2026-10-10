@@ -226,6 +226,10 @@ pub struct GltfAsset {
     /// Arms-only geometry for the first-person viewmodel, cut from the same
     /// rig so the hands animate from the same bone palette as the body.
     pub viewmodel: Option<GltfModel>,
+    /// Model-space point the arm vertices were shifted away from. The bone
+    /// palette of a viewmodel instance must be conjugated by this
+    /// translation (see `sync_gltf_instances`).
+    pub viewmodel_pivot: glam::Vec3,
     /// Joints, clips and the rest pose. `None` for models with no animation
     /// (duck, props), which take the unskinned fast path.
     pub skeleton: Option<crate::anim::Skeleton>,
@@ -263,12 +267,13 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
     } else {
         bytes
     };
-    let (model, viewmodel, skeleton) =
+    let (model, viewmodel, skeleton, viewmodel_pivot) =
         load_gltf_model(bytes).map_err(|e| format!("Failed to load GLTF model: {}", e))?;
 
     Ok(Arc::new(GltfAsset {
         model,
         viewmodel,
+        viewmodel_pivot,
         skeleton,
         source_path: String::new(), // Will be set by caller if needed
     }))
@@ -283,7 +288,15 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
 /// avatar is its own node) renders collapsed at the origin otherwise.
 fn load_gltf_model(
     bytes: &[u8],
-) -> Result<(GltfModel, Option<GltfModel>, Option<crate::anim::Skeleton>), String> {
+) -> Result<
+    (
+        GltfModel,
+        Option<GltfModel>,
+        Option<crate::anim::Skeleton>,
+        glam::Vec3,
+    ),
+    String,
+> {
     let (document, buffers, images) =
         gltf::import_slice(bytes).map_err(|e| format!("Failed to parse GLTF: {}", e))?;
 
@@ -306,6 +319,7 @@ fn load_gltf_model(
     // material, which is what collapses the girl's 795 primitives into a
     // single draw call.
     let rig = crate::anim::rig::Rig::build(&document, &buffers)?;
+    let arms_pivot = glam::Vec3::from_array(rig.arms_pivot);
     let (skeleton, meshes, arms) = rig.into_parts();
 
     Ok((
@@ -322,6 +336,7 @@ fn load_gltf_model(
             textures: Vec::new(),
         }),
         Some(skeleton),
+        arms_pivot,
     ))
 }
 
@@ -898,6 +913,8 @@ pub struct GltfModels {
     /// Arms-only meshes, keyed by the same asset path as `uploaded`. These
     /// reuse the body's materials, so they carry no material of their own.
     pub viewmodels: std::collections::HashMap<String, GltfGpuMesh>,
+    /// Per-model pivot the arms were recentred on; see `GltfAsset`.
+    pub viewmodel_pivots: std::collections::HashMap<String, glam::Vec3>,
     pub pending_paths: std::collections::HashSet<String>,
     /// `TextureManager::generation` textures were last uploaded into.
     pub texture_generation: u64,
@@ -974,6 +991,7 @@ pub fn upload_gltf_assets(
         if let Some(old) = models.viewmodels.remove(path) {
             render_state.gltf_allocator.free(old.allocation);
         }
+        models.viewmodel_pivots.remove(path);
     }
     if !changed_glb.is_empty() {
         // Textures are re-uploaded below; the old bindless ids are retained
@@ -1098,6 +1116,9 @@ pub fn upload_gltf_assets(
                                 data: vm.indices,
                             });
                             models.viewmodels.insert(path.clone(), vm.mesh);
+                            models
+                                .viewmodel_pivots
+                                .insert(path.clone(), asset.viewmodel_pivot);
                         }
                         Err(e) => warn!("gltf viewmodel upload failed for {path}: {e}"),
                     }
@@ -1184,11 +1205,15 @@ pub fn sync_gltf_instances(
     // The viewmodel is positioned from the eye, and faces the direction the
     // camera looks. Its projection is built the same way in `render_frame`,
     // so the two agree on where "in front of the camera" is.
+    //
+    // The model faces +Z in glTF space, but the camera looks along -Z.
+    // MODEL_YAW_OFFSET (PI) rotates the model to face the camera's forward.
+    // We apply this to the viewmodel's *orientation* but NOT its position offset,
+    // because VIEWMODEL_OFFSET is defined in the camera's yaw-only frame.
     let eye = camera.iter().next().map(|(transform, camera)| {
-        (
-            camera.eye_position(transform),
-            glam::Quat::from_rotation_y(camera.yaw),
-        )
+        let yaw_only = glam::Quat::from_rotation_y(camera.yaw);
+        let facing = yaw_only * glam::Quat::from_rotation_y(crate::entities::MODEL_YAW_OFFSET);
+        (camera.eye_position(transform), yaw_only, facing)
     });
 
     // A model that has not been uploaded yet is usually just "not downloaded
@@ -1245,6 +1270,11 @@ pub fn sync_gltf_instances(
         };
         let skeleton = models.skeletons.get(path).cloned();
         let viewmodel = models.viewmodels.get(path).cloned();
+        let viewmodel_pivot = models
+            .viewmodel_pivots
+            .get(path)
+            .copied()
+            .unwrap_or(glam::Vec3::ZERO);
 
         // Body instances and viewmodel instances are kept in separate
         // contiguous ranges. A draw call covers a whole `first_instance ..
@@ -1295,7 +1325,8 @@ pub fn sync_gltf_instances(
                     transform,
                     &instance.viewmodel_offset,
                     instance.scale,
-                    eye,
+                    eye.as_ref()
+                        .map(|(eye, yaw_only, facing)| (*eye, *yaw_only, *facing)),
                     swing.angle(),
                 ));
                 push_palette(
@@ -1308,6 +1339,18 @@ pub fn sync_gltf_instances(
                     &mut scratch,
                     &mut palette,
                 );
+                // The arm vertices were shifted by `-pivot` when the
+                // viewmodel was cut, but every bone rotates about the
+                // ORIGINAL joint positions. Re-express each bone in the
+                // shifted space, `T(-p) * bone * T(p)`; otherwise the arms
+                // only look right in the rest pose and fall apart (or fly
+                // off) as soon as the clip moves.
+                let row_start = palette.len() - PALETTE_STRIDE;
+                let into_shifted = glam::Mat4::from_translation(-viewmodel_pivot);
+                let out_of_shifted = glam::Mat4::from_translation(viewmodel_pivot);
+                for bone in &mut palette[row_start..] {
+                    *bone = into_shifted * *bone * out_of_shifted;
+                }
                 viewmodel_count += 1;
             }
         }
@@ -1412,11 +1455,12 @@ fn viewmodel_matrix(
     transform: &GlobalTransform,
     offset: &glam::Vec3,
     scale: f32,
-    eye: Option<(glam::Vec3, glam::Quat)>,
+    eye: Option<(glam::Vec3, glam::Quat, glam::Quat)>,
     swing: f32,
 ) -> glam::Mat4 {
     let (position, rotation) = match eye {
-        Some((eye, facing)) => (eye + facing * offset, facing),
+        // eye.0 = eye position, eye.1 = yaw-only (for position offset), eye.2 = facing (for rotation)
+        Some((eye, yaw_only, facing)) => (eye + yaw_only * offset, facing),
         // No camera yet (first frame): fall back to the entity's own
         // transform so the hands appear somewhere sensible rather than at
         // the origin.
