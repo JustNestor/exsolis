@@ -556,9 +556,14 @@ fn scan_catalog(
     // Committed `.glb` sources skip the converter above, so normalize their
     // texture encodings here instead: the client loader only understands
     // PNG and JPEG, and a WebP texture would make the whole model fail to
-    // load. The normalized copy is written next to the source and that is
-    // what gets packed, leaving the original untouched.
+    // load. The normalized copy is a build artifact, so it goes under
+    // `.exsolis/cache` rather than next to the source — writing it beside
+    // the source would make the catalog pick it up on the next scan and ship
+    // a second, redundant copy of the model to every client.
     let mut normalized: HashMap<String, PathBuf> = HashMap::new();
+    // Scratch space for generated artifacts. Kept out of the asset tree so
+    // the catalog never sees them.
+    let cache_dir = std::path::PathBuf::from(".exsolis/cache/gltf-pack");
     for (logical_path, disk_path) in &shippable {
         if !logical_path.ends_with(".glb") {
             continue;
@@ -568,7 +573,10 @@ fn scan_catalog(
         };
         match crate::gltf_pack::normalize_glb_textures(&bytes) {
             Ok(normalized_bytes) if normalized_bytes != bytes => {
-                let target = disk_path.with_extension("normalized.glb");
+                let target = cache_dir.join(format!(
+                    "{}.normalized.glb",
+                    logical_path.replace(['/', '\\'], "_")
+                ));
                 // The catalog is rebuilt whenever any asset changes, and
                 // decoding + re-encoding a 2 MB texture every time is pure
                 // waste. Reuse the artifact if it is newer than the source.
@@ -584,7 +592,9 @@ fn scan_catalog(
                     normalized.insert(logical_path.clone(), target);
                     continue;
                 }
-                if let Err(e) = std::fs::write(&target, &normalized_bytes) {
+                if let Err(e) = std::fs::create_dir_all(&cache_dir)
+                    .and_then(|()| std::fs::write(&target, &normalized_bytes))
+                {
                     warn!("texture normalization failed for {logical_path}: {e}");
                     continue;
                 }
