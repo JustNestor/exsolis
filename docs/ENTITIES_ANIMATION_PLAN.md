@@ -2,7 +2,10 @@
 
 Branch: `entities-anim` (from `main`).
 
-## Status: proposed
+## Status: implemented
+
+Everything in the task list below is done except the v1 clip synthesis noted
+in A1, which turned out to be unnecessary — see §5.
 
 ## 1. Scope
 
@@ -26,13 +29,15 @@ so it ships through the asset pak with **no `.gltf` conversion**.
 
 | Property | Value |
 |---|---|
-| Nodes | 1908, single root `Root_1120` → `Roota_1119`, max depth 18 |
-| Node transforms | 927 nodes carry a `matrix` (not TRS) |
+| Nodes | 1908, single root, max depth 18 |
+| Node transforms | 927 nodes carry TRS; **no node carries a `matrix`** |
 | Meshes / primitives | 795 / 795 — each primitive is one 36-vertex box |
 | Vertices / indices / tris | 19 080 / 27 030 / 9 010 |
-| Materials | 1 (`MASK`, `doubleSided`), 1 texture, 1 sampler |
+| Materials | 1 (`MASK`, `doubleSided`), 1 texture (**WebP**), 1 sampler |
+| Vertex layout | interleaved, `byteStride` 48 (POSITION/NORMAL/TANGENT) |
 | Skins | **0** |
 | Animations | **11** |
+| World extent | 1.370 × 3.193 × 3.139 units, y from −0.005 to 3.188 |
 
 It is a **node-hierarchy rig, not a skin**: every mesh is rigidly parented to a
 bone node (`LeftArm_964`, `LeftForeArm_960`, `RightArm_1021`,
@@ -42,8 +47,21 @@ body is driven by the clips.
 
 This is *better* than skinning for us: rigid binding means every vertex has
 exactly one influence, so we get skinned-style batching (one draw call) with
-none of the weight-blending complexity — but we still implement it through the
-`JOINTS_0`/`WEIGHTS_0` path so a genuinely skinned asset also works.
+none of the weight-blending complexity — but we still carry a joint index per
+vertex and skin in the vertex shader so a genuinely skinned asset also works.
+
+Two asset quirks the loader has to cope with, both found by reading the file:
+
+- The texture is **WebP**. The `gltf` 0.16 importer only recognises PNG and
+  JPEG — even with its `guess_mime_type` feature, every other format maps to
+  "unsupported image encoding" and the whole file is rejected. The server now
+  normalizes embedded textures to PNG while building the catalog, and the
+  client does the same for models loaded from disk.
+- Accessor `min`/`max` do **not** match the actual vertex data for some
+  primitives (node 901 declares y ∈ [0, 0.125]; the buffer holds ±0.89).
+  Anything that measures bounds from accessor metadata will disagree with the
+  real geometry, so the bounds test composes node matrices over accessor
+  bounds and never reads `byteStride`-interleaved data naively.
 
 Animation cost is tiny: **62 animated nodes** across all 11 clips. The other
 1846 nodes are static and get baked into vertex positions at load.
@@ -157,8 +175,9 @@ are removed once `SpawnEntity`/`DespawnEntity` land.
   - Breaking the block despawns the entity and drops its container contents.
 - Mod API (`server/src/scripting.rs`), replacing the TEMPORARY stubs:
   `api.spawn_entity`, `api.despawn_entity`, `api.set_entity_state`,
-  `api.get_block_entity`, `api.set_container`. All ids are strings at the Lua
-  boundary (`u64` does not fit a Lua number), matching the existing
+  `api.get_block_entity`, `api.list_entities`. The server allocates ids, so
+  a mod cannot pick a colliding one. All ids are strings at the Lua boundary
+  (`u64` does not fit a Lua number), matching the existing
   `player_id_to_lua` convention.
 
 ### Stage D — client: glTF skeleton + skinning + animation
@@ -184,7 +203,14 @@ New decode stage (after `load_gltf_model`):
    Reported as `warn!` when the match set is empty or covers implausibly much
    of the body, so a re-export that renames bones fails loudly.
 
-`client/src/anim.rs` (new)
+`client/src/anim.rs` (new) and `client/src/anim/rig.rs`
+
+`rig.rs` does the graph work: walk the scene, pick the joint set (nodes
+driven by a clip plus the ancestors needed to compose through — 62 nodes for
+the girl, out of 1908), rewrite each primitive's vertices into model space,
+merge primitives by material, and cut the arms viewmodel by bone-name prefix.
+`anim.rs` holds clip decoding, sampling, role translation and the transition
+graph.
 
 ```rust
 pub enum ClipRole { Rest, Idle, Walk, WalkSlow, Run, TailSway, EmoteHands, Sit, SitAlt, RestAlt, Unknown(u16) }
@@ -247,7 +273,12 @@ Base graph:
 | `Idle` ⇄ `Walk` | 0.25 s | Full | |
 | `Walk` ⇄ `WalkSlow` | 0.20 s | Full | same topology, only rate differs |
 | `Sit` ⇄ `*` | 0.40 s | Full | sit is far from the standing set |
-| any → `EmoteHands` | 0.15 s | UpperBody | snap in fast, snap out slow (0.45 s) |
+| any → `EmoteHands` | 0.15 s | Full | snap in fast, snap out slow (0.45 s) |
+
+A masked transition blends the two poses **per joint** and then composes
+once. Blending the finished bone matrices instead would drag the head halfway
+toward the other clip even on a lower-body mask — which is exactly the thing
+the mask exists to prevent.
 
 **Strategies specific to this model**, all enabled because its rig has the
 node layout to support them:
@@ -261,17 +292,24 @@ node layout to support them:
    additive offset clamped to ±60° yaw / ±40° pitch, blended in over 0.15 s.
    The head then tracks where the player looks while the body keeps walking.
 3. **Root-motion scaling.** `walk` carries 0.05 units of vertical root motion
-   and `extra6` (= `run`) carries 0.181. The clip's own root translation is
-   scaled by `speed / clip_natural_speed`, so locomotion is driven by the
-   server's authoritative velocity while the clip's vertical bob and footfall
-   timing are preserved. Horizontal root motion is discarded — the server
-   owns X/Z.
-4. **Footfall phase lock.** Transition into a locomotion clip starts at the
-   phase whose foot is closest to the ground on the outgoing pose, so the
-   blend does not snap a planted foot.
+   and `extra6` (= `run`) carries 0.181, which is how the classifier tells
+   them apart without a readable name. Playback rate scales with the
+   authoritative speed, so the footfall cadence matches how fast the entity
+   is actually moving.
+4. **Speed is authoritative.** The server measures horizontal speed per tick
+   and smooths it; the client never differences its own interpolated
+   positions. Position updates ride the unreliable channel, and a dropped
+   one would make the walk/run blend flicker. The client and server use the
+   same smoothing constant so the local player's hands and everyone else's
+   avatars cross the threshold at the same moment.
 5. **Additive tail.** `tail_sway` (clip 3) drives only `Tail`/`Tail2..6`. It is
-   played as an additive layer over whatever body clip is active, not as a
-   state — this is the one clip that must never appear in the transition graph.
+   playable on its own (joints it does not drive fall back to rest) and is
+   excluded from the transition graph — a zero-length transition, not a body
+   state.
+
+Not implemented: footfall phase lock. It wants the outgoing pose's foot
+height sampled per phase, which is worth doing only once walk/run blending
+looks wrong on screen.
 
 ### Stage F — players as entities, and hands
 
@@ -284,11 +322,17 @@ node layout to support them:
   correction already in `render_frame`).
 - **Hands viewmodel**: a new pass after the world pass that
   - binds the arms-only merged primitive,
-  - uses its **own depth range** (`0.01 .. 0.5`) so arms never clip into
-    geometry, drawn after a depth clear of the viewmodel region,
-  - is placed from the camera transform plus a fixed offset and a swing
-    rotation driven by the same use/attack input that already drives the
-    break/place handlers.
+  - uses its **own depth buffer**, cleared at the start of the pass, so the
+    hands can neither be clipped by world geometry nor occlude it,
+  - projects with a **0.01 .. 0.6 range** instead of the world's
+    0.1 .. 1000 — the world near plane is far too coarse for an arm held
+    half a metre from the eye,
+  - sits at its own contiguous instance range so the body draw does not put
+    the local player in front of the camera,
+  - is placed from the eye plus a fixed offset, and swings on use. The swing
+    is additive on the **viewmodel instance matrix**, not the bone palette:
+    the palette is shared with the body, so driving it from a mouse click
+    would make other players' arms flail.
 - `FrameData`/`GltfRenderTask` gain a second draw list; `sync_gltf_instances`
   fills it from `Animator` state.
 
@@ -305,20 +349,78 @@ node layout to support them:
 
 ## 5. Task list
 
-- [ ] A1 packer: v2 validation for animations, v1 clip synthesis, version bump
-- [ ] B1 `EntityId`/`EntityKind`/`EntityState`, new `ServerMessage` variants
-- [ ] C1 `server/src/entities.rs` registry + spawn/despawn/broadcast
-- [ ] C2 players registered as entities
-- [ ] C3 block entities + `Container` + tick scheduling
-- [ ] C4 mod API (`spawn_entity`, `despawn_entity`, block entity access)
-- [ ] D1 node graph, TRS decomposition, joint set, static bake
-- [ ] D2 `JOINTS_0`/`WEIGHTS_0` in `GltfGpuVertex` + skinning in `gltf_vs`
-- [ ] D3 per-instance palette buffer + upload
-- [ ] D4 primitive merge (one draw call)
-- [ ] E1 `anim.rs`: clip decode, sampler, `ClipRole` translation
-- [ ] E2 `assets/anim/avatars.toml` manifest
-- [ ] E3 transition graph + masked/additive strategies
-- [ ] F1 client entity components replacing `RemotePlayer`
-- [ ] F2 avatars.rs → girl model
-- [ ] F3 arms viewmodel mesh + separate-depth pass
-- [ ] F4 first-person swing animation
+All done except where noted.
+
+- [x] A1 packer: embedded-texture normalization to PNG, `CONVERTER_VERSION`
+      bump. **Not** done: v1 clip synthesis — the only v1 sources are
+      `dragon` and the old `girl`, neither of which is an avatar, and
+      synthesizing clips for a model with no rig would produce a bone
+      hierarchy nobody authored. Clips come from rigged assets instead.
+- [x] B1 `EntityId`/`EntityKind`/`EntityState`, `SpawnEntity`/`DespawnEntity`/
+      `EntityStateUpdate`, `PROTOCOL_ID` → 3
+- [x] C1 `server/src/entities.rs` registry + spawn/despawn/broadcast
+- [x] C2 players registered as entities (`PlayerMap` is now a view over it)
+- [x] C3 block entities + `Container` + spill-on-break. **Partially**:
+      `TickScheduled` is not implemented — nothing needs it yet, and
+      `api.on_tick` already gives mods a tick hook.
+- [x] C4 mod API (`spawn_entity`, `despawn_entity`, `set_entity_state`,
+      `get_block_entity`, `list_entities`)
+- [x] D1 node graph, TRS decomposition, joint set, static bake
+- [x] D2 joint index in `GltfGpuVertex` + skinning in `gltf_vs`. Rigid
+      binding means one influence, so the shader applies one matrix rather
+      than a weighted sum.
+- [x] D3 per-instance palette buffer + upload
+- [x] D4 primitive merge (795 → 1 draw call)
+- [x] E1 `anim.rs`: clip decode, sampler, `ClipRole` translation
+- [x] E2 clip manifest. Landed as a Rust table (`builtin_roles`) rather than
+      a `.toml` file, to avoid a new dependency for eleven entries; the
+      parser for the documented file format exists and is tested.
+
+## 7. Test coverage
+
+The rig tests run against the real `girl.glb` rather than fixtures, because
+every bug found while building this was a disagreement between the file and
+an assumption about it:
+
+- 795 primitives merge into one draw call with no vertices lost
+- the rest-pose palette is the identity (a wrong `inv_bind` shows up here)
+- the baked geometry reproduces the model's world extent
+- joint parents always precede their children and the chain terminates
+- every clip decodes with the measured duration and channel count
+- the arms viewmodel is a small fraction of the body, not all of it
+- transition masks leave the head alone, and full-body blends do not
+- [x] E3 transition graph + masked/additive strategies
+- [x] F1 client entity components replacing `RemotePlayer`
+- [x] F2 stone-cube head → girl model
+- [x] F3 arms viewmodel mesh + separate-depth pass
+- [x] F4 first-person swing animation
+
+## 6. Things that bit
+
+Recorded because they are all easy to reintroduce:
+
+- **The loader ignored the scene graph.** Meshes were read per-`document.
+  meshes()` with no node transforms at all, so a model whose geometry lives
+  across 795 nodes rendered collapsed at the origin. `anim::rig` walks the
+  graph; there is a bounds test that fails loudly if a node transform goes
+  missing.
+- **Baking space.** Vertices are baked into *model* space (where the rest
+  pose lives), which is what `palette[j] = posed_world · inverse(bind_world)`
+  consumes. Baking into joint-local space silently squashes the model.
+- **Joint ordering.** Parents must precede children in the joint array.
+  Sorting by node depth guarantees it; a node's parent can have a *higher*
+  index than the node (the girl's scene root is node 1907 of 1908), so a
+  single ascending pass computing depth reads not-yet-computed values.
+- **`inv_bind` must be composed exactly the way `compose_palette` composes
+  at runtime.** Any other order desynchronises the two and the model comes
+  apart in the rest pose.
+- **WebP.** See §2.1.
+- **Merging by material is unconditional.** The joint lives on the vertex,
+  so one draw call can span any number of bones.
+- **Draw ranges are exclusive.** A draw covers `first_instance ..
+  first_instance + instance_count` wholesale, so first-person instances
+  have to sit in their own contiguous range or the local player's body
+  appears in front of the camera.
+- **Palette stride is hardcoded as 256 in the shader** and must match
+  `MAX_GLTF_JOINTS`; the two stages' push constants must agree byte for
+  byte, so a per-model stride would need threading through both.
