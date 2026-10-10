@@ -32,6 +32,7 @@ use crate::gltf::{GltfMesh, GltfPrimitive, GltfVertex};
 pub const STATIC_JOINT: usize = 0;
 
 /// One primitive after the rig has placed it in joint space.
+#[derive(Clone)]
 struct BakedPrimitive {
     vertices: Vec<GltfVertex>,
     indices: Vec<u32>,
@@ -39,10 +40,45 @@ struct BakedPrimitive {
     joint: u16,
 }
 
+/// Bone-name prefixes that make up the first-person viewmodel.
+///
+/// Matched against joint names rather than vertex positions, so the arms come
+/// out clean regardless of how the mesh is deformed. Each entry is a prefix
+/// of a bone name (`LeftArm_964`), and the trailing `_<id>` that the exporter
+/// appends is what makes prefix matching stable across re-exports.
+const ARM_JOINT_PREFIXES: &[&str] = &[
+    // Body arms.
+    "LeftArm",
+    "LeftForeArm",
+    "RightArm",
+    "RightForeArm",
+    "RightHand",
+    // Hair and garment arms that follow the body arms; without these the
+    // sleeves and long hair would stay behind in the world.
+    "H_LeftArm",
+    "H_RightArm",
+    "H_above_Left",
+    "H_above_Right",
+    "H_hm_",
+    "Hoodie_Left",
+    "Hoodie_Right",
+];
+
+/// True when a joint belongs to the arms.
+fn is_arm_joint(name: &str) -> bool {
+    ARM_JOINT_PREFIXES
+        .iter()
+        .any(|prefix| name.starts_with(prefix))
+}
+
 /// A decoded, ready-to-upload model: joint-space geometry plus its skeleton.
 pub struct Rig {
     pub skeleton: Skeleton,
     primitives: Vec<BakedPrimitive>,
+    /// The same geometry with everything outside the arms removed, for the
+    /// first-person viewmodel. `None` when no joint matched, which is
+    /// reported as a warning rather than silently rendering nothing.
+    pub arms: Option<Vec<BakedPrimitive>>,
 }
 
 impl Rig {
@@ -119,6 +155,7 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
+        let arms = build_arms(&joints, &primitives);
         let primitives = merge_by_material(primitives);
 
         let skeleton = Skeleton {
@@ -142,31 +179,97 @@ impl Rig {
         Ok(Rig {
             skeleton,
             primitives,
+            arms,
         })
+    }
+
+    /// Arms-only geometry for the first-person viewmodel.
+    pub fn into_viewmodels(self) -> (Vec<GltfMesh>, Option<Vec<GltfMesh>>) {
+        let arms = self.arms.map(merge_by_material).map(to_meshes);
+        (to_meshes(self.primitives), arms)
     }
 
     /// Take the skeleton out, leaving the geometry. [`Rig::meshes`] consumes
     /// what is left.
-    pub fn into_parts(self) -> (Skeleton, Vec<GltfMesh>) {
+    pub fn into_parts(self) -> (Skeleton, Vec<GltfMesh>, Option<Vec<GltfMesh>>) {
         let skeleton = self.skeleton.clone();
-        (skeleton, self.meshes())
+        let (body, arms) = self.into_viewmodels();
+        (skeleton, body, arms)
     }
 
     /// Flatten the rig into engine meshes, one per material.
     pub fn meshes(self) -> Vec<GltfMesh> {
-        self.primitives
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| GltfMesh {
-                name: Some(format!("rig_material_{i}")),
-                primitives: vec![GltfPrimitive {
-                    vertices: p.vertices,
-                    indices: p.indices,
-                    material_index: p.material_index,
-                }],
-            })
-            .collect()
+        to_meshes(self.primitives)
     }
+}
+
+fn to_meshes(primitives: Vec<BakedPrimitive>) -> Vec<GltfMesh> {
+    primitives
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| GltfMesh {
+            name: Some(format!("rig_material_{i}")),
+            primitives: vec![GltfPrimitive {
+                vertices: p.vertices,
+                indices: p.indices,
+                material_index: p.material_index,
+            }],
+        })
+        .collect()
+}
+
+/// Extract the primitives bound to arm joints, for the first-person
+/// viewmodel.
+///
+/// The same joint indices are kept, so the viewmodel animates with the very
+/// same bone palette as the body — the arms swing because the walk clip says
+/// so, not because a second animation was authored for them.
+fn build_arms(joints: &[JointBuild], primitives: &[BakedPrimitive]) -> Option<Vec<BakedPrimitive>> {
+    let arm_set: std::collections::HashSet<u16> = joints
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| is_arm_joint(&j.joint.name))
+        .map(|(index, _)| index as u16)
+        .collect();
+
+    let kept: Vec<BakedPrimitive> = primitives
+        .iter()
+        .filter(|p| arm_set.contains(&p.joint))
+        .cloned()
+        .collect();
+
+    if kept.is_empty() {
+        warn!(
+            "viewmodel: no arm joints matched ({} prefixes, {} joints scanned); \
+             first-person hands will be empty",
+            ARM_JOINT_PREFIXES.len(),
+            joints.len()
+        );
+        return None;
+    }
+    let kept_joints: std::collections::HashSet<u16> = kept.iter().map(|p| p.joint).collect();
+    let total_verts: usize = primitives.iter().map(|p| p.vertices.len()).sum();
+    let kept_verts: usize = kept.iter().map(|p| p.vertices.len()).sum();
+    let share = kept_verts as f32 / total_verts.max(1) as f32;
+    // An arms-only viewmodel should be a small fraction of the body. If it
+    // is most of the model the bone names must have changed, and silently
+    // drawing a headless-but-mostly-intact avatar in first person is worse
+    // than drawing nothing.
+    if share > 0.35 {
+        warn!(
+            "viewmodel: arm joints matched {:.0}% of the geometry ({} joints) — bone \
+             names probably changed",
+            share * 100.0,
+            kept_joints.len()
+        );
+    }
+    debug!(
+        "viewmodel: {} arm joints, {} of {} verts",
+        kept_joints.len(),
+        kept_verts,
+        total_verts
+    );
+    Some(kept)
 }
 
 /// A joint plus the bookkeeping the builder needs but the runtime does not.
@@ -610,7 +713,7 @@ mod tests {
     fn girl_rig_bakes_the_hierarchy_into_a_handful_of_draws() {
         let (document, buffers, _images) = load("girl.glb");
         let rig = Rig::build(&document, &buffers).expect("rig");
-        let (skeleton, meshes) = rig.into_parts();
+        let (skeleton, meshes, _) = rig.into_parts();
 
         // 795 primitives collapse to one draw call because the model has a
         // single material.
@@ -745,7 +848,7 @@ mod tests {
         let (document, buffers, _images) = load("girl.glb");
         let rig = Rig::build(&document, &buffers).expect("rig");
         let skeleton = rig.skeleton.clone();
-        let (_, meshes) = rig.into_parts();
+        let (_, meshes, _) = rig.into_parts();
         let palette = rest_palette(&skeleton);
 
         let mut lo = [f32::INFINITY; 3];
@@ -776,6 +879,75 @@ mod tests {
             lo[1],
             hi[1]
         );
+    }
+
+    /// The first-person viewmodel must come out of the same rig so the
+    /// hands animate from the same bone palette as the body.
+    #[test]
+    fn the_avatar_yields_an_arms_only_viewmodel() {
+        let (document, buffers, _images) = load("girl.glb");
+        let rig = Rig::build(&document, &buffers).expect("rig");
+        let (_, body, arms) = rig.into_parts();
+
+        let arms = arms.expect("the avatar must have arms to extract");
+        assert_eq!(arms.len(), 1, "arms should merge into one draw call");
+
+        let body_verts: usize = body
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .map(|p| p.vertices.len())
+            .sum();
+        let arm_verts: usize = arms
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .map(|p| p.vertices.len())
+            .sum();
+        assert!(arm_verts > 0, "arms viewmodel has no vertices");
+        assert!(
+            arm_verts < body_verts,
+            "arms viewmodel ({arm_verts}) is not smaller than the body ({body_verts}) \
+             — the arm joint prefixes probably stopped matching"
+        );
+        // An arms-only slice should be a modest share of the body, not most
+        // of it.
+        let share = arm_verts as f32 / body_verts as f32;
+        assert!(
+            share < 0.35,
+            "arms are {share:.0}% of the body, which means the bone names changed"
+        );
+        // Every arm vertex must still point at a real joint, or the palette
+        // lookup reads out of bounds.
+        let joint_count = 82usize; // measured: 81 animated nodes + the static slot
+        for v in arms[0].primitives[0].vertices.iter() {
+            assert!((v.joint as usize) < joint_count);
+        }
+    }
+
+    #[test]
+    fn arm_prefixes_match_this_rigs_bone_names() {
+        for name in [
+            "LeftArm_964",
+            "LeftForeArm_960",
+            "RightArm_1021",
+            "RightForeArm_1009",
+            "RightHand_1006",
+            "H_LeftArm_918",
+            "H_RightArm_1017",
+            "H_above_Left_b_874",
+            "H_hm_above2_899",
+            "Hoodie_Left_886",
+        ] {
+            assert!(is_arm_joint(name), "{name} should be an arm joint");
+        }
+        for name in [
+            "Head_822",
+            "LeftLeg_52",
+            "RightFoot_95",
+            "Breast_1064",
+            "Tail_182",
+        ] {
+            assert!(!is_arm_joint(name), "{name} should not be an arm joint");
+        }
     }
 
     // Helpers for the bound check above.

@@ -214,6 +214,9 @@ pub enum AlphaMode {
 #[derive(Debug)]
 pub struct GltfAsset {
     pub model: GltfModel,
+    /// Arms-only geometry for the first-person viewmodel, cut from the same
+    /// rig so the hands animate from the same bone palette as the body.
+    pub viewmodel: Option<GltfModel>,
     /// Joints, clips and the rest pose. `None` for models with no animation
     /// (duck, props), which take the unskinned fast path.
     pub skeleton: Option<crate::anim::Skeleton>,
@@ -251,11 +254,12 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
     } else {
         bytes
     };
-    let (model, skeleton) =
+    let (model, viewmodel, skeleton) =
         load_gltf_model(bytes).map_err(|e| format!("Failed to load GLTF model: {}", e))?;
 
     Ok(Arc::new(GltfAsset {
         model,
+        viewmodel,
         skeleton,
         source_path: String::new(), // Will be set by caller if needed
     }))
@@ -268,7 +272,9 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
 /// mesh primitive is placed by its node's world transform — a model whose
 /// geometry is distributed across a node hierarchy (every box of the girl
 /// avatar is its own node) renders collapsed at the origin otherwise.
-fn load_gltf_model(bytes: &[u8]) -> Result<(GltfModel, Option<crate::anim::Skeleton>), String> {
+fn load_gltf_model(
+    bytes: &[u8],
+) -> Result<(GltfModel, Option<GltfModel>, Option<crate::anim::Skeleton>), String> {
     let (document, buffers, images) =
         gltf::import_slice(bytes).map_err(|e| format!("Failed to parse GLTF: {}", e))?;
 
@@ -291,7 +297,7 @@ fn load_gltf_model(bytes: &[u8]) -> Result<(GltfModel, Option<crate::anim::Skele
     // material, which is what collapses the girl's 795 primitives into a
     // single draw call.
     let rig = crate::anim::rig::Rig::build(&document, &buffers)?;
-    let (skeleton, meshes) = rig.into_parts();
+    let (skeleton, meshes, arms) = rig.into_parts();
 
     Ok((
         GltfModel {
@@ -299,6 +305,13 @@ fn load_gltf_model(bytes: &[u8]) -> Result<(GltfModel, Option<crate::anim::Skele
             materials,
             textures,
         },
+        arms.map(|meshes| GltfModel {
+            meshes,
+            // The viewmodel draws with the body's materials; duplicating
+            // them would waste the global material budget.
+            materials: Vec::new(),
+            textures: Vec::new(),
+        }),
         Some(skeleton),
     ))
 }
