@@ -88,9 +88,10 @@ impl Compiled {
     ///
     /// Required for hand-written `extern "C"` wrappers obtained through
     /// [`Compiled::get`] (which cannot take a guard themselves): without it the
-    /// string/array builtins would panic on a missing runtime.
-    pub fn enter(&self) -> crate::runtime::RuntimeGuard {
-        self.runtime.enter()
+    /// string/array builtins would panic on a missing runtime, and host
+    /// functions could not build strings.
+    pub fn enter(&self) -> crate::runtime::Guard {
+        crate::runtime::enter(&self.runtime)
     }
 
     /// # Safety
@@ -114,8 +115,9 @@ impl Compiled {
     #[track_caller]
     pub unsafe fn call_i64(&self, name: &str, args: &[i64]) -> i64 {
         // String/array builtins resolve the module heap through a thread-local,
-        // so the module must be entered for the duration of the call.
-        let _guard = self.runtime.enter();
+        // so the module must be entered for the duration of the call — and host
+        // functions need it too, to build strings they hand back.
+        let _guard = crate::runtime::enter(&self.runtime);
         let e = self.entry(name).expect("unknown export");
         assert!(e.params.len() == args.len(), "argument count mismatch");
         assert!(args.len() <= 4, "call_i64 supports at most 4 arguments");

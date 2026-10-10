@@ -60,7 +60,55 @@ impl TrapKind {
     }
 }
 
+/// Build a string in the arena of the module currently being called.
+///
+/// Returns 0 (an empty string) when no module is being called — a host function
+/// invoked outside a handler has nowhere to allocate.
+pub fn host_string(text: &str) -> i64 {
+    HOST.with(|h| {
+        h.borrow()
+            .as_ref()
+            .map(|runtime| runtime.make_string(text))
+            .unwrap_or(0)
+    })
+}
+
+/// Enter a module for both roles it has during a call: the runtime whose heap
+/// the builtins allocate in, *and* the runtime host functions build strings in.
+///
+/// Users normally go through [`crate::Compiled::enter`] / `call_i64`, which do
+/// this for them; it is public for hand-written `extern "C"` wrappers obtained
+/// with [`crate::Compiled::get`].
+pub fn enter(runtime: &Arc<TesjitRuntime>) -> Guard {
+    let rt = runtime.enter();
+    let previous = HOST.with(|h| h.borrow_mut().replace(Arc::clone(runtime)));
+    Guard {
+        _rt: rt,
+        previous: Some(previous),
+    }
+}
+
+/// Restores both thread-locals on drop.
+pub struct Guard {
+    /// Restores the module runtime (which the builtins resolve through) — its
+    /// own `Drop` does that, hence the underscore-prefixed field.
+    _rt: RuntimeGuard,
+    previous: Option<Option<Arc<TesjitRuntime>>>,
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous.take() {
+            HOST.with(|h| *h.borrow_mut() = previous);
+        }
+    }
+}
+
 thread_local! {
+    /// The runtime host functions should build strings in (the module being
+    /// called). Set for the duration of a handler invocation.
+    static HOST: std::cell::RefCell<Option<Arc<TesjitRuntime>>> =
+        const { std::cell::RefCell::new(None) };
     /// The runtime of the module currently executing on this thread.
     ///
     /// Execution is single-threaded per module (same model as the current Lua
@@ -249,6 +297,24 @@ impl TesjitRuntime {
         true
     }
 
+    /// Allocate an arena string holding `text`, returning its pointer (the
+    /// same value JIT code would see from a string literal).
+    ///
+    /// This is how a host function returns or passes a string: it cannot know
+    /// the module's arena otherwise, and strings *must* live there to be valid
+    /// for the module's lifetime.
+    pub fn make_string(&self, text: &str) -> i64 {
+        let bytes = text.as_bytes();
+        let Some(ptr) = self.alloc(8 + bytes.len()) else {
+            return 0;
+        };
+        unsafe {
+            std::ptr::write_unaligned(ptr as *mut i64, bytes.len() as i64);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.add(8), bytes.len());
+        }
+        ptr as i64
+    }
+
     /// Bytes handed out so far (diagnostics/benchmarks).
     pub fn used(&self) -> usize {
         self.arena.borrow().used
@@ -269,6 +335,7 @@ impl TesjitRuntime {
         0
     }
 
+    /// Build a string in this runtime's arena and return its pointer (the same
     fn alloc(&self, size: usize) -> Option<*mut u8> {
         self.arena.borrow_mut().alloc(size)
     }
