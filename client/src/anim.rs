@@ -789,12 +789,29 @@ pub fn apply_manifest(clips: &mut [AnimationClip], manifest: &[(String, ClipRole
     }
 }
 
-/// The authoritative role table for `assets/models/girl2.glb`.
+/// The authoritative role table for the two Blockbench exports of this avatar.
 ///
-/// Measured from the file (see docs/ENTITIES_ANIMATION_PLAN.md §2.2). Every
+/// Measured from the files (see docs/ENTITIES_ANIMATION_PLAN.md §2.2). Every
 /// clip name except `walk` and `extra6` was destroyed by the exporter, so
 /// these indices are the only stable identifier.
+///
+/// Both paths are listed because they are the *same* rig in two containers:
+/// `girl.glb` is the node-hierarchy original that ships as `PLAYER_MODEL`, and
+/// `girl2.glb` is the skinned re-export with identical clips. Keying on only
+/// one of them leaves whichever is running with no manifest at all, which is
+/// how the shipped avatar once fell back to the structural classifier.
 pub const GIRL_CLIP_ROLES: &[(&str, ClipRole)] = &[
+    ("models/girl.glb#0", ClipRole::Rest),
+    ("models/girl.glb#1", ClipRole::Walk),
+    ("models/girl.glb#2", ClipRole::Walk),
+    ("models/girl.glb#3", ClipRole::TailSway),
+    ("models/girl.glb#4", ClipRole::EmoteHands),
+    ("models/girl.glb#5", ClipRole::WalkSlow),
+    ("models/girl.glb#6", ClipRole::Sit),
+    ("models/girl.glb#7", ClipRole::Run),
+    ("models/girl.glb#8", ClipRole::Idle),
+    ("models/girl.glb#9", ClipRole::SitAlt),
+    ("models/girl.glb#10", ClipRole::RestAlt),
     ("models/girl2.glb#0", ClipRole::Rest),
     ("models/girl2.glb#1", ClipRole::Walk),
     ("models/girl2.glb#2", ClipRole::Walk),
@@ -810,9 +827,14 @@ pub const GIRL_CLIP_ROLES: &[(&str, ClipRole)] = &[
 
 /// Clip roles bundled in the binary for `path`, if any.
 pub fn builtin_roles(path: &str) -> &'static [(&'static str, ClipRole)] {
-    match path {
-        "models/girl2.glb" => GIRL_CLIP_ROLES,
-        _ => &[],
+    // The table is stored as one slice with a fixed entry per model, so
+    // slicing keeps the path -> role mapping in one place.
+    if path == "models/girl.glb" {
+        &GIRL_CLIP_ROLES[0..11]
+    } else if path == "models/girl2.glb" {
+        &GIRL_CLIP_ROLES[11..]
+    } else {
+        &[]
     }
 }
 

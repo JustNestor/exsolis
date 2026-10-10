@@ -42,17 +42,22 @@ struct BakedPrimitive {
 
 /// Bone-name prefixes that make up the first-person viewmodel.
 ///
-/// Matched against joint names rather than vertex positions, so the arms come
-/// out clean regardless of how the mesh is deformed. Each entry is a prefix
-/// of a bone name (`LeftArm_964`), and the trailing `_<id>` that the exporter
-/// appends is what makes prefix matching stable across re-exports.
+/// Upper-arm joints the first-person arms hang from.
+///
+/// The arm cut starts here and walks down the joint tree (see
+/// [`arm_joint_set`]), so this only has to name the two tops of the arms —
+/// never the forearm, hand or finger bones, which is what made the old
+/// name-prefix-only cut tear the hands off.
+const ARM_ROOT_PREFIXES: &[&str] = &["LeftArm", "RightArm"];
+
+/// Garment bones that follow the body arms but are parented to the chest
+/// rather than hanging off them.
+///
+/// Each entry is a prefix of a bone name (`LeftArm_964`), and the trailing
+/// `_<id>` that the exporter appends is what makes prefix matching stable
+/// across re-exports. Bones *below* an upper-arm joint do not need an entry
+/// here — [`arm_joint_set`] takes those by hierarchy.
 const ARM_JOINT_PREFIXES: &[&str] = &[
-    // Body arms.
-    "LeftArm",
-    "LeftForeArm",
-    "RightArm",
-    "RightForeArm",
-    "RightHand",
     // Hair and garment arms that follow the body arms; without these the
     // sleeves and long hair would stay behind in the world.
     "H_LeftArm",
@@ -213,7 +218,7 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        let (arms, arms_pivot) = match build_arms(&joints, &primitives) {
+        let (arms, arms_pivot) = match build_arms(&joints, &world, &primitives) {
             Some((arms, pivot)) => (Some(arms), pivot),
             None => (None, [0.0; 3]),
         };
@@ -288,14 +293,11 @@ fn to_meshes(primitives: Vec<BakedPrimitive>) -> Vec<GltfMesh> {
 /// so, not because a second animation was authored for them.
 fn build_arms(
     joints: &[JointBuild],
+    world: &[glam::Mat4],
     primitives: &[BakedPrimitive],
 ) -> Option<(Vec<BakedPrimitive>, [f32; 3])> {
-    let arm_set: std::collections::HashSet<u16> = joints
-        .iter()
-        .enumerate()
-        .filter(|(_, j)| is_arm_joint(&j.joint.name))
-        .map(|(index, _)| index as u16)
-        .collect();
+    let arm_set = arm_joint_set(&joints.iter().map(|j| &j.joint).collect::<Vec<_>>()[..]);
+    let pivot = arm_shoulder(joints, world);
 
     let kept: Vec<BakedPrimitive> = primitives
         .iter()
@@ -312,8 +314,7 @@ fn build_arms(
         );
         return None;
     }
-    let kept_joints: std::collections::HashSet<u16> = kept.iter().map(|p| p.joint).collect();
-    let total_verts: usize = primitives.iter().map(|p| p.vertices.len()).sum();
+    let kept_joints: std::collections::HashSet<u16> = kept.iter().map(|p| p.joint).collect();    let total_verts: usize = primitives.iter().map(|p| p.vertices.len()).sum();
     let kept_verts: usize = kept.iter().map(|p| p.vertices.len()).sum();
     let share = kept_verts as f32 / total_verts.max(1) as f32;
     // An arms-only viewmodel should be a small fraction of the body. If it
@@ -338,18 +339,118 @@ fn build_arms(
         return None;
     }
     debug!(
-        "viewmodel: {} arm joints, {} of {} verts",
+        "viewmodel: {} arm joints, {} of {} verts, shoulder at ({:.2}, {:.2}, {:.2})",
         kept_joints.len(),
         kept_verts,
-        total_verts
+        total_verts,
+        pivot[0],
+        pivot[1],
+        pivot[2]
     );
-    Some(recenter_on_shoulders(kept))
+    Some(shift_arms(kept, pivot))
+}
+
+/// Every joint that belongs to the first-person arms.
+///
+/// Chosen by **hierarchy first, name second**:
+///
+/// 1. Everything below the two upper-arm joints is an arm, whatever the
+///    exporter called it. `girl.glb` binds its left hand/finger cubes to
+///    `spLeft_963` and its right ones to `RightHand_1006` — both hang off the
+///    forearm, and neither looks like an "arm" bone. Name lists alone can
+///    never cover that, which is exactly how the hands ended up torn off.
+/// 2. Garment bones that follow the arms but are parented to the chest
+///    (`Hoodie_Left`, `H_above_Left`, `H_hm_*`, ...) are added by prefix, so
+///    sleeves do not stay behind in the world.
+fn arm_joint_set(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u16> {
+    let mut arm_set: std::collections::HashSet<u16> = joints
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| is_arm_joint(&j.name))
+        .map(|(index, _)| index as u16)
+        .collect();
+
+    let roots: Vec<u16> = joints
+        .iter()
+        .enumerate()
+        .filter(|(_, j)| {
+            ARM_ROOT_PREFIXES
+                .iter()
+                .any(|prefix| j.name.starts_with(prefix))
+        })
+        .map(|(index, _)| index as u16)
+        .collect();
+    if roots.is_empty() {
+        warn!(
+            "viewmodel: no upper-arm joint matched {:?} ({} joints scanned); \
+             falling back to name prefixes only",
+            ARM_ROOT_PREFIXES,
+            joints.len()
+        );
+    }
+    for root in roots {
+        // `Joint::parent` is the nearest *joint* ancestor, so the joint tree is
+        // closed under descendants and this walk reaches the whole arm subtree
+        // without needing the node graph.
+        mark_subtree(root, joints, &mut arm_set);
+    }
+    arm_set
+}
+
+/// Collect `root` and every joint that hangs below it.
+fn mark_subtree(
+    root: u16,
+    joints: &[&crate::anim::Joint],
+    out: &mut std::collections::HashSet<u16>,
+) {
+    out.insert(root);
+    for (index, joint) in joints.iter().enumerate() {
+        if joint.parent == Some(root as usize) {
+            mark_subtree(index as u16, joints, out);
+        }
+    }
+}
+
+/// Where the arms pivot, in model space: the shoulder line.
+///
+/// The rest **world** translation of the two upper-arm joints is the exact
+/// point the arm rotates about, which is the only pivot the shifted geometry
+/// and the conjugated bone palette can agree on. The previous version
+/// estimated it as the centroid of the top 10% slice of the arm *geometry*,
+/// which drifts with every sleeve cube the exporter adds above the shoulder.
+fn arm_shoulder(joints: &[JointBuild], world: &[glam::Mat4]) -> [f32; 3] {
+    let mut sum = [0f64; 3];
+    let mut count = 0u32;
+    for joint in joints {
+        if !ARM_ROOT_PREFIXES
+            .iter()
+            .any(|prefix| joint.joint.name.starts_with(prefix))
+        {
+            continue;
+        }
+        let Some(matrix) = world.get(joint.node_index) else {
+            continue;
+        };
+        let at = matrix.transform_point3(glam::Vec3::ZERO);
+        for axis in 0..3 {
+            sum[axis] += at[axis] as f64;
+        }
+        count += 1;
+    }
+    if count == 0 {
+        return [0.0; 3];
+    }
+    [
+        sum[0] as f32 / count as f32,
+        sum[1] as f32 / count as f32,
+        sum[2] as f32 / count as f32,
+    ]
 }
 
 /// Move the arms so the viewmodel's origin is between the shoulders.
 ///
 /// The vertices are baked into model space — the space the body draw uses —
-/// where the shoulders sit around `y = 2.5` for a 3.2-unit-tall avatar. The
+/// where the shoulders sit around `y = 2.0` for a 3.1-unit-tall avatar. The
 /// viewmodel instance matrix is placed relative to the eye, so without this
 /// the arms float a metre and a half above the camera instead of hanging in
 /// front of it.
@@ -358,53 +459,8 @@ fn build_arms(
 /// ORIGINAL joint positions, so it does NOT line up with the shifted
 /// geometry on its own. Callers must conjugate every bone by the returned
 /// pivot (`T(-p) * bone * T(p)`) or the arms shear apart as soon as the pose
-/// leaves the rest pose. The
-/// shoulder line is estimated as the centroid of the top slice of the arm
-/// geometry, which is the clavicle/shoulder region on a humanoid rig and
-/// degrades gracefully on anything else.
-fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> (Vec<BakedPrimitive>, [f32; 3]) {
-    /// Fraction of the arm geometry, measured from the top, treated as the
-    /// shoulder region. The hands and forearms are lower down, so this stays
-    /// well clear of them.
-    const SHOULDER_SLICE: f32 = 0.10;
-
-    let top = arms
-        .iter()
-        .flat_map(|p| p.vertices.iter())
-        .map(|v| v.position[1])
-        .fold(f32::NEG_INFINITY, f32::max);
-    let cutoff = top
-        - (top
-            - arms
-                .iter()
-                .flat_map(|p| p.vertices.iter())
-                .map(|v| v.position[1])
-                .fold(f32::INFINITY, f32::min))
-            * SHOULDER_SLICE;
-
-    let mut sum = [0f64; 3];
-    let mut count = 0f64;
-    for v in arms.iter().flat_map(|p| p.vertices.iter()) {
-        if v.position[1] >= cutoff {
-            for k in 0..3 {
-                sum[k] += v.position[k] as f64;
-            }
-            count += 1.0;
-        }
-    }
-    if count == 0.0 {
-        return (arms, [0.0; 3]);
-    }
-    let pivot = [
-        sum[0] as f32 / count as f32,
-        sum[1] as f32 / count as f32,
-        sum[2] as f32 / count as f32,
-    ];
-    debug!(
-        "viewmodel: recentred arms on the shoulder line at ({:.2}, {:.2}, {:.2})",
-        pivot[0], pivot[1], pivot[2]
-    );
-
+/// leaves the rest pose.
+fn shift_arms(arms: Vec<BakedPrimitive>, pivot: [f32; 3]) -> (Vec<BakedPrimitive>, [f32; 3]) {
     let shifted = arms
         .into_iter()
         .map(|mut p| {
@@ -1176,12 +1232,9 @@ mod tests {
 
     #[test]
     fn arm_prefixes_match_this_rigs_bone_names() {
+        // Name prefixes are only for the garment bones that follow the arms
+        // but hang off the chest; the arms themselves are found by hierarchy.
         for name in [
-            "LeftArm_964",
-            "LeftForeArm_960",
-            "RightArm_1021",
-            "RightForeArm_1009",
-            "RightHand_1006",
             "H_LeftArm_918",
             "H_RightArm_1017",
             "H_above_Left_b_874",
@@ -1196,8 +1249,64 @@ mod tests {
             "RightFoot_95",
             "Breast_1064",
             "Tail_182",
+            // The arm bones themselves are *not* in the name list any more,
+            // so a rig that names them anything else still works: the walk
+            // from the upper-arm root picks them up.
+            "LeftArm_964",
+            "LeftForeArm_960",
+            "Rig_Elbow_7",
         ] {
             assert!(!is_arm_joint(name), "{name} should not be an arm joint");
+        }
+    }
+
+    #[test]
+    fn the_arm_cut_includes_the_hand_geometry() {
+        let (document, buffers, _images) = load("girl.glb");
+        let rig = Rig::build(&document, &buffers).expect("rig");
+
+        // The arm cut is the subtree of the two upper-arm joints plus the
+        // garment bones. `girl.glb` binds its finger cubes to `spLeft_963` and
+        // `spRight_1020`, which sit between the upper arm and the forearm, so
+        // only a hierarchy walk finds them: the old name-prefix cut came out
+        // with forearms and no hands.
+        let set = arm_joint_set(&rig.skeleton.joints.iter().collect::<Vec<_>>());
+        let names: Vec<&str> = rig
+            .skeleton
+            .joints
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| set.contains(&(*index as u16)))
+            .map(|(_, joint)| joint.name.as_str())
+            .collect();
+        for required in [
+            "LeftArm_964",
+            "LeftForeArm_960",
+            "RightArm_1021",
+            "RightForeArm_1009",
+            "spLeft_963",
+            "spRight_1020",
+        ] {
+            assert!(
+                names.contains(&required),
+                "arm cut is missing {required}; it has {}",
+                names.join(", ")
+            );
+        }
+        // `spLeft2_959` / `spRight2_1008` are *not* animated, so they never
+        // become joints: their geometry binds to the forearm, which is above.
+        assert!(
+            !names.contains(&"spLeft2_959"),
+            "a static bone should not be a joint; it has {}",
+            names.join(", ")
+        );
+        // ...and it must not swallow the rest of the body.
+        for excluded in ["Head_822", "LeftLeg_52", "RightFoot_95", "Breast_1064", "Tail_182"] {
+            assert!(
+                !names.contains(&excluded),
+                "arm cut swallowed {excluded}; it has {}",
+                names.join(", ")
+            );
         }
     }
 

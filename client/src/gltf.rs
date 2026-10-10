@@ -1299,6 +1299,7 @@ pub fn sync_gltf_instances(
                 skeleton.as_ref(),
                 animator,
                 dt,
+                instance.scale,
                 &mut locals,
                 &mut worlds,
                 &mut bones,
@@ -1333,6 +1334,7 @@ pub fn sync_gltf_instances(
                     skeleton.as_ref(),
                     animator,
                     dt,
+                    instance.scale,
                     &mut locals,
                     &mut worlds,
                     &mut bones,
@@ -1491,6 +1493,7 @@ fn push_palette(
     skeleton: Option<&Skeleton>,
     animator: Option<Mut<Animator>>,
     dt: f32,
+    scale: f32,
     locals: &mut Vec<JointTransform>,
     worlds: &mut Vec<glam::Mat4>,
     bones: &mut Vec<glam::Mat4>,
@@ -1521,7 +1524,12 @@ fn push_palette(
                 let transition = skeleton.transition(animator.current.clip, clip);
                 animator.play(clip, transition);
             }
-            let rate = playback_rate(skeleton, animator.current.clip, animator.speed);
+            let rate = playback_rate(
+                skeleton,
+                animator.current.clip,
+                animator.speed,
+                scale,
+            );
             animator.advance(dt, rate);
             skeleton.sample(animator.current.clip, animator.current.time, locals);
 
@@ -1556,7 +1564,20 @@ fn push_palette(
 /// A clip authored at some natural stride plays back faster when the entity
 /// moves faster; the vertical bob and footfall timing are preserved because
 /// the whole clip is scaled rather than just its translation.
-fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32) -> f32 {
+/// Playback rate that matches the clip's footfall cadence to the
+/// authoritative movement speed.
+///
+/// A clip authored at some natural stride plays back faster when the entity
+/// moves faster; the vertical bob and footfall timing are preserved because
+/// the whole clip is scaled rather than just its translation.
+///
+/// `speed` is in world units (blocks) per second, `natural_speed` is in the
+/// model's own units per second, so the two are only comparable after the
+/// instance's scale is divided out. Getting that wrong is how the walk clip
+/// ended up playing four times too fast: 4.3 blocks/s against a 1.19
+/// model-units/s stride is 3.6x before the scale, and looked like a
+/// vibration.
+fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32, scale: f32) -> f32 {
     let natural = skeleton
         .clips
         .get(clip as usize)
@@ -1568,7 +1589,12 @@ fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32) -> f32 {
     if natural <= f32::EPSILON {
         return IN_PLACE_RATE;
     }
-    (speed / natural).clamp(0.25, 4.0)
+    // World units per model unit, i.e. how many blocks one model unit spans.
+    let blocks_per_unit = scale.max(0.0001);
+    // Cap tightly: a rate far from 1.0 never matches real footfalls, it just
+    // turns the clip into a blur, and the walk/run choice is what is supposed
+    // to cover the speed range.
+    ((speed / blocks_per_unit) / natural).clamp(0.5, 1.6)
 }
 
 #[cfg(test)]

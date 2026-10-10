@@ -380,8 +380,10 @@ mod tests {
 
     #[test]
     fn unknown_element_is_error() {
+        // `<img>` is a known element now, so the unknown one has to be
+        // something the parser genuinely does not implement.
         assert!(matches!(
-            parse_ui("<div><img/></div>"),
+            parse_ui("<div><blink/></div>"),
             Err(ParseError::UnknownElement { .. })
         ));
     }
