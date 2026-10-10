@@ -5715,6 +5715,7 @@ dependencies = [
  "oxc_ast",
  "oxc_parser",
  "oxc_span",
+ "tesjit-dwarf",
  "thiserror 2.0.21",
 ]
 
