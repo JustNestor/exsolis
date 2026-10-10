@@ -1167,9 +1167,10 @@ pub fn sync_gltf_instances(
     mut models: ResMut<GltfModels>,
     mut instances: Query<(&GltfModelInstance, &GlobalTransform, Option<&mut Animator>)>,
     camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
+    swing: Res<crate::anim::UseSwing>,
     time: Res<Time>,
 ) {
-    let (Some(vk), Some(mut render_state)) = (vk, render_state) else {
+    let (Some(vk), Some(render_state)) = (vk, render_state) else {
         return;
     };
 
@@ -1276,6 +1277,7 @@ pub fn sync_gltf_instances(
                     &instance.viewmodel_offset,
                     instance.scale,
                     eye,
+                    swing.angle(),
                 ));
                 push_palette(
                     skeleton.as_ref(),
@@ -1392,6 +1394,7 @@ fn viewmodel_matrix(
     offset: &glam::Vec3,
     scale: f32,
     eye: Option<(glam::Vec3, glam::Quat)>,
+    swing: f32,
 ) -> glam::Mat4 {
     let (position, rotation) = match eye {
         Some((eye, facing)) => (eye + facing * offset, facing),
@@ -1400,10 +1403,17 @@ fn viewmodel_matrix(
         // the origin.
         None => (transform.translation() + *offset, transform.rotation()),
     };
+    // The use swing is additive on the viewmodel only. Rotating about the
+    // shoulder's own axis (X, applied before the facing yaw) is what makes
+    // the hand arc forward rather than slide sideways, and the pivot is
+    // offset so the shoulder stays put instead of the whole arm spinning
+    // about the eye.
+    let pivot = rotation * glam::Vec3::new(0.0, 0.0, 0.25);
+    let swing_rotation = glam::Quat::from_rotation_x(swing);
     glam::Mat4::from_scale_rotation_translation(
         glam::Vec3::splat(scale.max(0.0001)),
-        rotation,
-        position,
+        rotation * swing_rotation,
+        position - pivot + swing_rotation * pivot,
     )
 }
 

@@ -442,6 +442,63 @@ pub struct PlayState {
     pub time: f32,
 }
 
+/// How long one first-person arm swing takes, in seconds. Matches the
+/// cadence of a mining swing rather than a click, so repeated clicks read as
+/// one continuous motion instead of a stutter.
+pub const SWING_DURATION: f32 = 0.25;
+
+/// Additive arm swing for the first-person viewmodel.
+///
+/// This lives on the *viewmodel instance matrix*, not on the bone palette:
+/// the palette is shared with the body, and swinging the body from a mouse
+/// click would make other players' arms flail.
+#[derive(Resource, Debug, Clone, Copy, Default)]
+pub struct UseSwing {
+    /// 1 at the start of a swing, easing back to 0.
+    pub phase: f32,
+}
+
+impl UseSwing {
+    /// Start a swing. Re-triggering mid-swing restarts it, which is what
+    /// makes holding the button read as repeated swings.
+    pub fn trigger(&mut self) {
+        self.phase = 1.0;
+    }
+
+    /// Advance the swing. Returns true while it is still in progress.
+    pub fn advance(&mut self, dt: f32) -> bool {
+        if self.phase <= 0.0 {
+            return false;
+        }
+        self.phase -= dt / SWING_DURATION;
+        // Snap to finished rather than creeping toward zero: a residue of
+        // 1e-8 would leave the hand permanently a hair off its rest pose.
+        if self.phase <= 1e-4 {
+            self.phase = 0.0;
+        }
+        self.phase > 0.0
+    }
+
+    /// Swing angle at the current phase.
+    ///
+    /// A half sine over the swing: zero at both ends, peak in the middle.
+    /// `phase` counts down from 1 to 0 across the swing, so the progress
+    /// through the swing is `1 - phase`, mapped onto 0..PI — feeding the
+    /// raw 0..1 progress to `sin` would only ever climb the first quarter
+    /// of the curve and never reach the peak.
+    pub fn angle(&self) -> f32 {
+        if self.phase <= 0.0 {
+            return 0.0;
+        }
+        let progress = 1.0 - self.phase;
+        (progress * std::f32::consts::PI).sin() * SWING_ANGLE
+    }
+}
+
+/// Peak swing angle in radians: enough to read clearly without the hand
+/// leaving the frame.
+const SWING_ANGLE: f32 = 55f32.to_radians();
+
 /// Drives one animated instance: which clip is playing, how far through it,
 /// and how far into a cross-fade we are.
 #[derive(Debug, Clone, Copy, bevy_ecs::component::Component)]
@@ -993,6 +1050,56 @@ models/test.glb
         a.advance(10.0, 1.0);
         assert_eq!(a.current.time, 10.0);
         // The clip itself wraps during sampling.
+    }
+
+    #[test]
+    fn the_swing_rests_at_zero_and_returns_to_it() {
+        let mut swing = UseSwing::default();
+        assert_eq!(swing.angle(), 0.0);
+        assert!(!swing.advance(0.1), "an idle swing must not run");
+
+        swing.trigger();
+        // The swing starts *at* the rest pose and leaves it over the next
+        // few frames, so the first frame is legitimately zero.
+        assert_eq!(swing.angle(), 0.0, "a swing starts from the rest pose");
+        let mut moved = false;
+        for _ in 0..(SWING_DURATION * 60.0) as usize {
+            swing.advance(1.0 / 60.0);
+            moved |= swing.angle() > 0.0;
+        }
+        assert!(moved, "a triggered swing must actually move");
+        assert_eq!(swing.phase, 0.0);
+        assert_eq!(swing.angle(), 0.0, "must settle back to the rest pose");
+    }
+
+    #[test]
+    fn the_swing_peaks_partway_through() {
+        let mut swing = UseSwing::default();
+        swing.trigger();
+        let mut peak = 0.0f32;
+        // Step finely enough to land near the middle of the swing.
+        let steps = (SWING_DURATION * 200.0) as usize;
+        for _ in 0..steps {
+            swing.advance(SWING_DURATION / steps as f32);
+            peak = peak.max(swing.angle());
+        }
+        assert!(
+            peak > SWING_ANGLE * 0.9,
+            "swing peaked at {peak}, expected close to {SWING_ANGLE}"
+        );
+    }
+
+    #[test]
+    fn retriggering_restarts_the_swing() {
+        let mut swing = UseSwing::default();
+        swing.trigger();
+        for _ in 0..10 {
+            swing.advance(0.01);
+        }
+        let before = swing.phase;
+        assert!(before < 1.0);
+        swing.trigger();
+        assert_eq!(swing.phase, 1.0, "holding the button repeats the swing");
     }
 
     #[test]

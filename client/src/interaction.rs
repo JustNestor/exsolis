@@ -80,10 +80,27 @@ impl ClientInventory {
 
 pub struct InteractionPlugin;
 
+/// Swing the first-person arms on use.
+///
+/// Separate from the handlers above so the animation plays whether or not
+/// the action itself succeeded — clicking a block you cannot reach should
+/// still move your hand.
+fn drive_use_swing(
+    time: Res<Time>,
+    mouse: Res<ButtonInput<MouseButton>>,
+    mut swing: ResMut<crate::anim::UseSwing>,
+) {
+    if mouse.just_pressed(MouseButton::Left) || mouse.just_pressed(MouseButton::Right) {
+        swing.trigger();
+    }
+    swing.advance(time.delta_secs());
+}
+
 impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<ClientInventory>()
             .init_resource::<InteractionCooldown>()
+            .init_resource::<crate::anim::UseSwing>()
             .add_systems(
                 Update,
                 (
@@ -95,6 +112,7 @@ impl Plugin for InteractionPlugin {
                         handle_place_input,
                     )
                         .run_if(gameplay_input_allowed),
+                    drive_use_swing.run_if(gameplay_input_allowed),
                 )
                     .in_set(GameplaySet),
             );
