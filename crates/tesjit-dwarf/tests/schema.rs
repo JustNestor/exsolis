@@ -2,8 +2,8 @@
 //! layout flattening.
 
 use tesjit_dwarf::{
-    Field, Head, StructType, TypeArgs, TypeDb, TypeDef, TypeName, Variant, Discriminant,
-    EnumType, FORMAT_VERSION,
+    Discriminant, EnumType, FORMAT_VERSION, Field, Head, StructType, TypeArgs, TypeDb, TypeDef,
+    TypeName, Variant,
 };
 
 fn struct_def(name: &str, size: u64, fields: Vec<(&str, &str, u64)>) -> TypeDef {
@@ -44,18 +44,31 @@ fn sample() -> TypeDb {
     );
     db.types.insert(
         "outer::Padded".into(),
-        struct_def("outer::Padded", 16, vec![("a", "u8", 0), ("p", "inner::Point", 4)]),
+        struct_def(
+            "outer::Padded",
+            16,
+            vec![("a", "u8", 0), ("p", "inner::Point", 4)],
+        ),
     );
     db.types.insert(
         "outer::Ref".into(),
-        struct_def("outer::Ref", 16, vec![("p", "&inner::Point", 0), ("d", "u8", 8)]),
+        struct_def(
+            "outer::Ref",
+            16,
+            vec![("p", "&inner::Point", 0), ("d", "u8", 8)],
+        ),
     );
-    db.types.insert("&inner::Point".into(), TypeDef {
-        name: TypeName::from("&inner::Point"),
-        size: 8,
-        align: 8,
-        args: TypeArgs::Pointer { pointee: TypeName::from("inner::Point") },
-    });
+    db.types.insert(
+        "&inner::Point".into(),
+        TypeDef {
+            name: TypeName::from("&inner::Point"),
+            size: 8,
+            align: 8,
+            args: TypeArgs::Pointer {
+                pointee: TypeName::from("inner::Point"),
+            },
+        },
+    );
     db.aliases.insert("Point".into(), "inner::Point".into());
     db
 }
@@ -93,10 +106,7 @@ fn alias_lookup_and_canonicalize() {
 fn flatten_nested_structs() {
     let db = sample();
     let leaves = db.layout("outer::Padded").expect("layout");
-    let got: Vec<_> = leaves
-        .iter()
-        .map(|f| (f.name.as_str(), f.offset))
-        .collect();
+    let got: Vec<_> = leaves.iter().map(|f| (f.name.as_str(), f.offset)).collect();
     assert_eq!(got, vec![("a", 0), ("p::x", 4), ("p::y", 8)]);
 }
 
@@ -119,7 +129,10 @@ fn resolve_reports_unknown_and_recursive() {
         struct_def("rec::Loop", 8, vec![("next", "rec::Loop", 0)]),
     );
     let err = db.layout("rec::Loop").unwrap_err();
-    assert!(matches!(err, tesjit_dwarf::TypeDbError::RecursiveType(_)), "{err}");
+    assert!(
+        matches!(err, tesjit_dwarf::TypeDbError::RecursiveType(_)),
+        "{err}"
+    );
 }
 
 #[test]
@@ -157,10 +170,7 @@ fn enum_variants_are_exported() {
         },
     );
     let leaves = db.layout("opt::Maybe").expect("layout");
-    let got: Vec<_> = leaves
-        .iter()
-        .map(|f| (f.name.as_str(), f.offset))
-        .collect();
+    let got: Vec<_> = leaves.iter().map(|f| (f.name.as_str(), f.offset)).collect();
     assert_eq!(got, vec![("Some::0::x", 8), ("Some::0::y", 12)]);
 }
 

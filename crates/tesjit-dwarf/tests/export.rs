@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use tesjit_dwarf::{export, TypeArgs, TypeDb};
+use tesjit_dwarf::{TypeArgs, TypeDb, export};
 
 /// The fixture source, kept in one place so the compiled binary matches.
 ///
@@ -70,7 +70,9 @@ fn exported() -> TypeDb {
 }
 
 fn field_of(db: &TypeDb, type_name: &str, field: &str) -> (String, u64) {
-    let def = db.get(type_name).unwrap_or_else(|| panic!("{type_name} missing"));
+    let def = db
+        .get(type_name)
+        .unwrap_or_else(|| panic!("{type_name} missing"));
     let fields = match &def.args {
         TypeArgs::Struct(s) => &s.fields,
         other => panic!("{type_name} is not a struct: {other:?}"),
@@ -94,7 +96,14 @@ fn structs_and_enum_layouts() {
         .into_iter()
         .map(|f| (f.name.to_string(), f.offset))
         .collect();
-    assert_eq!(offsets, vec![("x".to_string(), 0), ("y".to_string(), 4), ("z".to_string(), 8)]);
+    assert_eq!(
+        offsets,
+        vec![
+            ("x".to_string(), 0),
+            ("y".to_string(), 4),
+            ("z".to_string(), 8)
+        ]
+    );
 
     // Padding: `repr(Rust)` puts the `align 4` field first and the two `u8`s
     // last, so `size` rounds up to a multiple of `align` (4).
@@ -135,5 +144,8 @@ fn structs_and_enum_layouts() {
     // All four array fields (names, shape, coords) are laid out after the
     // 8-byte `blocks_vec_len`; just require it to be inside the struct.
     let world = db.get("fixture::World").unwrap();
-    assert!(names.1 < world.size && world.size >= 8, "{names:?} / {world:?}");
+    assert!(
+        names.1 < world.size && world.size >= 8,
+        "{names:?} / {world:?}"
+    );
 }

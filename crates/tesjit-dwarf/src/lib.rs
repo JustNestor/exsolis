@@ -12,9 +12,9 @@
 pub mod export;
 pub mod schema;
 
-pub use export::{export, ExportError, ExportStats};
+pub use export::{ExportError, ExportStats, export};
 pub use schema::{
-    ArrayType, Discriminant, EnumType, Field, Head, LeafField, OpaqueKind, Resolution, Resolved,
-    StructType, TypeArgs, TypeDb, TypeDbDecodeError, TypeDbError, TypeDef, TypeName, Variant,
-    FORMAT_VERSION,
+    ArrayType, Discriminant, EnumType, FORMAT_VERSION, Field, Head, LeafField, OpaqueKind,
+    Resolution, Resolved, StructType, TypeArgs, TypeDb, TypeDbDecodeError, TypeDbError, TypeDef,
+    TypeName, Variant,
 };

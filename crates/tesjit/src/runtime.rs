@@ -44,6 +44,8 @@ pub enum TrapKind {
     OutOfMemory,
     /// The fuel budget ran out (runaway loop or unbounded recursion).
     FuelExhausted,
+    /// A load/store referenced a region id that was never registered.
+    RegionUnknown,
 }
 
 impl TrapKind {
@@ -53,6 +55,7 @@ impl TrapKind {
             TrapKind::ArrayOverflow => "array capacity exceeded",
             TrapKind::OutOfMemory => "out of memory",
             TrapKind::FuelExhausted => "fuel exhausted (runaway handler)",
+            TrapKind::RegionUnknown => "unknown memory region",
         }
     }
 }
@@ -140,7 +143,25 @@ pub struct TesjitRuntime {
     trap: RefCell<Option<TrapKind>>,
     /// Remaining fuel for the current call.
     fuel: std::cell::Cell<u64>,
+    /// Host-owned memory the module may read/write through the region
+    /// intrinsics. A Bevy system hands over query rows this way; the JIT side
+    /// only ever sees an opaque id plus a bounds-checked offset.
+    regions: RefCell<Vec<Region>>,
 }
+
+/// One host-provided memory region.
+#[derive(Debug)]
+pub struct Region {
+    /// Opaque id JIT code carries instead of a raw pointer.
+    pub id: u64,
+    pub name: String,
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+// SAFETY: see the type docs — one execution thread per module.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
 
 impl Default for TesjitRuntime {
     fn default() -> Self {
@@ -157,7 +178,52 @@ impl TesjitRuntime {
             arena: RefCell::new(Arena::new()),
             trap: RefCell::new(None),
             fuel: std::cell::Cell::new(DEFAULT_FUEL),
+            regions: RefCell::new(Vec::new()),
         }
+    }
+
+    /// Expose a host memory region to the module (replacing any region with
+    /// the same name). Returns the id JIT code passes to the load/store
+    /// intrinsics.
+    pub fn register_region(&self, name: impl Into<String>, ptr: *mut u8, len: usize) -> u64 {
+        let name = name.into();
+        let mut regions = self.regions.borrow_mut();
+        if let Some(existing) = regions.iter_mut().find(|r| r.name == name) {
+            existing.ptr = ptr;
+            existing.len = len;
+            return existing.id;
+        }
+        let id = regions.len() as u64;
+        regions.push(Region {
+            id,
+            name,
+            ptr,
+            len,
+        });
+        id
+    }
+
+    /// Drop a region by name. Its id stays invalid afterwards.
+    pub fn unregister_region(&self, name: &str) {
+        self.regions.borrow_mut().retain(|r| r.name != name);
+    }
+
+    /// Look up a region id by name.
+    fn region_id_by_name(&self, name: &str) -> Option<u64> {
+        self.regions
+            .borrow()
+            .iter()
+            .find(|r| r.name == name)
+            .map(|r| r.id)
+    }
+
+    /// Look up a region by id (the value JIT code carries).
+    fn region(&self, id: u64) -> Option<(*mut u8, usize)> {
+        self.regions
+            .borrow()
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| (r.ptr, r.len))
     }
 
     /// Arm (or re-arm) the fuel budget for the next call into module code.
@@ -432,6 +498,88 @@ extern "C" fn fuel() -> i64 {
     i64::from(current().spend_fuel())
 }
 
+// ───────────────────────── host memory regions ─────────────────────────
+//
+// A Bevy system (or any embedder) hands the module a pointer to real Rust data
+// — for example a query row laid out by `tesjit-dwarf`'s `TypeDb` — and the
+// module reads and writes it through these helpers. Offsets are checked against
+// the region length, so a wrong offset is a trap rather than out-of-bounds
+// access into host memory.
+
+/// Resolve a region id, trapping when the id is unknown.
+fn region_ptr(id: i64) -> Option<(*mut u8, usize)> {
+    if id < 0 {
+        trap(TrapKind::RegionUnknown);
+        return None;
+    }
+    let found = current().region(id as u64);
+    if found.is_none() {
+        trap(TrapKind::RegionUnknown);
+    }
+    found
+}
+
+extern "C" fn load_f64(id: i64, offset: i64) -> f64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0.0;
+    };
+    if offset < 0 || offset + 8 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    unsafe { std::ptr::read_unaligned(ptr.add(offset as usize) as *const f64) }
+}
+
+extern "C" fn load_i32(id: i64, offset: i64) -> i64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0;
+    };
+    if offset < 0 || offset + 4 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    unsafe { i64::from(std::ptr::read_unaligned(ptr.add(offset as usize) as *const i32)) }
+}
+
+extern "C" fn store_f64(id: i64, offset: i64, value: f64) -> f64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0.0;
+    };
+    if offset < 0 || offset + 8 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    unsafe { std::ptr::write_unaligned(ptr.add(offset as usize) as *mut f64, value) };
+    value
+}
+
+extern "C" fn store_i32(id: i64, offset: i64, value: i64) -> i64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0;
+    };
+    if offset < 0 || offset + 4 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    unsafe { std::ptr::write_unaligned(ptr.add(offset as usize) as *mut i32, value as i32) };
+    value
+}
+
+/// Resolve a region *name* (an arena string) to its id, for mods that would
+/// rather not carry ids around.
+extern "C" fn region_id(name: i64) -> i64 {
+    let len = unsafe { *(name as *const i64) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts((name as *const u8).add(8), len) };
+    let name = String::from_utf8_lossy(bytes);
+    match current().region_id_by_name(&name) {
+        Some(id) => id as i64,
+        None => {
+            trap(TrapKind::RegionUnknown);
+            0
+        }
+    }
+}
+
 /// Named runtime symbols to register for one module.
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
@@ -447,6 +595,11 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("__tesjit_arr_push", arr_push as *const u8),
         ("__tesjit_arr_get", arr_get as *const u8),
         ("__tesjit_arr_set", arr_set as *const u8),
+        ("__tesjit_load_f64", load_f64 as *const u8),
+        ("__tesjit_load_i32", load_i32 as *const u8),
+        ("__tesjit_store_f64", store_f64 as *const u8),
+        ("__tesjit_store_i32", store_i32 as *const u8),
+        ("__tesjit_region_id", region_id as *const u8),
     ]
 }
 

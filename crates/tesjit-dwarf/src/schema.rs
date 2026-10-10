@@ -179,7 +179,9 @@ pub enum Resolution {
     Struct(StructType),
     Enum(EnumType),
     Array(ArrayType),
-    Pointer { pointee: TypeName },
+    Pointer {
+        pointee: TypeName,
+    },
     /// A type with no further structure of interest.
     Opaque,
 }
@@ -235,10 +237,11 @@ impl TypeDb {
         for _ in 0..2 {
             let Some(def) = self.types.get(&current) else {
                 if let Some(next) = self.aliases.get(&current)
-                    && *next != current {
-                        current = next.clone();
-                        continue;
-                    }
+                    && *next != current
+                {
+                    current = next.clone();
+                    continue;
+                }
                 return current;
             };
             if let TypeArgs::Struct(_) | TypeArgs::Enum(_) = &def.args {
@@ -291,7 +294,10 @@ impl TypeDb {
                 break;
             }
         }
-        removed.iter().filter(|n| self.types.remove(n.as_str()).is_some()).count()
+        removed
+            .iter()
+            .filter(|n| self.types.remove(n.as_str()).is_some())
+            .count()
     }
 
     /// Resolve a type and (recursively) its nested members/variants.

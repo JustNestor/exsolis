@@ -140,9 +140,31 @@ pub enum Intrinsic {
     ArrPush,
     /// `(array, index, elem_size) -> value`
     ArrGet,
+    /// `(region, offset) -> f64`
+    LoadF64,
+    /// `(region, offset) -> i32`
+    LoadI32,
+    /// `(region, offset, value) -> f64`
+    StoreF64,
+    /// `(region, offset, i32) -> i32`
+    StoreI32,
     /// `(array, index, elem_size, value) -> value`
     ArrSet,
+    /// `(string) -> i32` — resolve a region name to its id.
+    RegionId,
 }
+
+/// Builtins callable straight from TS (they are runtime symbols, not host
+/// functions, so they take no `declare`).
+///
+/// The names are reserved: a mod cannot define its own `load_f64`.
+pub const BUILTINS: &[(&str, Intrinsic)] = &[
+    ("load_f64", Intrinsic::LoadF64),
+    ("load_i32", Intrinsic::LoadI32),
+    ("store_f64", Intrinsic::StoreF64),
+    ("store_i32", Intrinsic::StoreI32),
+    ("region_id", Intrinsic::RegionId),
+];
 
 impl Intrinsic {
     /// Name of the runtime symbol backing this operation.
@@ -157,6 +179,11 @@ impl Intrinsic {
             Intrinsic::ArrNew => "__tesjit_arr_new",
             Intrinsic::ArrLen => "__tesjit_arr_len",
             Intrinsic::ArrPush => "__tesjit_arr_push",
+            Intrinsic::LoadF64 => "__tesjit_load_f64",
+            Intrinsic::LoadI32 => "__tesjit_load_i32",
+            Intrinsic::StoreF64 => "__tesjit_store_f64",
+            Intrinsic::StoreI32 => "__tesjit_store_i32",
+            Intrinsic::RegionId => "__tesjit_region_id",
             Intrinsic::ArrGet => "__tesjit_arr_get",
             Intrinsic::ArrSet => "__tesjit_arr_set",
         }

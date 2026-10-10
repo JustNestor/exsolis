@@ -70,6 +70,20 @@ impl Compiled {
         &self.runtime
     }
 
+    /// Expose host memory (a query row, a component, ...) to the module.
+    ///
+    /// Returns the opaque id JIT code passes to the `load_*`/`store_*`
+    /// intrinsics. The region stays valid until [`Compiled::unregister_region`]
+    /// or until the pointer's owner goes away — bevy hands those over inside a
+    /// system that holds the data for the duration of the call.
+    pub fn register_region(&self, name: impl Into<String>, ptr: *mut u8, len: usize) -> u64 {
+        self.runtime.register_region(name, ptr, len)
+    }
+
+    pub fn unregister_region(&self, name: &str) {
+        self.runtime.unregister_region(name);
+    }
+
     /// Enter this module's runtime for the duration of `f`.
     ///
     /// Required for hand-written `extern "C"` wrappers obtained through
@@ -380,6 +394,11 @@ impl Jit {
             ("__tesjit_arr_new", vec![Ptr, Ptr], Ptr),
             ("__tesjit_arr_len", vec![Ptr], Ptr),
             ("__tesjit_arr_push", vec![Ptr, Ptr, Ptr], Ptr),
+            ("__tesjit_load_f64", vec![Ptr, Ptr], Ty::F64),
+            ("__tesjit_load_i32", vec![Ptr, Ptr], Ty::I32),
+            ("__tesjit_store_f64", vec![Ptr, Ptr, Ty::F64], Ty::F64),
+            ("__tesjit_store_i32", vec![Ptr, Ptr, Ty::I32], Ty::I32),
+            ("__tesjit_region_id", vec![Ty::Str], Ty::I32),
             ("__tesjit_arr_get", vec![Ptr, Ptr, Ptr], Ptr),
             ("__tesjit_arr_set", vec![Ptr, Ptr, Ptr, Ptr], Ptr),
         ]

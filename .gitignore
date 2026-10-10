@@ -1,5 +1,7 @@
 /target
 log*
+temp
+
 assets/ui/fastfetch.png
 
 crates/fastpak/goldclient_test.pak

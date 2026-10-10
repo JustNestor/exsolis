@@ -211,16 +211,22 @@ impl<'a, 'b> Builder<'a, 'b> {
                 collected.dies.insert(entry.offset(), rec);
                 collected.order.push(entry.offset());
                 if local >= 2
-                    && let Some(&parent) = stack.get(local - 2) {
-                        collected.parents[die] = parent;
-                        collected.children[parent].push(die);
-                    }
+                    && let Some(&parent) = stack.get(local - 2)
+                {
+                    collected.parents[die] = parent;
+                    collected.children[parent].push(die);
+                }
                 stack.resize(local.max(1), usize::MAX);
                 stack[local.max(1) - 1] = die;
             }
             for (die, offset) in collected.order.iter().enumerate() {
-                self.abs_index
-                    .insert(collected.start + offset.0 as u64, DieIndex { unit: unit_index, die });
+                self.abs_index.insert(
+                    collected.start + offset.0 as u64,
+                    DieIndex {
+                        unit: unit_index,
+                        die,
+                    },
+                );
             }
             self.stats.dies += collected.order.len();
             self.stats.compilation_units += 1;
@@ -253,9 +259,7 @@ impl<'a, 'b> Builder<'a, 'b> {
                 gimli::DW_AT_byte_size => rec.byte_size = attr.udata_value(),
                 gimli::DW_AT_alignment => rec.alignment = attr.udata_value(),
                 gimli::DW_AT_producer if self.producer.is_empty() => {
-                    self.producer = self
-                        .attr_string(unit, attr.value())?
-                        .unwrap_or_default();
+                    self.producer = self.attr_string(unit, attr.value())?.unwrap_or_default();
                 }
                 gimli::DW_AT_type => {
                     rec.type_ref = match attr.value() {
@@ -443,7 +447,10 @@ fn emit_die(
                     continue;
                 }
                 variants.push(Variant {
-                    name: crec.name.clone().unwrap_or_else(|| format!("__v{}", variants.len())),
+                    name: crec
+                        .name
+                        .clone()
+                        .unwrap_or_else(|| format!("__v{}", variants.len())),
                     discr: crec.const_value.unwrap_or(0),
                     fields: Vec::new(),
                 });
@@ -479,8 +486,8 @@ fn emit_die(
                 .and_then(|c| c.count)
                 .unwrap_or(0);
             // rustc leaves `DW_AT_name` off array types: synthesize `[T; N]`.
-            let name = name_for(units, idx)
-                .unwrap_or_else(|| TypeName::from(format!("[{elem}; {len}]")));
+            let name =
+                name_for(units, idx).unwrap_or_else(|| TypeName::from(format!("[{elem}; {len}]")));
             emitted.insert(idx, name.clone());
             if db.types.contains_key(name.as_str()) {
                 return Some(name);
@@ -567,7 +574,9 @@ fn emit_die(
                     name: name.clone(),
                     size: 8,
                     align: 8,
-                    args: TypeArgs::Opaque(OpaqueKind::Function { monomorphized: true }),
+                    args: TypeArgs::Opaque(OpaqueKind::Function {
+                        monomorphized: true,
+                    }),
                 },
             );
             name
@@ -594,11 +603,7 @@ fn emit_die(
             TypeName::from("")
         }
     };
-    if name.0.is_empty() {
-        None
-    } else {
-        Some(name)
-    }
+    if name.0.is_empty() { None } else { Some(name) }
 }
 
 /// Best-guess alignment for a scalar from its size (used when DWARF omitted
@@ -687,7 +692,10 @@ fn emit_enum(
 fn children_of(units: &[UnitDies], idx: DieIndex) -> Vec<DieIndex> {
     units[idx.unit].children[idx.die]
         .iter()
-        .map(|&die| DieIndex { unit: idx.unit, die })
+        .map(|&die| DieIndex {
+            unit: idx.unit,
+            die,
+        })
         .collect()
 }
 
@@ -706,33 +714,42 @@ fn child_with_tag(units: &[UnitDies], idx: DieIndex, tag: gimli::DwTag) -> Optio
 fn name_for(units: &[UnitDies], idx: DieIndex) -> Option<TypeName> {
     let rec = units[idx.unit].rec(idx);
     if let Some(name) = &rec.name
-        && !name.is_empty() {
-            let mut path = name.clone();
-            let mut parent = units[idx.unit].parents[idx.die];
-            let mut depth = 0;
-            while parent != usize::MAX && depth < 32 {
-                let prec = units[idx.unit].rec(DieIndex { unit: idx.unit, die: parent });
-                if prec.tag == gimli::DW_TAG_namespace
-                    && let Some(ns) = &prec.name {
-                        // Skip anonymous namespaces (`{impl#0}`, etc).
-                        if !ns.starts_with('{') {
-                            path = format!("{ns}::{path}");
-                        }
-                    }
-                depth += 1;
-                parent = units[idx.unit].parents[parent];
+        && !name.is_empty()
+    {
+        let mut path = name.clone();
+        let mut parent = units[idx.unit].parents[idx.die];
+        let mut depth = 0;
+        while parent != usize::MAX && depth < 32 {
+            let prec = units[idx.unit].rec(DieIndex {
+                unit: idx.unit,
+                die: parent,
+            });
+            if prec.tag == gimli::DW_TAG_namespace
+                && let Some(ns) = &prec.name
+            {
+                // Skip anonymous namespaces (`{impl#0}`, etc).
+                if !ns.starts_with('{') {
+                    path = format!("{ns}::{path}");
+                }
             }
-            return Some(TypeName::from(path));
+            depth += 1;
+            parent = units[idx.unit].parents[parent];
         }
+        return Some(TypeName::from(path));
+    }
     // Anonymous: derive from the enclosing declaration.
     let mut parent = units[idx.unit].parents[idx.die];
     let mut suffix = idx.die.to_string();
     while parent != usize::MAX {
-        let prec = units[idx.unit].rec(DieIndex { unit: idx.unit, die: parent });
+        let prec = units[idx.unit].rec(DieIndex {
+            unit: idx.unit,
+            die: parent,
+        });
         if let Some(name) = &prec.name
-            && !name.is_empty() {
-                return Some(TypeName::from(format!("{name}::{{anon{suffix}}}")));
-            }
+            && !name.is_empty()
+        {
+            return Some(TypeName::from(format!("{name}::{{anon{suffix}}}")));
+        }
         suffix = format!("{parent}{}", idx.die);
         parent = units[idx.unit].parents[parent];
     }
@@ -746,7 +763,10 @@ fn resolve_index(units: &[UnitDies], tref: TypeRef) -> Option<DieIndex> {
             let unit_dies = units.get(unit)?;
             let offset = gimli::UnitOffset(tref.offset as usize);
             if unit_dies.dies.contains_key(&offset) {
-                let die = unit_dies.order.iter().position(|o| o.0 as u64 == tref.offset)?;
+                let die = unit_dies
+                    .order
+                    .iter()
+                    .position(|o| o.0 as u64 == tref.offset)?;
                 Some(DieIndex { unit, die })
             } else {
                 // Cross-unit absolute reference recorded as in-unit: search all.
@@ -772,9 +792,9 @@ fn resolve_index(units: &[UnitDies], tref: TypeRef) -> Option<DieIndex> {
                         .order
                         .iter()
                         .position(|o| unit.start + o.0 as u64 == tref.offset)
-                    {
-                        containing = Some(DieIndex { unit: index, die });
-                    }
+                {
+                    containing = Some(DieIndex { unit: index, die });
+                }
             }
             containing
         }
@@ -801,7 +821,10 @@ fn infer_alignments(db: &mut TypeDb) {
                     .map(|f| f.align)
                     .max()
                     .unwrap_or(0),
-                TypeArgs::Enum(e) => db.get(e.discriminant.ty.as_str()).map(|d| d.align).unwrap_or(0),
+                TypeArgs::Enum(e) => db
+                    .get(e.discriminant.ty.as_str())
+                    .map(|d| d.align)
+                    .unwrap_or(0),
                 TypeArgs::Array(a) => db.get(a.elem.as_str()).map(|a| a.align).unwrap_or(0),
                 TypeArgs::Pointer { .. } => 8,
                 TypeArgs::Opaque(_) => size_align(def.size),
@@ -815,9 +838,10 @@ fn infer_alignments(db: &mut TypeDb) {
         }
         for (name, align) in updates {
             if let Some(def) = db.types.get_mut(&name)
-                && def.align == 0 {
-                    def.align = align;
-                }
+                && def.align == 0
+            {
+                def.align = align;
+            }
         }
     }
 }

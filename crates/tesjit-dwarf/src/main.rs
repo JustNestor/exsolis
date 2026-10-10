@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use tesjit_dwarf::{export, TypeDb};
+use tesjit_dwarf::{TypeDb, export};
 
 fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
@@ -20,7 +20,9 @@ fn main() -> ExitCode {
             "--list" => list = args.next(),
             "--show" => show.push(args.next().unwrap_or_else(|| usage())),
             "-h" | "--help" => {
-                eprintln!("usage: tesjit-dwarf <binary> [-o types.tdb] [--list substr] [--show Type]");
+                eprintln!(
+                    "usage: tesjit-dwarf <binary> [-o types.tdb] [--list substr] [--show Type]"
+                );
                 return ExitCode::SUCCESS;
             }
             other if other.starts_with('-') => usage(),
@@ -75,7 +77,9 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let round_tripped = TypeDb::from_bytes(&bytes).map(|db| db.types.len()).unwrap_or(0);
+    let round_tripped = TypeDb::from_bytes(&bytes)
+        .map(|db| db.types.len())
+        .unwrap_or(0);
     println!(
         "{}: {} types ({} structs, {} unions, {} enums, {} arrays, {} pointers, {} aliases, {} opaque) \
          from {} CUs / {} DIEs; wrote {} bytes to {} (reloaded {round_tripped} types)",
