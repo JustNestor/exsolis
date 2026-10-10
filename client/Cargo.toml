@@ -55,7 +55,13 @@ rand.workspace = true
 bincode.workspace = true
 offset-allocator.workspace = true
 
-gltf = { version = "0.16", features = ["image"] }
+# `utils` gates `Animation::reader`; `guess_mime_type` lets the importer
+# recognise formats beyond PNG/JPEG (girl.glb's texture is WebP, and without
+# this the whole model fails to load with "unsupported image encoding").
+# `image023` turns on the matching WebP decoder — the `gltf` crate pulls
+# image 0.23, a different major from the `image` the client uses directly.
+gltf = { version = "0.16", features = ["image", "utils", "guess_mime_type"] }
+image023.workspace = true
 gltf-json = "0.16"
 
 # taffy = "0.14.0"

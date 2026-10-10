@@ -553,6 +553,38 @@ fn scan_catalog(
             Err(e) => warn!("gltf conversion failed for {logical_path}: {e}"),
         }
     }
+    // Committed `.glb` sources skip the converter above, so normalize their
+    // texture encodings here instead: the client loader only understands
+    // PNG and JPEG, and a WebP texture would make the whole model fail to
+    // load. The normalized copy is written next to the source and that is
+    // what gets packed, leaving the original untouched.
+    let mut normalized: HashMap<String, PathBuf> = HashMap::new();
+    for (logical_path, disk_path) in &shippable {
+        if !logical_path.ends_with(".glb") {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(disk_path) else {
+            continue;
+        };
+        match crate::gltf_pack::normalize_glb_textures(&bytes) {
+            Ok(normalized_bytes) if normalized_bytes != bytes => {
+                let target = disk_path.with_extension("normalized.glb");
+                if let Err(e) = std::fs::write(&target, &normalized_bytes) {
+                    warn!("texture normalization failed for {logical_path}: {e}");
+                    continue;
+                }
+                info!(
+                    "normalized {logical_path}: {} -> {} bytes (PNG textures)",
+                    bytes.len(),
+                    normalized_bytes.len()
+                );
+                normalized.insert(logical_path.clone(), target);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("texture normalization failed for {logical_path}: {e}"),
+        }
+    }
+    shippable.extend(normalized);
     for (logical_path, disk_path) in &shippable {
         builder
             .add_file(logical_path, disk_path)

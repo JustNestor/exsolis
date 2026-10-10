@@ -31,6 +31,7 @@ use bevy_renet::{
 use bevy_window::{Window, WindowPlugin, WindowResolution};
 use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 
+mod anim;
 mod assets;
 mod block_textures;
 mod chunk;

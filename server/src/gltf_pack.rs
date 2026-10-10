@@ -17,7 +17,7 @@
 use std::path::{Path, PathBuf};
 
 /// Bump when conversion output changes so stale artifacts regenerate.
-const CONVERTER_VERSION: u32 = 4;
+const CONVERTER_VERSION: u32 = 5;
 
 fn generator(kind: &str) -> String {
     format!("exsolis gltf_pack v{CONVERTER_VERSION} ({kind})")
@@ -51,6 +51,141 @@ pub fn convert_gltf_file(gltf_path: &Path) -> Result<Vec<u8>, String> {
         other => return Err(err(&format!("unsupported glTF version {other:?}"))),
     };
     Ok(write_glb(&json, &bin))
+}
+
+/// Normalize embedded texture encodings in a GLB to PNG.
+///
+/// The `gltf` crate the client loads with only understands PNG and JPEG:
+/// even with its `guess_mime_type` feature enabled it maps every other
+/// format to "unsupported image encoding" and refuses the whole file.
+/// `assets/models/girl.glb` ships a WebP texture, so without this step the
+/// avatar cannot be loaded at all.
+///
+/// Every image whose bytes are stored in a bufferView is decoded and
+/// re-encoded to PNG. The buffer is repacked so the converted images and the
+/// original geometry can share it, and every `byteOffset` is rewritten to
+/// match. External-URI images are left alone — those come from a `.gltf`
+/// source that `convert_*` already embedded.
+pub fn normalize_glb_textures(glb: &[u8]) -> Result<Vec<u8>, String> {
+    if glb.len() < 20 || &glb[0..4] != b"glTF" {
+        return Err(err("not a GLB"));
+    }
+    let (json_chunk, bin) = split_glb(glb)?;
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(json_chunk).map_err(|e| err(&format!("bad json chunk: {e}")))?;
+
+    if doc.get("images").and_then(|v| v.as_array()).is_none() {
+        return Ok(glb.to_vec());
+    }
+
+    // Which bufferViews need re-encoding, and to what. Collected before any
+    // mutation so the borrow of `doc` is not held across the repack below.
+    let mut to_convert: Vec<(usize, Vec<u8>)> = Vec::new();
+    for image in doc["images"]
+        .as_array()
+        .map(|a| a.as_slice())
+        .unwrap_or(&[])
+    {
+        let mime = image.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+        if mime == "image/png" || mime == "image/jpeg" {
+            continue;
+        }
+        let Some(view_index) = image.get("bufferView").and_then(|v| v.as_u64()) else {
+            continue; // external URI; nothing to do here
+        };
+        let Some(view) = doc
+            .get("bufferViews")
+            .and_then(|v| v.get(view_index as usize))
+        else {
+            continue;
+        };
+        let offset = view.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let length = view.get("byteLength").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let end = offset + length;
+        if end > bin.len() {
+            return Err(err("bufferView out of range"));
+        }
+        let decoded = image::load_from_memory(&bin[offset..end])
+            .map_err(|e| err(&format!("decode image {view_index}: {e}")))?
+            .into_rgba8();
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(decoded)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(|e| err(&format!("encode png {view_index}: {e}")))?;
+        to_convert.push((view_index as usize, png));
+    }
+
+    if to_convert.is_empty() {
+        return Ok(glb.to_vec());
+    }
+
+    // Repack: copy each original bufferView, substituting converted images.
+    let mut new_bin: Vec<u8> = Vec::with_capacity(bin.len());
+    let mut new_views = Vec::new();
+    let view_count = doc
+        .get("bufferViews")
+        .and_then(|v| v.as_array())
+        .map(|v| v.len())
+        .unwrap_or(0);
+    let converted: std::collections::HashMap<usize, Vec<u8>> = to_convert.into_iter().collect();
+    for i in 0..view_count {
+        let view = &doc["bufferViews"][i];
+        let offset = view.get("byteOffset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let length = view.get("byteLength").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        while new_bin.len() % 4 != 0 {
+            new_bin.push(0);
+        }
+        let base = new_bin.len();
+        if let Some(png) = converted.get(&i) {
+            new_bin.extend_from_slice(png);
+        } else if offset + length <= bin.len() {
+            new_bin.extend_from_slice(&bin[offset..offset + length]);
+        }
+        let mut out = view.as_object().cloned().unwrap_or_default();
+        out.insert("byteOffset".into(), base.into());
+        out.insert("byteLength".into(), (new_bin.len() - base).into());
+        new_views.push(serde_json::Value::Object(out));
+    }
+
+    // Point every converted image at its new bufferView and fix the mime.
+    for image in doc["images"].as_array_mut().unwrap() {
+        let Some(view_index) = image.get("bufferView").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if converted.contains_key(&(view_index as usize)) {
+            image["mimeType"] = serde_json::Value::String("image/png".into());
+        }
+    }
+
+    doc["bufferViews"] = serde_json::Value::Array(new_views);
+    doc["buffers"] = serde_json::json!([{ "byteLength": new_bin.len() }]);
+    if let Some(asset) = doc.get_mut("asset").and_then(|v| v.as_object_mut()) {
+        asset.insert("generator".into(), generator("normalize").into());
+    }
+    Ok(write_glb(&doc, &new_bin))
+}
+
+/// Split a GLB into its JSON chunk and BIN chunk.
+fn split_glb(glb: &[u8]) -> Result<(&[u8], &[u8]), String> {
+    let mut offset = 12usize;
+    let mut json_chunk = &glb[12..12];
+    let mut bin: &[u8] = &[];
+    while offset + 8 <= glb.len() {
+        let len = u32::from_le_bytes(glb[offset..offset + 4].try_into().unwrap()) as usize;
+        let kind = u32::from_le_bytes(glb[offset + 4..offset + 8].try_into().unwrap());
+        let start = offset + 8;
+        let end = start
+            .checked_add(len)
+            .filter(|e| *e <= glb.len())
+            .ok_or_else(|| err("chunk runs past end of file"))?;
+        match kind {
+            0x4E4F534A => json_chunk = &glb[start..end],
+            0x004E4942 => bin = &glb[start..end],
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok((json_chunk, bin))
 }
 
 /// Ensure a fresh `<stem>.glb` next to `gltf_path`, converting when missing
@@ -645,6 +780,62 @@ mod tests {
     #[test]
     fn pack_dragon() {
         assert_glb(&convert_fixture("dragon"), 374, 374);
+    }
+
+    /// `assets/models/girl.glb` — the avatar — stores its single texture as
+    /// WebP, which the client loader cannot decode. Normalizing has to make it
+    /// loadable, and must not disturb the geometry around it.
+    #[test]
+    fn normalize_converts_the_avatar_webp_texture_to_png() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/models/girl.glb");
+        let bytes = std::fs::read(&path).expect("girl.glb");
+        let normalized = normalize_glb_textures(&bytes).expect("normalize");
+
+        assert!(normalized.len() > 12);
+        assert_eq!(&normalized[0..4], b"glTF");
+
+        let json_len = u32::from_le_bytes(normalized[12..16].try_into().unwrap()) as usize;
+        let doc: serde_json::Value =
+            serde_json::from_slice(&normalized[20..20 + json_len]).expect("json chunk");
+
+        // Every image is now PNG.
+        for image in doc["images"].as_array().unwrap() {
+            assert_eq!(image["mimeType"], "image/png");
+        }
+        // The mesh and animation data are untouched: repacking must only move
+        // bytes around.
+        let (json, _) = split_glb(&bytes).unwrap();
+        let before: serde_json::Value = serde_json::from_slice(json).unwrap();
+        assert_eq!(
+            doc["meshes"].as_array().unwrap().len(),
+            before["meshes"].as_array().unwrap().len()
+        );
+        assert_eq!(
+            doc["animations"].as_array().unwrap().len(),
+            before["animations"].as_array().unwrap().len()
+        );
+        assert_eq!(doc["nodes"].as_array().unwrap().len(), 1908);
+        assert_eq!(doc["animations"].as_array().unwrap().len(), 11);
+    }
+
+    /// Normalizing is idempotent: a second pass has nothing left to do and must
+    /// return the same bytes rather than re-encoding forever on every catalog
+    /// rebuild.
+    #[test]
+    fn normalize_is_idempotent() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/models/girl.glb");
+        let bytes = std::fs::read(&path).expect("girl.glb");
+        let once = normalize_glb_textures(&bytes).expect("first pass");
+        let twice = normalize_glb_textures(&once).expect("second pass");
+        assert_eq!(once, twice);
+    }
+
+    /// A GLB that is already all-PNG must come back untouched.
+    #[test]
+    fn normalize_leaves_png_only_models_alone() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../assets/models/duck.glb");
+        let bytes = std::fs::read(&path).expect("duck.glb");
+        assert_eq!(normalize_glb_textures(&bytes).expect("normalize"), bytes);
     }
 
     #[test]

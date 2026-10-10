@@ -61,6 +61,10 @@ pub struct GltfVertex {
     pub normal: [f32; 3],
     pub uv: [f32; 2],
     pub color: [f32; 4],
+    /// Index into the model's bone palette. Set by the rig; a vertex is
+    /// rigidly bound to exactly one joint because these models use node
+    /// hierarchies rather than skins.
+    pub joint: u16,
 }
 
 /// GPU-compatible vertex format for GLTF models (with tangents for normal mapping).
@@ -201,7 +205,25 @@ pub enum AlphaMode {
 #[derive(Debug)]
 pub struct GltfAsset {
     pub model: GltfModel,
+    /// Joints, clips and the rest pose. `None` for models with no animation
+    /// (duck, props), which take the unskinned fast path.
+    pub skeleton: Option<crate::anim::Skeleton>,
     pub source_path: String,
+}
+
+/// Normalize a model's embedded texture encodings to PNG.
+///
+/// The glTF importer only decodes PNG and JPEG, so a model with a WebP
+/// texture fails wholesale. The server already does this while building the
+/// asset catalog; this is the same pass for models loaded from disk.
+pub(crate) fn normalize_model_bytes(path: &str, bytes: &[u8]) -> Vec<u8> {
+    match exsolis_server::gltf_pack::normalize_glb_textures(bytes) {
+        Ok(normalized) => normalized,
+        Err(e) => {
+            bevy_log::warn!("gltf texture normalization failed for {path}: {e}");
+            bytes.to_vec()
+        }
+    }
 }
 
 /// Decode a GLTF/GLB file from bytes.
@@ -213,17 +235,31 @@ pub fn decode_gltf(bytes: &[u8]) -> Result<LoadedAsset, String> {
             exsolis_common::GLB_MAX_BYTES
         ));
     }
-    let model = load_gltf_model(bytes).map_err(|e| format!("Failed to load GLTF model: {}", e))?;
+    let owned;
+    let bytes = if bytes.starts_with(b"glTF") {
+        owned = normalize_model_bytes("<memory>", bytes);
+        owned.as_slice()
+    } else {
+        bytes
+    };
+    let (model, skeleton) =
+        load_gltf_model(bytes).map_err(|e| format!("Failed to load GLTF model: {}", e))?;
 
     Ok(Arc::new(GltfAsset {
         model,
+        skeleton,
         source_path: String::new(), // Will be set by caller if needed
     }))
 }
 
 /// Load a GLTF model from raw bytes using `import_slice`, which resolves
 /// embedded (GLB BIN, base64 data URIs) buffers and decodes images.
-fn load_gltf_model(bytes: &[u8]) -> Result<GltfModel, String> {
+///
+/// Returns the model plus its skeleton. The scene graph is walked so each
+/// mesh primitive is placed by its node's world transform — a model whose
+/// geometry is distributed across a node hierarchy (every box of the girl
+/// avatar is its own node) renders collapsed at the origin otherwise.
+fn load_gltf_model(bytes: &[u8]) -> Result<(GltfModel, Option<crate::anim::Skeleton>), String> {
     let (document, buffers, images) =
         gltf::import_slice(bytes).map_err(|e| format!("Failed to parse GLTF: {}", e))?;
 
@@ -240,25 +276,22 @@ fn load_gltf_model(bytes: &[u8]) -> Result<GltfModel, String> {
         materials.push(mat);
     }
 
-    // Load meshes
-    let mut meshes = Vec::new();
-    for mesh in document.meshes() {
-        let mut primitives = Vec::new();
-        for primitive in mesh.primitives() {
-            let prim = load_gltf_primitive(&primitive, &buffers)?;
-            primitives.push(prim);
-        }
-        meshes.push(GltfMesh {
-            name: mesh.name().map(String::from),
-            primitives,
-        });
-    }
+    // Meshes are instantiated per scene-graph node, with each primitive's
+    // vertices rewritten into the space of its joint and the static part of
+    // the hierarchy baked in. `Rig::build` merges primitives that share a
+    // material, which is what collapses the girl's 795 primitives into a
+    // single draw call.
+    let rig = crate::anim::rig::Rig::build(&document, &buffers)?;
+    let (skeleton, meshes) = rig.into_parts();
 
-    Ok(GltfModel {
-        meshes,
-        materials,
-        textures,
-    })
+    Ok((
+        GltfModel {
+            meshes,
+            materials,
+            textures,
+        },
+        Some(skeleton),
+    ))
 }
 
 /// Convert decoded `image::Data` to RGBA8 pixels.
@@ -380,7 +413,7 @@ fn load_gltf_material(material: &gltf::Material) -> Result<GltfMaterial, String>
 }
 
 /// Load a mesh primitive from GLTF.
-fn load_gltf_primitive(
+pub(crate) fn load_gltf_primitive(
     primitive: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
 ) -> Result<GltfPrimitive, String> {
@@ -424,6 +457,8 @@ fn load_gltf_primitive(
             normal: normals.get(i).copied().unwrap_or([0.0, 1.0, 0.0]),
             uv: uvs.get(i).copied().unwrap_or([0.0, 0.0]),
             color: colors.get(i).copied().unwrap_or([1.0, 1.0, 1.0, 1.0]),
+            // Overwritten by the rig; the raw file has no joint concept.
+            joint: 0,
         });
     }
 
@@ -1183,41 +1218,61 @@ mod tests {
             let glen = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
             let doc: serde_json::Value = serde_json::from_slice(&bytes[20..20 + glen]).unwrap();
             let accs = doc["accessors"].as_array().unwrap();
-            let mut pmap: Vec<(&GltfPrimitive, usize)> = Vec::new();
-            for mesh in &asset.model.meshes {
-                for prim in &mesh.primitives {
-                    pmap.push((prim, pmap.len()));
-                }
-            }
-            let mut prims = Vec::new();
+
+            // The rig merges primitives that share a material and rewrites
+            // positions through the scene graph, so a 1:1 primitive mapping
+            // no longer exists. What must hold is that no geometry was lost
+            // or corrupted: the same number of vertices and indices comes
+            // out as goes in, and every index still addresses a real vertex.
+            let mut src_verts = 0usize;
+            let mut src_indices = 0usize;
             for mesh in doc["meshes"].as_array().unwrap() {
                 for p in mesh["primitives"].as_array().unwrap() {
-                    prims.push(p);
+                    let ai = p["attributes"]["POSITION"].as_u64().unwrap() as usize;
+                    src_verts += accs[ai]["count"].as_u64().unwrap() as usize;
+                    src_indices += accs[p["indices"].as_u64().unwrap() as usize]["count"]
+                        .as_u64()
+                        .unwrap() as usize;
                 }
             }
-            assert_eq!(pmap.len(), prims.len(), "{model}: primitive count");
-            for ((prim, _), p) in pmap.iter().zip(prims.iter()) {
-                let ai = p["attributes"]["POSITION"].as_u64().unwrap() as usize;
-                let acc = &accs[ai];
-                let (mn, mx) = (
-                    acc["min"].as_array().unwrap(),
-                    acc["max"].as_array().unwrap(),
-                );
-                assert_eq!(prim.vertices.len(), acc["count"].as_u64().unwrap() as usize);
-                for v in &prim.vertices {
-                    for k in 0..3 {
-                        let (lo, hi) = (
-                            mn[k].as_f64().unwrap() as f32,
-                            mx[k].as_f64().unwrap() as f32,
-                        );
-                        assert!(
-                            v.position[k] >= lo - 1e-3 && v.position[k] <= hi + 1e-3,
-                            "{model}: position out of range"
-                        );
-                    }
+
+            let got_verts: usize = asset
+                .model
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .map(|p| p.vertices.len())
+                .sum();
+            let got_indices: usize = asset
+                .model
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .map(|p| p.indices.len())
+                .sum();
+            assert_eq!(got_verts, src_verts, "{model}: vertex count");
+            assert_eq!(got_indices, src_indices, "{model}: index count");
+
+            let joint_count = asset.skeleton.as_ref().map(|s| s.joints.len()).unwrap_or(1);
+            for mesh in &asset.model.meshes {
+                for prim in &mesh.primitives {
+                    assert!(
+                        prim.vertices
+                            .iter()
+                            .all(|v| (v.joint as usize) < joint_count),
+                        "{model}: joint index out of range"
+                    );
+                    assert!(
+                        prim.vertices.iter().all(|v| v
+                            .position
+                            .iter()
+                            .chain(v.normal.iter())
+                            .all(|c| c.is_finite())),
+                        "{model}: non-finite position or normal"
+                    );
+                    let nv = prim.vertices.len() as u32;
+                    assert!(prim.indices.iter().all(|&i| i < nv), "{model}: index OOB");
                 }
-                let nv = prim.vertices.len() as u32;
-                assert!(prim.indices.iter().all(|&i| i < nv), "{model}: index OOB");
             }
             // Material texture refs must be valid image indices (texture
             // index != image index in general; see load_gltf_material).

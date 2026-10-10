@@ -30,6 +30,9 @@ bevy_renet.workspace = true
 bevy_internal.workspace = true
 
 glam.workspace = true
+# Decoding embedded GLB textures at catalog build time; see
+# `gltf_pack::normalize_glb_textures`.
+image = { workspace = true }
 rand.workspace = true
 rayon.workspace = true
 opensimplex2.workspace = true
