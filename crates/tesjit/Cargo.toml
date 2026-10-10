@@ -24,3 +24,6 @@ cranelift-module = "0.136"
 cranelift-jit = "0.136"
 miette = { version = "7.6.0", features = ["fancy"] }
 cranelift-native = "0.136.1"
+
+[dev-dependencies]
+tesjit-dwarf = { path = "../tesjit-dwarf" }

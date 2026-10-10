@@ -69,6 +69,32 @@ tesjit check <file.ts>    # type-check only, print every diagnostic
 tesjit bench <file.ts>    # fib benchmark driver
 ```
 
+## Host ABI: query rows and layouts
+
+The host can expose real Rust memory to mod code — the shape a Bevy system will
+use for query rows and components:
+
+```rust
+// Rust side: a value laid out by the real compiler, plus its layout from the
+// exported type database (crates/tesjit-dwarf).
+let offsets = db.layout("exsolis_common::ChunkBlocks").unwrap();
+let id = compiled.register_region("row", ptr, len);
+```
+
+```ts
+// Mod side: read/write by the offsets the type database reports.
+let count: i32 = load_i32(id, 0);
+let pos: f64 = load_f64(region_id("row"), 8);
+store_f64(id, 8, pos);
+```
+
+Every access is bounds-checked against the region length and traps on a bad
+offset or unknown id, so a wrong offset never reads host memory. Offsets come
+from `types.tdb` (exported from the server binary's DWARF), which is what makes
+layouts match without guessing — see `tests::type_db_offsets_drive_region_access`
+for an end-to-end test that exports a struct and reads a real Rust value through
+it.
+
 ## Sandbox (Phase 4)
 
 Mod code cannot take the process down:

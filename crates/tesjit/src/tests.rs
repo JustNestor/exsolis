@@ -516,3 +516,159 @@ fn default_fuel_covers_a_million_iterations() {
     drop(guard);
     assert!(c.trap().is_none(), "default fuel should not run out");
 }
+
+// ─────────────────── ABI: host regions (query rows) ───────────────────
+//
+// This is the shape the Bevy bridge will use: a system lays out real Rust data
+// (a query row, a component) and hands the module a pointer to it; the module
+// reads fields through the builtins, using offsets from the exported type
+// database rather than guesses.
+
+/// Layout of `exsolis_common::ChunkBlocks`-style data comes from
+/// `tesjit-dwarf`; the test below rebuilds a Rust value on the host side,
+/// exports its type from a debug binary, and reads it back from TS by offset.
+#[test]
+fn host_region_read_write_roundtrip() {
+    let c = build_arr(
+        r#"
+        export function peek(id: i32): f64 { return load_f64(id, 8); }
+        export function poke(id: i32, v: f64): f64 { return store_f64(id, 8, v); }
+        export function by_name(): f64 { return load_f64(region_id("row"), 0); }
+        export function far(id: i32): f64 { return load_f64(id, 64); }
+        "#,
+    );
+    let guard = c.enter();
+
+    // A host-side "row": two f64s followed by an i32, as a Rust struct would
+    // lay it out.
+    let mut row: [u64; 6] = [0; 6]; // 48 bytes, 8-aligned
+    let ptr = row.as_mut_ptr() as *mut u8;
+    unsafe {
+        std::ptr::write_unaligned(ptr.add(0) as *mut f64, 1.5);
+        std::ptr::write_unaligned(ptr.add(8) as *mut f64, 2.5);
+        std::ptr::write_unaligned(ptr.add(16) as *mut i32, 7);
+    }
+    let id = c.register_region("row", ptr, std::mem::size_of_val(&row));
+
+    unsafe {
+        let peek: extern "C" fn(i64) -> f64 = c.get("peek").unwrap();
+        let poke: extern "C" fn(i64, f64) -> f64 = c.get("poke").unwrap();
+        let by_name: extern "C" fn() -> f64 = c.get("by_name").unwrap();
+
+        assert_eq!(peek(i64::from(id as u32)), 2.5, "offset 8 holds b");
+        assert_eq!(poke(i64::from(id as u32), 9.0), 9.0);
+        // The write landed in the host's own memory (same field offset).
+        assert_eq!(*(ptr.add(8) as *const f64), 9.0);
+        // And a region can be found by name instead of by id (offset 0 = a).
+        assert_eq!(by_name(), 1.5);
+    }
+
+    c.unregister_region("row");
+    unsafe {
+        let peek: extern "C" fn(i64) -> f64 = c.get("peek").unwrap();
+        assert_eq!(peek(i64::from(id as u32)), 0.0, "unregistered region must not read");
+    }
+    assert_eq!(
+        c.trap().map(|t| t.message()),
+        Some("unknown memory region")
+    );
+    c.clear_trap();
+
+    // Out-of-bounds offsets inside a *known* region trap too.
+    let mut small: [u64; 1] = [0];
+    let id = c.register_region("small", small.as_mut_ptr() as *mut u8, 8);
+    unsafe {
+        let far: extern "C" fn(i64) -> f64 = c.get("far").unwrap();
+        assert_eq!(far(i64::from(id as u32)), 0.0);
+    }
+    assert_eq!(c.trap().map(|t| t.message()), Some("index out of bounds"));
+    c.clear_trap();
+    drop(guard);
+}
+
+/// Offsets really do come from the type database: `tesjit-dwarf` exports the
+/// layout of a Rust struct, and TS reads the same struct through those offsets.
+#[test]
+fn type_db_offsets_drive_region_access() {
+    // Compile a fixture with the same tool the exporter uses, export its types,
+    // and read a real value from TS by the exported field offsets.
+    let dir = std::env::temp_dir().join(format!("tesjit-abi-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let src = dir.join("fixture.rs");
+    std::fs::write(
+        &src,
+        r#"
+        #[derive(Clone, Copy)]
+        pub struct Chunk { pub a: f64, pub b: f64, pub count: i32 }
+        fn main() {
+            let c = Chunk { a: 3.25, b: -1.5, count: 42 };
+            std::hint::black_box((&c, c.count));
+        }
+        "#,
+    )
+    .unwrap();
+    let bin = dir.join("fixture");
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let ok = std::process::Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("-g")
+        .arg(&src)
+        .arg("-o")
+        .arg(&bin)
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "fixture build failed");
+
+    let data = std::fs::read(&bin).unwrap();
+    let (db, _) = tesjit_dwarf::export(&data, "fixture").expect("export fixture");
+    let def = db.get("fixture::Chunk").expect("Chunk exported");
+    let tesjit_dwarf::TypeArgs::Struct(fields) = &def.args else {
+        panic!("Chunk must be a struct");
+    };
+    let offset_of = |name: &str| -> u64 {
+        fields
+            .fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.offset)
+            .unwrap_or_else(|| panic!("no field {name}"))
+    };
+    let (a, b, count) = (offset_of("a"), offset_of("b"), offset_of("count"));
+    assert_eq!((a, b, count), (0, 8, 16), "rustc orders by alignment");
+
+    let c = build_arr(&format!(
+        r#"
+        export function a(id: i32): f64 {{ return load_f64(id, {a} as i32); }}
+        export function b(id: i32): f64 {{ return load_f64(id, {b} as i32); }}
+        export function count(id: i32): i32 {{ return load_i32(id, {count} as i32); }}
+        "#
+    ));
+    let guard = c.enter();
+
+    // The real Rust value, laid out by the compiler the exporter read.
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)] // read back through the region, not through Rust
+    struct Chunk {
+        a: f64,
+        b: f64,
+        count: i32,
+    }
+    let value = Chunk {
+        a: 3.25,
+        b: -1.5,
+        count: 42,
+    };
+    let ptr = &value as *const Chunk as *mut u8;
+    let id = c.register_region("chunk", ptr, std::mem::size_of::<Chunk>());
+    unsafe {
+        let get_a: extern "C" fn(i64) -> f64 = c.get("a").unwrap();
+        let get_b: extern "C" fn(i64) -> f64 = c.get("b").unwrap();
+        let get_count: extern "C" fn(i64) -> i32 = c.get("count").unwrap();
+        assert_eq!(get_a(i64::from(id as u32)), 3.25);
+        assert_eq!(get_b(i64::from(id as u32)), -1.5);
+        assert_eq!(get_count(i64::from(id as u32)), 42);
+    }
+    drop(guard);
+    let _ = std::fs::remove_dir_all(&dir);
+}

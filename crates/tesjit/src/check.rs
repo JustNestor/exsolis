@@ -550,11 +550,13 @@ impl<'a, 'l> FnCtx<'a, 'l> {
     /// other intrinsic call.
     fn builtin_call(&mut self, intrinsic: Intrinsic, c: &oxc_ast::ast::CallExpression<'_>) -> Expr {
         use Intrinsic::{LoadF64, LoadI32, RegionId, StoreF64, StoreI32};
+        // TS-facing signature; the codegen widens to the runtime's machine
+        // words exactly like any other intrinsic call.
         let (params, ret) = match intrinsic {
-            LoadF64 => (vec![Ty::Ptr, Ty::Ptr], Ty::F64),
-            LoadI32 => (vec![Ty::Ptr, Ty::Ptr], Ty::I32),
-            StoreF64 => (vec![Ty::Ptr, Ty::Ptr, Ty::F64], Ty::F64),
-            StoreI32 => (vec![Ty::Ptr, Ty::Ptr, Ty::I32], Ty::I32),
+            LoadF64 => (vec![Ty::I32, Ty::I32], Ty::F64),
+            LoadI32 => (vec![Ty::I32, Ty::I32], Ty::I32),
+            StoreF64 => (vec![Ty::I32, Ty::I32, Ty::F64], Ty::F64),
+            StoreI32 => (vec![Ty::I32, Ty::I32, Ty::I32], Ty::I32),
             RegionId => (vec![Ty::Str], Ty::I32),
             _ => unreachable!("builtin_call only handles region intrinsics"),
         };
@@ -569,12 +571,12 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             );
         }
         let mut args = Vec::with_capacity(params.len());
-        for (a, &pty) in c.arguments.iter().zip(&params) {
+        for (a, pty) in c.arguments.iter().zip(&params) {
             let Some(ex) = a.as_expression() else {
                 return self.poison(c.span, "spread arguments are not supported");
             };
             let v = self.expr(ex, Some(pty.clone()));
-            if v.ty != pty {
+            if v.ty != *pty {
                 self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
             }
             args.push(v);
@@ -951,13 +953,12 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 // Builtins (`load_f64`, `region_id`, ...) are runtime symbols,
                 // not host functions: no `declare` needed, and the names are
                 // reserved (a mod cannot define its own).
-                if let Expression::Identifier(callee) = &c.callee {
-                    if let Some((_, intrinsic)) = crate::hir::BUILTINS
+                if let Expression::Identifier(callee) = &c.callee
+                    && let Some((_, intrinsic)) = crate::hir::BUILTINS
                         .iter()
                         .find(|(name, _)| *name == callee.name.as_str())
-                    {
-                        return self.builtin_call(*intrinsic, c);
-                    }
+                {
+                    return self.builtin_call(*intrinsic, c);
                 }
                 let Expression::Identifier(callee) = &c.callee else {
                     return self.poison(
