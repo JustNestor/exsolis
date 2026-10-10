@@ -723,8 +723,14 @@ pub struct RenderState {
     /// Bone palettes, `[instance][MAX_GLTF_JOINTS]`.
     pub(crate) gltf_palette_buffer_id: Id<Buffer>,
     pub(crate) depth_image_id: Id<Image>,
+    /// Depth buffer for the first-person viewmodel pass, separate from the
+    /// world depth buffer so the hands can neither be clipped by nor clip
+    /// world geometry.
+    pub(crate) viewmodel_depth_image_id: Id<Image>,
     pub(crate) virtual_swapchain_id: Id<Swapchain>,
     pub(crate) virtual_depth_id: Id<Image>,
+    /// Task-graph id of the viewmodel's own depth image.
+    pub(crate) virtual_viewmodel_depth_id: Id<Image>,
     pub(crate) task_graph: Mutex<ExecutableTaskGraph<FrameData>>,
     pub(crate) shared: Arc<RwLock<RenderStateShared>>,
     pub(crate) allocator: MeshBufferAllocator,
@@ -929,6 +935,27 @@ pub(super) fn setup_renderer(
         .unwrap();
 
     let depth_image_id = vk
+        .resources
+        .create_image(
+            &ImageCreateInfo {
+                format: Format::D32_SFLOAT,
+                extent: [
+                    vk.viewport.extent[0] as u32,
+                    vk.viewport.extent[1] as u32,
+                    1,
+                ],
+                usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                ..Default::default()
+            },
+            &AllocationCreateInfo::default(),
+        )
+        .unwrap();
+
+    // A second depth buffer for the first-person viewmodel. The task graph
+    // requires every virtual resource to be mapped to a real one, so this
+    // needs a physical image of its own; it is resized alongside the world
+    // depth buffer below.
+    let viewmodel_depth_image_id = vk
         .resources
         .create_image(
             &ImageCreateInfo {
@@ -1234,13 +1261,22 @@ pub(super) fn setup_renderer(
         shared: Arc::clone(&shared),
         viewmodel: true,
     };
+    let virtual_viewmodel_framebuffer_id = task_graph.add_framebuffer();
+    // Its own framebuffer even though the colour image is shared. The task
+    // graph derives render-pass dependencies from the attachments a
+    // framebuffer collects, so giving this node a second, different depth
+    // attachment on the shared framebuffer produces a dependency whose
+    // source stages are not graphics — which is a validation error, not a
+    // warning. Ordering between the two passes comes from the explicit edge
+    // below instead.
+    let virtual_viewmodel_framebuffer_id = task_graph.add_framebuffer();
     let mut viewmodel_node = task_graph.create_task_node(
         "Viewmodel",
         vulkano_taskgraph::QueueFamilyType::Graphics,
         viewmodel_task,
     );
     let viewmodel_node_id = viewmodel_node
-        .framebuffer(virtual_framebuffer_id)
+        .framebuffer(virtual_viewmodel_framebuffer_id)
         .color_attachment(
             virtual_swapchain_id.current_image_id(),
             AccessTypes::COLOR_ATTACHMENT_WRITE,
@@ -1549,8 +1585,10 @@ pub(super) fn setup_renderer(
         gltf_index_buffer_id,
         gltf_palette_buffer_id,
         depth_image_id,
+        viewmodel_depth_image_id,
         virtual_swapchain_id,
         virtual_depth_id,
+        virtual_viewmodel_depth_id,
         task_graph: Mutex::new(task_graph),
         shared,
         allocator: MeshBufferAllocator::new(),
@@ -1611,6 +1649,19 @@ pub(super) fn render_frame(
         vk.recreate_swapchain = false;
 
         render_state.depth_image_id = vk
+            .resources
+            .create_image(
+                &ImageCreateInfo {
+                    format: Format::D32_SFLOAT,
+                    extent: [width, height, 1],
+                    usage: ImageUsage::DEPTH_STENCIL_ATTACHMENT,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo::default(),
+            )
+            .unwrap();
+        // The viewmodel depth buffer has to match the new extent too.
+        render_state.viewmodel_depth_image_id = vk
             .resources
             .create_image(
                 &ImageCreateInfo {
@@ -1736,6 +1787,7 @@ pub(super) fn render_frame(
         &*task_graph,
         render_state.virtual_swapchain_id => vk.swapchain_id,
         render_state.virtual_depth_id => render_state.depth_image_id,
+        render_state.virtual_viewmodel_depth_id => render_state.viewmodel_depth_image_id,
     )
     .unwrap();
 

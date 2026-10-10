@@ -1161,6 +1161,7 @@ pub fn sync_gltf_instances(
     render_state: Option<ResMut<RenderState>>,
     mut models: ResMut<GltfModels>,
     mut instances: Query<(&GltfModelInstance, &GlobalTransform, Option<&mut Animator>)>,
+    assets: Option<Res<crate::assets::AssetHandlerRegistry>>,
     camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
     swing: Res<crate::anim::UseSwing>,
     time: Res<Time>,
@@ -1181,12 +1182,26 @@ pub fn sync_gltf_instances(
         )
     });
 
+    // A model that has not been uploaded yet is usually just "not downloaded
+    // yet" — the local player exists from startup, long before the asset sync
+    // completes. Warn only for a model that is resident but never uploaded,
+    //    which is a genuinely bad path or a failed upload.
+    let loaded_but_not_uploaded: std::collections::HashSet<&str> = assets
+        .as_ref()
+        .map(|assets| {
+            assets
+                .iter_loaded::<GltfAsset>()
+                .map(|(path, _)| path)
+                .filter(|path| !models.uploaded.contains_key(*path))
+                .collect()
+        })
+        .unwrap_or_default();
     for (instance, _, _) in instances.iter() {
-        if !models.uploaded.contains_key(&instance.model_path)
+        if loaded_but_not_uploaded.contains(instance.model_path.as_str())
             && models.warned_missing.insert(instance.model_path.clone())
         {
             warn!(
-                "gltf instance references model with no GPU upload: {}",
+                "gltf instance references a loaded model that never uploaded: {}",
                 instance.model_path
             );
         }
