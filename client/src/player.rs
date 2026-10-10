@@ -114,10 +114,10 @@ fn spawn_local_player(mut commands: Commands) {
         FlyCamera::default(),
         Transform::from_translation(Vec3::from(SPAWN_POS)),
         ServerTarget::default(),
-        // The local player is an entity too, so the first-person hands and a
-        // third-person view of yourself go through the same avatar/animation
-        // path a remote player does. `first_person` draws only the arms, in
-        // their own depth range, from in front of the camera.
+        // The local player's avatar is a first-person viewmodel: it goes
+        // through the same rig/animation path a remote player's does, but
+        // `first_person` draws only the arms, in their own depth range,
+        // from in front of the camera.
         crate::anim::Animator::new(),
         crate::gltf::GltfModelInstance::new(exsolis_server::PLAYER_MODEL)
             .with_scale(exsolis_server::PLAYER_MODEL_SCALE)
@@ -394,10 +394,13 @@ fn drive_local_animator(
     }
 }
 
-/// Where the first-person arms sit relative to the eye: down and slightly
-/// forward, so the hands sit in the lower part of the frame the way a
-/// first-person arm does.
-const VIEWMODEL_OFFSET: Vec3 = Vec3::new(0.30, -0.42, -0.35);
+/// Where the first-person viewmodel's origin — the shoulder line, after
+/// [`crate::anim::rig`] recentres the arms — sits relative to the eye.
+///
+/// Straight down and a little forward, so the arms hang into the lower part
+/// of the frame rather than around the camera. This is the number to tune by
+/// eye; everything else about the viewmodel derives from it.
+const VIEWMODEL_OFFSET: Vec3 = Vec3::new(0.0, -0.42, -0.40);
 
 /// How fast the smoothed local speed chases the measured one. Must match
 /// `entities::sync_player_entities` on the server.

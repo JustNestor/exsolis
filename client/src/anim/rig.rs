@@ -269,7 +269,76 @@ fn build_arms(joints: &[JointBuild], primitives: &[BakedPrimitive]) -> Option<Ve
         kept_verts,
         total_verts
     );
-    Some(kept)
+    Some(recenter_on_shoulders(kept))
+}
+
+/// Move the arms so the viewmodel's origin is between the shoulders.
+///
+/// The vertices are baked into model space — the space the body draw uses —
+/// where the shoulders sit around `y = 2.5` for a 3.2-unit-tall avatar. The
+/// viewmodel instance matrix is placed relative to the eye, so without this
+/// the arms float a metre and a half above the camera instead of hanging in
+/// front of it.
+///
+/// Only a translation is applied, so the arms keep exactly the pose the
+/// skeleton gives them; and because the bone palette is composed in model
+/// space, the bone transforms still line up with the shifted geometry. The
+/// shoulder line is estimated as the centroid of the top slice of the arm
+/// geometry, which is the clavicle/shoulder region on a humanoid rig and
+/// degrades gracefully on anything else.
+fn recenter_on_shoulders(arms: Vec<BakedPrimitive>) -> Vec<BakedPrimitive> {
+    /// Fraction of the arm geometry, measured from the top, treated as the
+    /// shoulder region. The hands and forearms are lower down, so this stays
+    /// well clear of them.
+    const SHOULDER_SLICE: f32 = 0.10;
+
+    let top = arms
+        .iter()
+        .flat_map(|p| p.vertices.iter())
+        .map(|v| v.position[1])
+        .fold(f32::NEG_INFINITY, f32::max);
+    let cutoff = top
+        - (top
+            - arms
+                .iter()
+                .flat_map(|p| p.vertices.iter())
+                .map(|v| v.position[1])
+                .fold(f32::INFINITY, f32::min))
+            * SHOULDER_SLICE;
+
+    let mut sum = [0f64; 3];
+    let mut count = 0f64;
+    for v in arms.iter().flat_map(|p| p.vertices.iter()) {
+        if v.position[1] >= cutoff {
+            for k in 0..3 {
+                sum[k] += v.position[k] as f64;
+            }
+            count += 1.0;
+        }
+    }
+    if count == 0.0 {
+        return arms;
+    }
+    let pivot = [
+        sum[0] as f32 / count as f32,
+        sum[1] as f32 / count as f32,
+        sum[2] as f32 / count as f32,
+    ];
+    debug!(
+        "viewmodel: recentred arms on the shoulder line at ({:.2}, {:.2}, {:.2})",
+        pivot[0], pivot[1], pivot[2]
+    );
+
+    arms.into_iter()
+        .map(|mut p| {
+            for v in &mut p.vertices {
+                for k in 0..3 {
+                    v.position[k] -= pivot[k];
+                }
+            }
+            p
+        })
+        .collect()
 }
 
 /// A joint plus the bookkeeping the builder needs but the runtime does not.
@@ -923,6 +992,51 @@ mod tests {
         for v in arms[0].primitives[0].vertices.iter() {
             assert!((v.joint as usize) < joint_count);
         }
+
+        // The arms must be centred on the viewmodel origin, not left at body
+        // shoulder height. Untranslated they sit around y = 2.5 on an avatar
+        // 3.2 units tall, which would float a metre and a half above the
+        // camera when the viewmodel instance is placed relative to the eye.
+        let (lo, hi) = arms
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .flat_map(|p| p.vertices.iter())
+            .fold(
+                ([f32::INFINITY; 3], [f32::NEG_INFINITY; 3]),
+                |(mut lo, mut hi), v| {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(v.position[k]);
+                        hi[k] = hi[k].max(v.position[k]);
+                    }
+                    (lo, hi)
+                },
+            );
+        assert!(
+            hi[1] < 0.5 && lo[1] > -2.0,
+            "arms should hang below a shoulder-level origin, but span y {:.2}..{:.2} — \
+             they were not recentred",
+            lo[1],
+            hi[1]
+        );
+        assert!(
+            lo[0] < 0.0 && hi[0] > 0.0,
+            "arms should straddle the viewmodel origin, but span x {:.2}..{:.2}",
+            lo[0],
+            hi[0]
+        );
+        // Arms still hang *down* from the shoulders, so most of the geometry
+        // is below the origin rather than above it.
+        let vertices: Vec<_> = arms
+            .iter()
+            .flat_map(|m| m.primitives.iter())
+            .flat_map(|p| p.vertices.iter())
+            .collect();
+        let below = vertices.iter().filter(|v| v.position[1] < 0.0).count();
+        assert!(
+            below * 2 > vertices.len(),
+            "only {below} of {} arm verts are below the origin — the arms are not hanging down",
+            vertices.len()
+        );
     }
 
     #[test]
