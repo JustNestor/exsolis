@@ -152,7 +152,7 @@ pub struct ScriptRuntime {
 /// `Entity`, no `World` reference) so building this list never needs
 /// scheduler access and so this type is trivial to keep unchanged if the
 /// Lua side is later swapped for LuaJIT talking over the same shape.
-enum ScriptRequest {
+pub(crate) enum ScriptRequest {
     /// `api.send(player_id, kind, ...)` — a raw `ServerMessage` a mod
     /// wants delivered to one player. `kind` is matched against a small
     /// fixed set of message kinds a mod is allowed to send (see
@@ -221,7 +221,7 @@ enum ScriptRequest {
 #[derive(Clone, Debug)]
 #[allow(dead_code)] // Bool/as_u8 have no caller yet; kept for the next
 // message kind a mod needs (e.g. a bool flag arg).
-enum LuaScalar {
+pub(crate) enum LuaScalar {
     Int(i64),
     Float(f64),
     Str(String),
@@ -276,6 +276,11 @@ impl ScriptRuntime {
         };
         runtime.reload_mods()?;
         Ok(runtime)
+    }
+
+    /// Get a reference to the Lua state for other systems to use
+    pub fn lua(&self) -> &Lua {
+        &self.lua
     }
 
     pub fn check_and_reload_mods(&self) {
@@ -863,7 +868,7 @@ fn forward_player_leave(mut events: MessageReader<PlayerLeaved>, runtime: NonSen
 /// Converts a world position to `(ChunkCoord, index-into-chunk)`. Shared
 /// by `get_block` (read) and `set_block_and_broadcast` (write) so the two
 /// can never disagree about which cell a coordinate lands on.
-fn world_to_chunk_index(pos: BlockPos) -> (exsolis_common::ChunkCoord, usize) {
+pub(crate) fn world_to_chunk_index(pos: BlockPos) -> (exsolis_common::ChunkCoord, usize) {
     const S: i32 = exsolis_common::CHUNK_SIZE as i32;
     let coord = exsolis_common::ChunkCoord::new(
         pos.x.div_euclid(S),
@@ -1135,8 +1140,37 @@ fn run_on_tick(
 // placement in the schedule is only transitively `.after(run_on_tick)`,
 // not anchored to `GameplaySet`/`NetSet::Send`, so anything downstream
 // that needs to run strictly after it has to reference it by name.
+/// Lua's drain: the same translator, fed by the Lua outbox.
 pub(crate) fn drain_script_requests(
     runtime: NonSend<ScriptRuntime>,
+    commands: Commands,
+    world: ResMut<ChunkWorld>,
+    registry: Res<crate::entities::EntityRegistry>,
+    spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
+    despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
+    outgoing: MessageWriter<OutgoingPacket>,
+    loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
+) {
+    apply_script_requests(
+        runtime.take_requests(),
+        commands,
+        world,
+        registry,
+        spawns,
+        despawns,
+        outgoing,
+        loaded_by,
+    );
+}
+
+/// Applies the requests drained from *either* scripting backend.
+///
+/// Lua and the TS runtime share this translator so "what a mod may do to the
+/// world" has exactly one implementation: both push the same
+/// [`ScriptRequest`] shape into their outbox and this function does the work.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_script_requests(
+    requests: Vec<ScriptRequest>,
     mut commands: Commands,
     mut world: ResMut<ChunkWorld>,
     registry: Res<crate::entities::EntityRegistry>,
@@ -1145,7 +1179,7 @@ pub(crate) fn drain_script_requests(
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
 ) {
-    for req in runtime.take_requests() {
+    for req in requests {
         match req {
             ScriptRequest::SendTo {
                 player_id,
