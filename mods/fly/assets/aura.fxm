@@ -1,0 +1,64 @@
+{
+  "format_version": 1,
+  "id": "example:aura",
+  "max_instances": 32,
+  "instance_lifetime_seconds": 120.0,
+  "frame_inputs": ["view_projection", "model"],
+  "actions": [
+    {
+      "id": "example:aura_start",
+      "mode": "spawn",
+      "compute_pass": "init",
+      "fields": [{ "name": "intensity", "source": "intensity", "type": "f32" }],
+      "model_player_id": "player_id",
+      "instance_key": "player_id",
+      "follow_model": true
+    },
+    {
+      "id": "example:aura_update",
+      "mode": "update",
+      "compute_pass": "set_intensity",
+      "fields": [{ "name": "intensity", "source": "intensity", "type": "f32" }],
+      "instance_key": "player_id"
+    },
+    {
+      "id": "example:aura_stop",
+      "mode": "stop",
+      "instance_key": "player_id",
+      "linger_seconds": 0.6
+    }
+  ],
+  "passes": [
+    {
+      "id": "init",
+      "kind": "compute",
+      "shader": "mods/fly/effects/aura.wgsl",
+      "entry_point": "init",
+      "workgroups": [1, 1, 1],
+      "writes": ["state"]
+    },
+    {
+      "id": "set_intensity",
+      "kind": "compute",
+      "shader": "mods/fly/effects/aura.wgsl",
+      "entry_point": "set_intensity",
+      "workgroups": [1, 1, 1],
+      "writes": ["state"]
+    },
+    {
+      "id": "draw",
+      "kind": "graphics",
+      "vertex": { "shader": "mods/fly/effects/aura.wgsl", "entry_point": "vs_main" },
+      "fragment": { "shader": "mods/fly/effects/aura.wgsl", "entry_point": "fs_main" },
+      "phase": "world_transparent",
+      "blend": "additive",
+      "depth": "test",
+      "vertex_count": 6,
+      "instance_count": 24,
+      "reads": ["state"]
+    }
+  ],
+  "buffers": [{ "id": "state", "bytes": 16, "persistent": true }],
+  "images": [],
+  "textures": []
+}

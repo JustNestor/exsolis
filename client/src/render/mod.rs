@@ -5,13 +5,15 @@
 //! - [`allocator`] — `offset-allocator` sub-alloc of the vertex/index buffers
 //! - [`gpu`] — pipeline, buffers, task graph, draw
 //! - [`meshing`] — invalidate / queue / poll / upload
-//! - [`avatars`] — one local-space head, instanced by model matrix
+//! - [`effects`] / [`effects_gpu`] — server-authored mod visual effects
+//! - [`world_data`] — block data window that effect shaders can read
 
 pub mod allocator;
 pub(crate) mod effects;
 mod effects_gpu;
 pub mod gpu;
 mod meshing;
+pub(crate) mod world_data;
 pub mod ui_pass;
 
 use bevy_app::prelude::*;
@@ -28,11 +30,13 @@ impl Plugin for RendererPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugins(TexturePlugin)
             .init_resource::<crate::gltf::GltfModels>()
+            .init_resource::<world_data::WorldWindow>()
             .add_message::<effects::ModActionEvent>()
             .add_systems(
                 Update,
                 (
                     gpu::setup_renderer,
+                    world_data::update_world_window,
                     effects::route_mod_actions,
                     effects_gpu::prepare_gpu_effects,
                     meshing::invalidate_stale_meshes.run_if(resource_exists::<RenderState>),

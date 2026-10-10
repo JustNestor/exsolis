@@ -21,10 +21,35 @@ use crate::{
 pub struct ModActionEvent {
     pub effect_id: String,
     pub id: String,
-    pub compute_pass: String,
+    pub mode: ActionMode,
+    /// Spawn: always `Some`. Update/stop: an optional one-shot pass that runs
+    /// once with this event's payload bound as `action`.
+    pub compute_pass: Option<String>,
     /// Payload fields encoded with WGSL-compatible alignment and padding.
     pub payload: Vec<u8>,
     pub model_player_id: Option<u64>,
+    /// Identity of the instance this action addresses (see `ActionRoute`).
+    pub instance_key: Option<String>,
+    pub follow_model: bool,
+    pub lifetime_seconds: Option<f32>,
+    pub linger_seconds: f32,
+}
+
+/// What an action does to the effect's instances.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActionMode {
+    /// Start a new instance (the default, and the only mode before keyed
+    /// instances existed). Fire-and-forget: the instance stays where it
+    /// spawned until its lifetime ends.
+    #[default]
+    Spawn,
+    /// Address a live instance by `instance_key`: runs the optional one-shot
+    /// pass and extends the instance's lifetime (a heartbeat).
+    Update,
+    /// End a live instance by `instance_key`, after an optional one-shot pass
+    /// and `linger_seconds` of fade-out.
+    Stop,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -89,12 +114,33 @@ pub enum FrameInput {
 #[serde(deny_unknown_fields)]
 pub struct ActionRoute {
     pub id: String,
-    pub compute_pass: String,
+    #[serde(default)]
+    pub mode: ActionMode,
+    /// Required for `spawn`. For `update`/`stop` an optional one-shot pass.
+    #[serde(default)]
+    pub compute_pass: Option<String>,
     #[serde(default)]
     pub fields: Vec<PayloadField>,
     /// Payload path holding a decimal PlayerId whose client transform is
     /// exposed through the engine model-matrix binding.
     pub model_player_id: Option<String>,
+    /// Payload path of a string or integer naming the instance. A keyed
+    /// `spawn` restarts the live instance with the same key instead of
+    /// stacking a second one; `update` and `stop` require it.
+    #[serde(default)]
+    pub instance_key: Option<String>,
+    /// Keep refreshing the model matrix from the player's transform every
+    /// frame. Off by default so one-shot effects (a jump puff) stay where
+    /// they happened until they die. Needs `model_player_id`.
+    #[serde(default)]
+    pub follow_model: bool,
+    /// Overrides the manifest's `instance_lifetime_seconds` (spawn/update).
+    #[serde(default)]
+    pub lifetime_seconds: Option<f32>,
+    /// `stop` only: how long the instance keeps running after the stop pass
+    /// before it is removed. Shaders see it through `frame.stop_age`.
+    #[serde(default)]
+    pub linger_seconds: f32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -144,6 +190,21 @@ pub struct EffectPass {
     pub writes: Vec<String>,
     #[serde(default)]
     pub after: Vec<String>,
+    /// GPU-written arguments. Graphics: a `DrawIndirectCommand` (4 x u32:
+    /// vertex_count, instance_count, first_vertex, first_instance) read from
+    /// a declared buffer. Compute: a `DispatchIndirectCommand` (3 x u32).
+    /// The static counts / workgroups are ignored when this is set.
+    #[serde(default)]
+    pub indirect: Option<IndirectArgs>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IndirectArgs {
+    pub buffer: String,
+    /// Byte offset of the command inside the buffer (4-byte aligned).
+    #[serde(default)]
+    pub offset: u32,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -518,6 +579,30 @@ fn validate_manifest(manifest: &EffectManifest) -> Result<(), String> {
         }
     }
 
+    for pass in &manifest.passes {
+        let Some(indirect) = &pass.indirect else {
+            continue;
+        };
+        let command_bytes = match pass.kind {
+            PassKind::Compute => 12u64,
+            PassKind::Graphics => 16u64,
+        };
+        let Some(buffer) = manifest.buffers.iter().find(|b| b.id == indirect.buffer) else {
+            return Err(format!(
+                "pass '{}' uses unknown indirect buffer '{}'",
+                pass.id, indirect.buffer
+            ));
+        };
+        if indirect.offset % 4 != 0
+            || u64::from(indirect.offset) + command_bytes > u64::from(buffer.bytes)
+        {
+            return Err(format!(
+                "pass '{}' has an unaligned or out-of-range indirect offset",
+                pass.id
+            ));
+        }
+    }
+
     let compute_pass_ids: HashSet<&str> = manifest
         .passes
         .iter()
@@ -526,11 +611,50 @@ fn validate_manifest(manifest: &EffectManifest) -> Result<(), String> {
         .collect();
     let mut action_ids = HashSet::new();
     for action in &manifest.actions {
+        let pass_ok = match (action.compute_pass.as_deref(), action.mode) {
+            (Some(pass), _) => compute_pass_ids.contains(pass),
+            (None, ActionMode::Spawn) => false,
+            (None, _) => true,
+        };
         if !is_valid_mod_action_id(&action.id)
             || !action_ids.insert(action.id.as_str())
-            || !compute_pass_ids.contains(action.compute_pass.as_str())
+            || !pass_ok
         {
             return Err(format!("invalid or duplicate action route '{}'", action.id));
+        }
+        if action.mode != ActionMode::Spawn
+            && (action.instance_key.is_none()
+                || action.follow_model
+                || action.model_player_id.is_some())
+        {
+            return Err(format!(
+                "action '{}': update/stop need instance_key and take no model fields",
+                action.id
+            ));
+        }
+        if action.follow_model && action.model_player_id.is_none() {
+            return Err(format!(
+                "action '{}': follow_model needs model_player_id",
+                action.id
+            ));
+        }
+        if let Some(path) = &action.instance_key {
+            if path.is_empty() || !path.split('.').all(is_identifier) {
+                return Err(format!("invalid instance key path for '{}'", action.id));
+            }
+        }
+        if action
+            .lifetime_seconds
+            .is_some_and(|v| !v.is_finite() || !(0.05..=120.0).contains(&v))
+            || action.mode == ActionMode::Stop && action.lifetime_seconds.is_some()
+        {
+            return Err(format!("action '{}': invalid lifetime_seconds", action.id));
+        }
+        if !action.linger_seconds.is_finite()
+            || !(0.0..=120.0).contains(&action.linger_seconds)
+            || action.mode != ActionMode::Stop && action.linger_seconds != 0.0
+        {
+            return Err(format!("action '{}': invalid linger_seconds", action.id));
         }
         let mut field_names = HashSet::new();
         let mut source_names = HashSet::new();
@@ -638,40 +762,47 @@ pub(super) fn route_mod_actions(
             };
         for (_, manifest) in assets.iter_loaded::<EffectManifest>() {
             for route in manifest.actions.iter().filter(|route| route.id == *id) {
-                let pass = manifest
-                    .passes
-                    .iter()
-                    .find(|pass| pass.id == route.compute_pass)
-                    .expect("validated action references a compute pass");
-                let shader_path = pass.shader.as_deref().expect("compute shader validated");
-                let entry_point = pass
-                    .entry_point
-                    .as_deref()
-                    .expect("compute entry point validated");
-                let Some(shader) = assets.get::<WgslAsset>(shader_path) else {
-                    warn!(
-                        "effect '{}' action '{}' references unloaded shader '{}'",
-                        manifest.id, id, shader_path
-                    );
-                    continue;
-                };
-                if !shader.entry_points.iter().any(|entry| {
-                    entry.name == entry_point && entry.stage == naga::ShaderStage::Compute
-                }) {
-                    warn!(
-                        "effect '{}' pass '{}' has no compiled compute entry point '{}'",
-                        manifest.id, pass.id, entry_point
-                    );
-                    continue;
+                if let Some(pass_id) = route.compute_pass.as_deref() {
+                    let pass = manifest
+                        .passes
+                        .iter()
+                        .find(|pass| pass.id == pass_id)
+                        .expect("validated action references a compute pass");
+                    let shader_path = pass.shader.as_deref().expect("compute shader validated");
+                    let entry_point = pass
+                        .entry_point
+                        .as_deref()
+                        .expect("compute entry point validated");
+                    let Some(shader) = assets.get::<WgslAsset>(shader_path) else {
+                        warn!(
+                            "effect '{}' action '{}' references unloaded shader '{}'",
+                            manifest.id, id, shader_path
+                        );
+                        continue;
+                    };
+                    if !shader.entry_points.iter().any(|entry| {
+                        entry.name == entry_point && entry.stage == naga::ShaderStage::Compute
+                    }) {
+                        warn!(
+                            "effect '{}' pass '{}' has no compiled compute entry point '{}'",
+                            manifest.id, pass.id, entry_point
+                        );
+                        continue;
+                    }
                 }
                 match pack_payload(route, &payload) {
-                    Ok((bytes, model_player_id)) => {
+                    Ok((bytes, model_player_id, instance_key)) => {
                         actions.write(ModActionEvent {
                             effect_id: manifest.id.clone(),
                             id: id.clone(),
+                            mode: route.mode,
                             compute_pass: route.compute_pass.clone(),
                             payload: bytes,
                             model_player_id,
+                            instance_key,
+                            follow_model: route.follow_model,
+                            lifetime_seconds: route.lifetime_seconds,
+                            linger_seconds: route.linger_seconds,
                         });
                     }
                     Err(error) => {
@@ -683,10 +814,13 @@ pub(super) fn route_mod_actions(
     }
 }
 
+/// Longest accepted instance key, so a hostile payload can't bloat the table.
+const MAX_INSTANCE_KEY_BYTES: usize = 64;
+
 fn pack_payload(
     route: &ActionRoute,
     payload: &serde_json::Value,
-) -> Result<(Vec<u8>, Option<u64>), String> {
+) -> Result<(Vec<u8>, Option<u64>, Option<String>), String> {
     let mut bytes = Vec::new();
     for field in &route.fields {
         let (alignment, size) = field.ty.layout();
@@ -709,7 +843,26 @@ fn pack_payload(
                 .map_err(|_| format!("model player id '{path}' is not a u64"))
         })
         .transpose()?;
-    Ok((bytes, model_player_id))
+    let instance_key = route
+        .instance_key
+        .as_deref()
+        .map(|path| {
+            let value = json_path(payload, path)
+                .ok_or_else(|| format!("instance key '{path}' is missing"))?;
+            let key = match value {
+                serde_json::Value::String(text) => text.clone(),
+                serde_json::Value::Number(number) if number.is_i64() || number.is_u64() => {
+                    number.to_string()
+                }
+                _ => return Err(format!("instance key '{path}' must be a string or integer")),
+            };
+            if key.is_empty() || key.len() > MAX_INSTANCE_KEY_BYTES {
+                return Err(format!("instance key '{path}' has an invalid length"));
+            }
+            Ok(key)
+        })
+        .transpose()?;
+    Ok((bytes, model_player_id, instance_key))
 }
 
 fn json_path<'a>(value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {

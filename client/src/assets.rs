@@ -171,9 +171,9 @@ pub struct WgslEntryPoint {
 }
 
 fn decode_wgsl(bytes: &[u8]) -> Result<LoadedAsset, String> {
-    let source = std::str::from_utf8(bytes)
-        .map_err(|e| format!("WGSL source is not UTF-8: {e}"))?
-        .to_owned();
+    let source = expand_engine_imports(
+        std::str::from_utf8(bytes).map_err(|e| format!("WGSL source is not UTF-8: {e}"))?,
+    )?;
     let module = naga::front::wgsl::parse_str(&source).map_err(|e| e.emit_to_string(&source))?;
     let info = naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
@@ -186,15 +186,29 @@ fn decode_wgsl(bytes: &[u8]) -> Result<LoadedAsset, String> {
     // Effect WGSL declares the Vulkano descriptor-set ABI directly with
     // @group/@binding, so preserve those values when Naga resolves resources.
     spv_options.fake_missing_bindings = true;
+    // Effects index the engine's bindless set (group 0) with unsized
+    // `binding_array`s; see `declare_runtime_descriptor_arrays`.
+    let uses_unsized_binding_arrays = module.global_variables.iter().any(|(_, global)| {
+        matches!(
+            module.types[global.ty].inner,
+            naga::TypeInner::BindingArray {
+                size: naga::ArraySize::Dynamic,
+                ..
+            }
+        )
+    });
     let mut entry_points = Vec::with_capacity(module.entry_points.len());
     for entry in &module.entry_points {
         let pipeline_options = naga::back::spv::PipelineOptions {
             shader_stage: entry.stage,
             entry_point: entry.name.clone(),
         };
-        let spirv =
+        let mut spirv =
             naga::back::spv::write_vec(&module, &info, &spv_options, Some(&pipeline_options))
                 .map_err(|e| format!("WGSL SPIR-V generation failed for '{}': {e}", entry.name))?;
+        if uses_unsized_binding_arrays {
+            declare_runtime_descriptor_arrays(&mut spirv);
+        }
         entry_points.push(WgslEntryPoint {
             name: entry.name.clone(),
             stage: entry.stage,
@@ -206,6 +220,228 @@ fn decode_wgsl(bytes: &[u8]) -> Result<LoadedAsset, String> {
         source,
         entry_points,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Engine WGSL imports
+//
+// A line consisting of `//!import <name>` is replaced by the engine-owned
+// declarations below, so mods don't copy ABI structs that change with the
+// engine (the frame layout grows over time). Each import expands once, and
+// imports pull in what they depend on. The directive is a plain comment to
+// every other tool, and `enable ...;` lines must still come first in the file.
+//
+//   engine/frame     FrameData + `@group(1) @binding(1) var<storage, read> frame`
+//   engine/bindless  `samplers` / `textures` binding arrays (needs
+//                    `enable wgpu_binding_array;` at the top of the file)
+//   engine/world     block data around the camera (needs engine/frame)
+// ---------------------------------------------------------------------------
+
+const ENGINE_FRAME_WGSL: &str = r#"
+struct FrameData {
+    frame_index: u32,
+    time_seconds: f32,
+    delta_time: f32,
+    _padding: u32,
+    viewport: vec2<f32>,
+    _padding2: vec2<u32>,
+    camera_position: vec3<f32>,
+    _padding3: f32,
+    view_projection: mat4x4<f32>,
+    model: mat4x4<f32>,
+    model_view_projection: mat4x4<f32>,
+    sampler_nearest: u32,
+    sampler_linear: u32,
+    texture_count: u32,
+    _padding4: u32,
+    textures: array<u32, 8>,
+    // Seconds since this instance spawned.
+    instance_age: f32,
+    // Seconds since a `stop` action hit this instance, or -1.0 while running.
+    stop_age: f32,
+    // Slot of this instance within the effect (stable for its lifetime).
+    instance_slot: u32,
+    _padding5: u32,
+    // xyz: window size in chunks, w: chunk edge in blocks. Zero when absent.
+    world_dims: vec4<u32>,
+    // xyz: chunk coordinate the window is centred on, w: 1 when usable.
+    world_anchor: vec4<i32>,
+}
+@group(1) @binding(1) var<storage, read> frame: FrameData;
+"#;
+
+const ENGINE_BINDLESS_WGSL: &str = r#"
+@group(0) @binding(0) var samplers: binding_array<sampler>;
+@group(0) @binding(1) var textures: binding_array<texture_2d<f32>>;
+"#;
+
+const ENGINE_WORLD_WGSL: &str = r#"
+// Read-only block data in a window of chunks around the local camera. Voxels
+// are packed as u16: bits 0..8 block id, bits 8..11 flags. A position outside
+// the window or in a chunk that hasn't arrived yet reads as WORLD_UNLOADED.
+@group(1) @binding(24) var<storage, read> world_cells: array<u32>;
+
+const WORLD_UNLOADED: u32 = 0xFFFFu;
+const WORLD_FLAG_SOLID: u32 = 0x100u;
+const WORLD_FLAG_TRANSPARENT: u32 = 0x200u;
+const WORLD_FLAG_AIR: u32 = 0x400u;
+
+fn world_enabled() -> bool {
+    return frame.world_anchor.w != 0;
+}
+
+fn world_floor_div(a: i32, b: i32) -> i32 {
+    var q = a / b;
+    if ((a % b) != 0 && ((a < 0) != (b < 0))) {
+        q = q - 1;
+    }
+    return q;
+}
+
+// Packed voxel at an integer block position, or WORLD_UNLOADED.
+fn world_block(p: vec3<i32>) -> u32 {
+    if (frame.world_anchor.w == 0) {
+        return WORLD_UNLOADED;
+    }
+    let cs = i32(frame.world_dims.w);
+    let dims = vec3<i32>(frame.world_dims.xyz);
+    let c = vec3<i32>(
+        world_floor_div(p.x, cs),
+        world_floor_div(p.y, cs),
+        world_floor_div(p.z, cs),
+    );
+    let l = p - c * cs;
+    let m = ((c % dims) + dims) % dims;
+    let cell = u32((m.z * dims.y + m.y) * dims.x + m.x);
+    let tag = cell * 4u;
+    if (world_cells[tag + 3u] == 0u
+        || bitcast<i32>(world_cells[tag]) != c.x
+        || bitcast<i32>(world_cells[tag + 1u]) != c.y
+        || bitcast<i32>(world_cells[tag + 2u]) != c.z) {
+        return WORLD_UNLOADED;
+    }
+    let cells = u32(dims.x * dims.y * dims.z);
+    let cs_u = u32(cs);
+    let voxel = u32((l.y * cs + l.z) * cs + l.x);
+    let base = cells * 4u + cell * (cs_u * cs_u * cs_u / 2u);
+    let word = world_cells[base + voxel / 2u];
+    return (word >> ((voxel & 1u) * 16u)) & 0xFFFFu;
+}
+
+fn world_block_at(p: vec3<f32>) -> u32 {
+    return world_block(vec3<i32>(floor(p)));
+}
+
+fn world_is_loaded(v: u32) -> bool { return v != WORLD_UNLOADED; }
+fn world_is_solid(v: u32) -> bool { return v != WORLD_UNLOADED && (v & WORLD_FLAG_SOLID) != 0u; }
+fn world_is_air(v: u32) -> bool { return v != WORLD_UNLOADED && (v & WORLD_FLAG_AIR) != 0u; }
+fn world_block_id(v: u32) -> u32 { return v & 0xFFu; }
+
+// Collision shorthand: true only for loaded, solid blocks.
+fn world_solid_at(p: vec3<f32>) -> bool {
+    return world_is_solid(world_block_at(p));
+}
+
+// Top surface of the first solid block at or below `p` within `max_down`
+// blocks, or `none` if there isn't one in loaded data.
+fn world_ground_below(p: vec3<f32>, max_down: i32, none: f32) -> f32 {
+    let start = vec3<i32>(floor(p));
+    for (var i = 0; i <= max_down; i = i + 1) {
+        let v = world_block(vec3<i32>(start.x, start.y - i, start.z));
+        if (world_is_solid(v)) {
+            return f32(start.y - i + 1);
+        }
+    }
+    return none;
+}
+"#;
+
+fn engine_import(name: &str) -> Option<(&'static [&'static str], &'static str)> {
+    match name {
+        "engine/frame" => Some((&[], ENGINE_FRAME_WGSL)),
+        "engine/bindless" => Some((&[], ENGINE_BINDLESS_WGSL)),
+        "engine/world" => Some((&["engine/frame"], ENGINE_WORLD_WGSL)),
+        _ => None,
+    }
+}
+
+fn expand_engine_import(
+    name: &str,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut String,
+) -> Result<(), String> {
+    if !seen.insert(name.to_owned()) {
+        return Ok(());
+    }
+    let Some((dependencies, text)) = engine_import(name) else {
+        return Err(format!("unknown engine import '{name}'"));
+    };
+    for dependency in dependencies {
+        expand_engine_import(dependency, seen, out)?;
+    }
+    out.push_str(text);
+    out.push('\n');
+    Ok(())
+}
+
+fn expand_engine_imports(source: &str) -> Result<String, String> {
+    if !source.contains("//!import") {
+        return Ok(source.to_owned());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = String::with_capacity(source.len() + 4096);
+    for line in source.lines() {
+        match line.trim().strip_prefix("//!import") {
+            Some(name) => expand_engine_import(name.trim(), &mut seen, &mut out)?,
+            None => {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Naga (30.x) lowers an unsized `binding_array<T>` to a UniformConstant
+/// `OpTypeRuntimeArray` of opaque handles but never declares the capability
+/// Vulkan requires for that (`RuntimeDescriptorArray`), nor the extension that
+/// provides it below SPIR-V 1.5 (`SPV_EXT_descriptor_indexing`). `spirv-val
+/// --target-env vulkan1.3` rejects the module otherwise
+/// (VUID-StandaloneSpirv-OpTypeRuntimeArray-04680). The bindless context
+/// already requires the matching device feature, so declaring both is safe.
+fn declare_runtime_descriptor_arrays(spirv: &mut Vec<u32>) {
+    const HEADER_WORDS: usize = 5;
+    const OP_EXTENSION: u32 = 10;
+    const OP_CAPABILITY: u32 = 17;
+    const CAPABILITY_RUNTIME_DESCRIPTOR_ARRAY: u32 = 5302;
+
+    let mut at = HEADER_WORDS;
+    while at < spirv.len() {
+        let word = spirv[at];
+        let (op, len) = (word & 0xffff, (word >> 16) as usize);
+        if op != OP_CAPABILITY || len == 0 || at + len > spirv.len() {
+            break;
+        }
+        if spirv[at + 1] == CAPABILITY_RUNTIME_DESCRIPTOR_ARRAY {
+            return;
+        }
+        at += len;
+    }
+
+    let mut name = b"SPV_EXT_descriptor_indexing\0".to_vec();
+    while name.len() % 4 != 0 {
+        name.push(0);
+    }
+    let name_words = name
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]));
+    let mut inserted = vec![
+        (2 << 16) | OP_CAPABILITY,
+        CAPABILITY_RUNTIME_DESCRIPTOR_ARRAY,
+        (((1 + name.len() / 4) as u32) << 16) | OP_EXTENSION,
+    ];
+    inserted.extend(name_words);
+    spirv.splice(at..at, inserted);
 }
 
 #[derive(Message, Debug, Clone)]

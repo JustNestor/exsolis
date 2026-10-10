@@ -445,6 +445,10 @@ pub(crate) struct FrameData {
     /// UI instance buffer + live count (synced from `UiDrawList` each frame).
     pub ui_buffer_id: Id<Buffer>,
     pub ui_count: u32,
+    /// Block-data window description for effect shaders.
+    pub(super) world: super::world_data::WorldFrameInfo,
+    /// Chunk cells to (re)write into the world buffer before effects run.
+    pub(super) world_uploads: Vec<super::world_data::WorldUpload>,
     /// GLTF instance data
     pub gltf_instance_buffer_id: Id<Buffer>,
     pub gltf_instance_count: u32,
@@ -982,6 +986,8 @@ pub(super) fn setup_renderer(
     let ui_gpu = UiPassGpu::new(&vk);
     let effect_arena_id = super::effects_gpu::create_effect_arena(&vk)
         .expect("failed to create mod-effect buffer arena");
+    let world_data_id = super::effects_gpu::create_world_buffer(&vk)
+        .expect("failed to create world data buffer for effects");
 
     // Create GLTF material storage buffer (max 256 materials)
     const MAX_GLTF_MATERIALS: u32 = 256;
@@ -1145,6 +1151,7 @@ pub(super) fn setup_renderer(
     });
 
     task_graph.add_host_buffer_access(effect_arena_id, HostAccessType::Write);
+    task_graph.add_host_buffer_access(world_data_id, HostAccessType::Write);
     task_graph.add_host_buffer_access(gltf_vertex_buffer_id, HostAccessType::Write);
     task_graph.add_host_buffer_access(gltf_index_buffer_id, HostAccessType::Write);
     task_graph.add_host_buffer_access(gltf_material_buffer_id, HostAccessType::Write);
@@ -1161,6 +1168,7 @@ pub(super) fn setup_renderer(
     );
     let compute_node_id = compute_node
         .buffer_access(effect_arena_id, effect_storage_access())
+        .buffer_access(world_data_id, effect_storage_access())
         .build();
 
     let task = ChunkRenderTask {
@@ -1198,6 +1206,7 @@ pub(super) fn setup_renderer(
         .buffer_access(vertex_buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .buffer_access(ui_gpu.buffer_id, AccessTypes::VERTEX_ATTRIBUTE_READ)
         .buffer_access(effect_arena_id, effect_storage_access())
+        .buffer_access(world_data_id, effect_storage_access())
         .build();
 
     // Both nodes access the effect arena, so make the compute-to-draw order
@@ -1578,6 +1587,7 @@ pub(super) fn setup_renderer(
     shared.write().unwrap().effects_gpu = Some(super::effects_gpu::EffectGpuState::new(
         &vk,
         effect_arena_id,
+        world_data_id,
         subpass,
     ));
 
@@ -1608,6 +1618,8 @@ fn effect_storage_access() -> AccessTypes {
         | AccessTypes::VERTEX_SHADER_STORAGE_WRITE
         | AccessTypes::FRAGMENT_SHADER_STORAGE_READ
         | AccessTypes::FRAGMENT_SHADER_STORAGE_WRITE
+        // Indirect draw/dispatch arguments written by effect compute passes.
+        | AccessTypes::INDIRECT_COMMAND_READ
 }
 
 pub(super) fn render_frame(
@@ -1620,6 +1632,7 @@ pub(super) fn render_frame(
     local_player_id: Option<Res<LocalPlayerId>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
+    mut world: ResMut<super::world_data::WorldWindow>,
     player_entities: Query<
         (&Transform, &EntityScale, Option<&PlayerIdComponent>),
         With<EntityKindComponent>,
@@ -1782,6 +1795,8 @@ pub(super) fn render_frame(
         viewmodel_draws,
         viewmodel_instance_count,
         viewmodel_view_proj,
+        world: world.frame_info(),
+        world_uploads: world.take_pending(),
     };
     render_state.frame_index = render_state.frame_index.wrapping_add(1);
 
@@ -1798,7 +1813,9 @@ pub(super) fn render_frame(
     .unwrap();
 
     match unsafe { task_graph.execute(resource_map, &frame, || {}) } {
-        Ok(()) => {}
+        // Only a frame that actually ran has applied its world uploads; on any
+        // other outcome the window re-derives them from its unchanged mirror.
+        Ok(()) => world.commit(&frame.world_uploads),
         Err(ExecuteError::Swapchain {
             error: VulkanError::OutOfDate,
             ..

@@ -1,26 +1,12 @@
 enable wgpu_binding_array;
 
-struct FrameData {
-    frame_index: u32,
-    time_seconds: f32,
-    delta_time: f32,
-    _padding: u32,
-    viewport: vec2<f32>,
-    _padding2: vec2<u32>,
-    camera_position: vec3<f32>,
-    _padding3: f32,
-    view_projection: mat4x4<f32>,
-    model: mat4x4<f32>,
-    model_view_projection: mat4x4<f32>,
-    // Texture table (added after the classic block, so shaders that stop at
-    // model_view_projection keep working).
-    sampler_nearest: u32,
-    sampler_linear: u32,
-    texture_count: u32,
-    _padding4: u32,
-    // Bindless image indices, in the order of the manifest's "textures".
-    textures: array<u32, 8>,
-}
+// Engine-owned declarations (see `ENGINE_*_WGSL` in assets.rs):
+//   engine/frame    FrameData + `frame` (group 1, binding 1)
+//   engine/bindless `samplers` / `textures` binding arrays (group 0)
+//   engine/world    block data around the camera (group 1, binding 24)
+//!import engine/frame
+//!import engine/bindless
+//!import engine/world
 
 struct FlyAction {
     strength: f32,
@@ -32,17 +18,25 @@ struct Particle {
     velocity_lifetime: vec4<f32>,
 }
 
-// Engine-provided bindless set (group 0). Index with frame.sampler_* /
-// frame.textures[..]; those values come from a read-only storage buffer, so
-// naga treats them as uniform and textureSample is fine.
-@group(0) @binding(0) var samplers: binding_array<sampler>;
-@group(0) @binding(1) var textures: binding_array<texture_2d<f32>>;
+// Layout of a DrawIndirectCommand. Atomics let every alive particle append
+// itself without a separate counting pass.
+struct DrawArgs {
+    vertex_count: atomic<u32>,
+    instance_count: atomic<u32>,
+    first_vertex: atomic<u32>,
+    first_instance: atomic<u32>,
+}
 
 const TEX_SPARK: u32 = 0u;
+const VERTICES_PER_PARTICLE: u32 = 6u;
+const PARTICLE_SIZE: f32 = 0.035;
 
 @group(1) @binding(0) var<storage, read> action: FlyAction;
-@group(1) @binding(1) var<storage, read> frame: FrameData;
 @group(1) @binding(2) var<storage, read_write> particles: array<Particle>;
+// Non-persistent buffers are zeroed every frame, so `args` starts at
+// instance_count = 0 and `alive` starts empty without any reset pass.
+@group(1) @binding(3) var<storage, read_write> alive: array<u32>;
+@group(1) @binding(4) var<storage, read_write> args: DrawArgs;
 
 @compute @workgroup_size(64)
 fn spawn(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -83,22 +77,44 @@ fn simulate(@builtin(global_invocation_id) gid: vec3<u32>) {
     let age = particle.position_age.w + dt;
     if (age >= particle.velocity_lifetime.w) {
         particle.position_age = vec4<f32>(particle.position_age.xyz, -1.0);
-    } else {
-        particle.position_age = vec4<f32>(
-            particle.position_age.xyz + particle.velocity_lifetime.xyz * dt,
-            age
-        );
-        particle.velocity_lifetime = vec4<f32>(
-            particle.velocity_lifetime.x,
-            particle.velocity_lifetime.y - 0.9 * dt,
-            particle.velocity_lifetime.z,
-            particle.velocity_lifetime.w
-        );
+        particles[index] = particle;
+        return;
     }
-    particles[index] = particle;
-}
 
-const PARTICLE_SIZE: f32 = 0.035;
+    var position = particle.position_age.xyz;
+    var velocity = particle.velocity_lifetime.xyz;
+    velocity.y = velocity.y - 0.9 * dt;
+    let next = position + velocity * dt;
+
+    // Sweep one axis at a time against the world: sparks slide along walls and
+    // bounce off the ground. Blocks that aren't loaded never count as solid.
+    if (!world_solid_at(vec3<f32>(next.x, position.y, position.z))) {
+        position.x = next.x;
+    } else {
+        velocity.x = -velocity.x * 0.4;
+    }
+    if (!world_solid_at(vec3<f32>(position.x, next.y, position.z))) {
+        position.y = next.y;
+    } else {
+        velocity.y = -velocity.y * 0.35;
+        velocity.x = velocity.x * 0.8;
+        velocity.z = velocity.z * 0.8;
+    }
+    if (!world_solid_at(vec3<f32>(position.x, position.y, next.z))) {
+        position.z = next.z;
+    } else {
+        velocity.z = -velocity.z * 0.4;
+    }
+
+    particle.position_age = vec4<f32>(position, age);
+    particle.velocity_lifetime = vec4<f32>(velocity, particle.velocity_lifetime.w);
+    particles[index] = particle;
+
+    // Append to the alive list; the draw reads its size from `args`.
+    let slot = atomicAdd(&args.instance_count, 1u);
+    alive[slot] = index;
+    atomicStore(&args.vertex_count, VERTICES_PER_PARTICLE);
+}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -115,7 +131,8 @@ fn vs_main(
         vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, -1.0), vec2<f32>(1.0, 1.0),
         vec2<f32>(-1.0, -1.0), vec2<f32>(1.0, 1.0), vec2<f32>(-1.0, 1.0)
     );
-    let particle = particles[instance_index];
+    // `instance_index` counts only live particles; `alive` maps it back.
+    let particle = particles[alive[instance_index]];
     let life = particle.position_age.w;
     let corner = corners[vertex_index % 6u];
     var out: VertexOutput;
@@ -153,5 +170,5 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         uv,
     );
     // Additive blend is SrcAlpha/One, so alpha scales the colour.
-    return vec4<f32>(spark.rgb * vec3<f32>(1., 0.42, 0.08), spark.a * in.life);
+    return vec4<f32>(spark.rgb * vec3<f32>(1.0, 0.42, 0.08), spark.a * in.life);
 }
