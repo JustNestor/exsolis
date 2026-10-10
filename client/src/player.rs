@@ -9,6 +9,7 @@ use bevy_ecs::prelude::*;
 use bevy_input::mouse::MouseMotion;
 use bevy_input::{ButtonInput, keyboard::KeyCode};
 use bevy_log::info;
+use bevy_time::Time;
 use bevy_transform::prelude::Transform;
 use bevy_ui::IsDefaultUiCamera;
 use bevy_window::{CursorGrabMode, CursorOptions, PrimaryWindow, Window};
@@ -80,6 +81,7 @@ impl Plugin for PlayerPlugin {
                 send_movement_input,
                 sync_ui_layout_camera,
                 (receive_server_position, follow_server_position).chain(),
+                drive_local_animator,
             )
                 .in_set(GameplaySet),
         );
@@ -92,6 +94,10 @@ fn spawn_local_player(mut commands: Commands) {
         FlyCamera::default(),
         Transform::from_translation(Vec3::from(SPAWN_POS)),
         ServerTarget::default(),
+        // The local player is an entity too, so the first-person hands and a
+        // third-person view of yourself go through the same avatar/animation
+        // path a remote player does.
+        crate::anim::Animator::new(),
     ));
 
     commands.spawn((
@@ -320,4 +326,54 @@ fn follow_server_position(
         let alpha = 1.0 - (-FOLLOW_RATE * dt).exp();
         transform.translation += delta * alpha;
     }
+}
+
+/// Drive the local player's avatar animation.
+///
+/// Remote entities take their speed from the server's authoritative
+/// `EntityState`. The local player is different: it moves on its own input
+/// and the server's copy arrives a round trip later, so waiting for it would
+/// make the first-person hands lag behind the camera. Differencing the local
+/// transform is both available immediately and exactly what the player is
+/// seeing.
+///
+/// The head look is applied additively on top of whatever body clip is
+/// playing, because in this rig the head is an independent branch — that is
+/// what lets the body keep walking while the head tracks the crosshair.
+fn drive_local_animator(
+    time: Res<Time>,
+    mut last_pos: Local<Option<Vec3>>,
+    mut query: Query<(&Transform, &FlyCamera, &mut crate::anim::Animator), With<LocalPlayer>>,
+) {
+    let dt = time.delta_secs();
+    for (transform, camera, mut animator) in &mut query {
+        let position = transform.translation;
+        let instant = match (last_pos.replace(position), dt) {
+            (Some(previous), dt) if dt > f32::EPSILON => {
+                let delta = position - previous;
+                Vec3::new(delta.x, 0.0, delta.z).length() / dt
+            }
+            // First frame (or a paused one): no basis for a speed.
+            _ => animator.speed,
+        };
+        // Frame-rate independent smoothing, matched to the server's so both
+        // sides cross the walk/run threshold at the same moment.
+        let alpha = 1.0 - (-SPEED_SMOOTHING * dt).exp();
+        animator.speed += (instant - animator.speed) * alpha.clamp(0.0, 1.0);
+
+        // The avatar's yaw comes from the body's facing, but the head
+        // tracks where the player is actually looking, so pass the
+        // difference.
+        let body_yaw = transform.rotation.to_euler(EulerRot::YXZ).0;
+        animator.look(wrap_angle(camera.yaw - body_yaw), -camera.pitch);
+    }
+}
+
+/// How fast the smoothed local speed chases the measured one. Must match
+/// `entities::sync_player_entities` on the server.
+const SPEED_SMOOTHING: f32 = 8.0;
+
+/// Shortest signed difference between two angles, in radians.
+fn wrap_angle(a: f32) -> f32 {
+    a.rem_euclid(std::f32::consts::TAU) - std::f32::consts::PI
 }

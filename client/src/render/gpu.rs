@@ -52,7 +52,8 @@ use vulkano_taskgraph::{
     resource_map,
 };
 
-use crate::streaming::{LocalPlayerId, RemotePlayer};
+use crate::entities::{EntityKindComponent, EntityScale, PlayerIdComponent};
+use crate::streaming::LocalPlayerId;
 use crate::{
     mesh::{ChunkVertex, fs, vs},
     player::{FlyCamera, LocalPlayer},
@@ -380,7 +381,6 @@ pub(crate) struct RenderStateShared {
     /// Chunk meshes only. Avatars share one [`avatar`] slice drawn with
     /// per-player model matrices.
     pub allocations: HashMap<Entity, GpuMeshAllocation>,
-    pub avatar: Option<GpuMeshAllocation>,
     pub effects_gpu: Option<super::effects_gpu::EffectGpuState>,
     /// GLTF model pipeline
     pub gltf_pipeline: Option<Arc<GraphicsPipeline>>,
@@ -434,7 +434,6 @@ pub(crate) struct FrameData {
     /// PNGs each frame (an `Arc` clone, and it survives texture hot-reload).
     pub textures: Option<crate::texture::TextureManager>,
     /// One model matrix per remote player. Mesh is local-space in [`avatar`].
-    pub avatar_models: Vec<Mat4>,
     /// Player ID -> model transform, for actions that explicitly request it.
     pub model_transforms: HashMap<u64, Mat4>,
     /// Validated actions received since the preceding rendered frame.
@@ -517,22 +516,8 @@ impl Task for ChunkRenderTask {
                 }
             }
 
-            if let Some(avatar) = shared.avatar {
-                if avatar.index_count > 0 {
-                    for model in &world.avatar_models {
-                        push(cbf, world.view_proj * *model);
-                        unsafe {
-                            cbf.draw_indexed(
-                                avatar.index_count,
-                                1,
-                                avatar.first_index(),
-                                avatar.vertex_offset(),
-                                0,
-                            );
-                        }
-                    }
-                }
-            }
+            // The stone-cube avatar head is gone: players are entities now and draw
+            // through the skinned glTF path.
         }
 
         if let Some(effects) = shared.effects_gpu.as_mut() {
@@ -1067,7 +1052,6 @@ pub(super) fn setup_renderer(
         pipeline: None,
         ui_pipeline: None,
         allocations: HashMap::new(),
-        avatar: None,
         effects_gpu: None,
         gltf_pipeline: None,
         gltf_pipeline_nocull: None,
@@ -1507,7 +1491,10 @@ pub(super) fn render_frame(
     local_player_id: Option<Res<LocalPlayerId>>,
     windows: Query<&Window, With<PrimaryWindow>>,
     camera: Query<(&Transform, &FlyCamera), With<LocalPlayer>>,
-    remotes: Query<(&RemotePlayer, &Transform)>,
+    player_entities: Query<
+        (&Transform, &EntityScale, Option<&PlayerIdComponent>),
+        With<EntityKindComponent>,
+    >,
 ) {
     let Ok(window) = windows.single() else {
         return;
@@ -1557,9 +1544,23 @@ pub(super) fn render_frame(
         .map(|(transform, cam)| cam.view_projection(transform, aspect))
         .unwrap_or(Mat4::IDENTITY);
 
-    let mut model_transforms: HashMap<u64, Mat4> = remotes
+    // `model_transforms` is what mod effects address by player id, so it is
+    // keyed by `PlayerId` and built from player entities rather than from a
+    // separate `RemotePlayer` list.
+    let mut model_transforms: HashMap<u64, Mat4> = player_entities
         .iter()
-        .map(|(player, transform)| (player.0, transform.to_matrix()))
+        .filter_map(|(transform, scale, player_id)| {
+            player_id.map(|id| {
+                (
+                    id.0,
+                    Mat4::from_scale_rotation_translation(
+                        Vec3::splat(scale.0),
+                        transform.rotation,
+                        transform.translation,
+                    ),
+                )
+            })
+        })
         .collect();
     let local_player_id = local_player_id.as_deref().and_then(|id| id.0);
     if let (Some(player_id), Some((transform, camera))) = (local_player_id, camera.iter().next()) {
@@ -1574,15 +1575,6 @@ pub(super) fn render_frame(
         );
         model_transforms.insert(player_id, model);
     }
-    // This is a first-person camera: drawing its own head from a matrix that
-    // encloses the camera exposes the inside of the cube and blocks the view.
-    // Keep the local matrix in `model_transforms` for shader effects, but only
-    // draw remote avatars here.
-    let avatar_models = model_transforms
-        .iter()
-        .filter(|(player_id, _)| Some(**player_id) != local_player_id)
-        .map(|(_, model)| *model)
-        .collect();
     let mod_actions = mod_actions.read().cloned().collect();
 
     // Upload UI instances only when `UiDrawList.generation` changed.
@@ -1618,7 +1610,6 @@ pub(super) fn render_frame(
         linear_sampler_id: vk.linear_sampler_id,
         pixel_sampler_id: vk.pixel_sampler_id,
         textures: textures.map(|textures| (*textures).clone()),
-        avatar_models,
         model_transforms,
         mod_actions,
         ui_buffer_id,

@@ -74,23 +74,11 @@ fn receive_chunk_updates(
                     registry.remove(*coords);
                 }
             }
-            ServerMessage::PlayerJoined(id) => {
-                let exists = remote_players.iter().any(|(_, p)| p.0 == *id);
-                if !exists {
-                    commands.spawn((
-                        RemotePlayer(*id),
-                        bevy_transform::prelude::Transform::from_translation(Vec3::from(SPAWN_POS)),
-                        ServerTarget(Some(Vec3::from(SPAWN_POS))),
-                    ));
-                }
-            }
-            ServerMessage::PlayerLeft(id) => {
-                for (entity, p) in &remote_players {
-                    if p.0 == *id {
-                        commands.entity(entity).despawn();
-                    }
-                }
-            }
+            // Players used to arrive as `PlayerJoined` and be drawn as a
+            // stone-cube head. They are entities now and are handled by
+            // `entities::receive_entity_messages`; despawning them here as
+            // well would leave a stale head floating at the spawn point.
+            ServerMessage::PlayerJoined(_) | ServerMessage::PlayerLeft(_) => {}
             _ => {}
         }
     }

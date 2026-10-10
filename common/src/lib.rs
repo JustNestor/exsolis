@@ -374,6 +374,11 @@ pub enum ServerMessage {
         state: EntityState,
         model: Option<String>,
         scale: f32,
+        /// Set only for `EntityKind::Player`: the session-stable `PlayerId`
+        /// this entity belongs to. Lets the client correlate the avatar
+        /// with `YourPlayerId` and with mod effects that address players by
+        /// id. Appended last so existing variant indices don't shift.
+        player_id: Option<PlayerId>,
     },
     /// Remove an entity. Unknown ids are ignored. ReliableOrdered.
     /// Appended for wire compatibility.

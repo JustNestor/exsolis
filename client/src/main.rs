@@ -36,6 +36,7 @@ mod assets;
 mod block_textures;
 mod chunk;
 mod chunk_registry;
+mod entities;
 mod gltf;
 mod interaction;
 mod keybinds;
@@ -98,6 +99,7 @@ fn main() {
         .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)
+        .add_plugins(crate::entities::EntityClientPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))
         .add_plugins(keybinds::KeybindPlugin)

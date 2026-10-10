@@ -8,7 +8,6 @@
 //! - [`avatars`] — one local-space head, instanced by model matrix
 
 pub mod allocator;
-mod avatars;
 pub(crate) mod effects;
 mod effects_gpu;
 pub mod gpu;
@@ -41,7 +40,6 @@ impl Plugin for RendererPlugin {
                     meshing::queue_chunk_meshing.run_if(resource_exists::<RenderState>),
                     meshing::collect_finished_meshes.run_if(resource_exists::<RenderState>),
                     meshing::upload_ready_chunk_meshes.run_if(resource_exists::<RenderState>),
-                    avatars::ensure_avatar_mesh.run_if(resource_exists::<RenderState>),
                     meshing::cleanup_removed_chunk_meshes.run_if(resource_exists::<RenderState>),
                     crate::gltf::upload_gltf_assets.run_if(resource_exists::<RenderState>),
                     crate::gltf::handle_spawn_model_messages.run_if(resource_exists::<RenderState>),

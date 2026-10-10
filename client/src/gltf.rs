@@ -822,13 +822,22 @@ pub fn upload_gltf_model(
 #[derive(Component, Debug, Clone)]
 pub struct GltfModelInstance {
     pub model_path: String,
+    /// Uniform scale applied to every instance of this model. Set from the
+    /// server's `SpawnEntity` so a mod can spawn a giant duck.
+    pub scale: f32,
 }
 
 impl GltfModelInstance {
     pub fn new(model_path: impl Into<String>) -> Self {
         Self {
             model_path: model_path.into(),
+            scale: 1.0,
         }
+    }
+
+    pub fn with_scale(mut self, scale: f32) -> Self {
+        self.scale = scale;
+        self
     }
 }
 
@@ -1152,7 +1161,11 @@ pub fn sync_gltf_instances(
                 warn!("gltf instance overflow ({MAX_GLTF_INSTANCES}); dropping extras");
                 break;
             }
-            matrices.push(transform.to_matrix());
+            matrices.push(glam::Mat4::from_scale_rotation_translation(
+                glam::Vec3::splat(instance.scale.max(0.0001)),
+                transform.rotation(),
+                transform.translation(),
+            ));
             push_palette(
                 skeleton.as_ref(),
                 animator,
