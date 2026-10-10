@@ -865,14 +865,15 @@ mod tests {
         runtime.tick(&positions(), std::ptr::null());
         PullCtx::uninstall();
 
-        let requests = runtime.outbox().lock().unwrap();
+        let outbox = runtime.outbox();
+        let requests = outbox.lock().unwrap();
         assert_eq!(requests.len(), 1, "the mod queued one request");
         match &requests[0] {
             ScriptRequest::SetBlock { pos, block } => {
                 assert_eq!((pos.x, pos.y, pos.z), (1, 2, 3));
                 assert_eq!(*block as u8, 4);
             }
-            other => panic!("unexpected request: {other:?}"),
+            _ => panic!("expected a SetBlock request"),
         }
         drop(requests);
         unsafe { std::env::remove_var("EXSOLIS_MODS_DIR") };

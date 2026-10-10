@@ -105,10 +105,11 @@ impl Compiled {
     /// Call a TS function by name with integer/pointer arguments, returning
     /// its result as `i64`.
     ///
-    /// Convenience for bindings and the CLI: every argument is passed in an
-    /// integer register slot, so `i32`/`boolean`/pointer parameters are fine
-    /// but `f64` parameters are **not** (they belong in an SSE register). Use
-    /// [`Compiled::get`] with an exact signature for float parameters.
+    /// Convenience for bindings, the CLI and the host bridge: every argument
+    /// is passed in an integer register slot, so `i32`/`boolean`/pointer
+    /// parameters are fine but `f64` parameters are **not** (they belong in an
+    /// SSE register). Use [`Compiled::get`] with an exact signature for float
+    /// parameters.
     ///
     /// # Safety
     /// `name` must exist and accept the given arguments.
@@ -120,16 +121,31 @@ impl Compiled {
         let _guard = crate::runtime::enter(&self.runtime);
         let e = self.entry(name).expect("unknown export");
         assert!(e.params.len() == args.len(), "argument count mismatch");
-        assert!(args.len() <= 4, "call_i64 supports at most 4 arguments");
+        assert!(
+            args.len() <= MAX_ARGS,
+            "call_i64 supports at most {MAX_ARGS} arguments"
+        );
         assert!(
             e.params.iter().all(|t| *t != Ty::F64),
             "call_i64 cannot pass f64 parameters; use `get::<F>()`"
         );
-        let mut buf = [0i64; 4];
+        let mut buf = [0i64; MAX_ARGS];
         buf[..args.len()].copy_from_slice(args);
-        let f: extern "C" fn(i64, i64, i64, i64) -> i64 =
-            unsafe { std::mem::transmute_copy(&e.ptr) };
-        f(buf[0], buf[1], buf[2], buf[3])
+        // Extra argument slots are simply ignored by the callee (System V,
+        // caller-cleaned), which keeps this single trampoline for every arity.
+        let f: extern "C" fn(
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) -> i64 = unsafe { std::mem::transmute_copy(&e.ptr) };
+        f(
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        )
     }
 
     /// # Safety
@@ -156,6 +172,9 @@ impl Drop for Compiled {
 /// jit.compile(&src)?;
 /// let compiled = jit.finish()?;
 /// ```
+/// Maximum arguments [`Compiled::call_i64`] can pass.
+pub const MAX_ARGS: usize = 8;
+
 pub struct JitBuilder {
     src_name: String,
     src: Arc<str>,
