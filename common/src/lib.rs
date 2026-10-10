@@ -269,16 +269,6 @@ pub enum ServerMessage {
         pos: BlockPos,
         kind: BlockType,
     },
-    ShowEntity {
-        entity_id: u64,
-        kind: EntityKind,
-        x: f32,
-        y: f32,
-        z: f32,
-    },
-    EntityDisappear {
-        entity_id: u64,
-    },
     /// Authoritative position of the receiving player themself. Sent on the
     /// unreliable channel whenever it changes (and repeated a few ticks
     /// after it stops so a single dropped packet can't leave the client
@@ -348,22 +338,6 @@ pub enum ServerMessage {
     /// Authenticated identity of the receiving client, for correlating local
     /// model transforms with server-authored actions. Appended for wire compatibility.
     YourPlayerId(PlayerId),
-    /// Spawn a GLTF model instance on the client. `path` is a server-manifest
-    /// asset path (e.g. `models/duck.glb`). TEMPORARY test API.
-    /// Appended for wire compatibility.
-    SpawnModel {
-        entity_id: u64,
-        path: String,
-        x: f32,
-        y: f32,
-        z: f32,
-        scale: f32,
-    },
-    /// Despawn a previously spawned model instance. Unknown ids are ignored.
-    /// TEMPORARY test API. Appended for wire compatibility.
-    DespawnModel {
-        entity_id: u64,
-    },
     /// Bring an entity into existence on the client. `model` is a catalog
     /// asset path (`models/girl.glb`) or `None` for entities that render
     /// nothing on their own (a block entity renders its block instead).

@@ -569,6 +569,21 @@ fn scan_catalog(
         match crate::gltf_pack::normalize_glb_textures(&bytes) {
             Ok(normalized_bytes) if normalized_bytes != bytes => {
                 let target = disk_path.with_extension("normalized.glb");
+                // The catalog is rebuilt whenever any asset changes, and
+                // decoding + re-encoding a 2 MB texture every time is pure
+                // waste. Reuse the artifact if it is newer than the source.
+                let fresh = std::fs::metadata(&target)
+                    .ok()
+                    .zip(std::fs::metadata(disk_path).ok())
+                    .map(|(t, s)| match (t.modified(), s.modified()) {
+                        (Ok(t), Ok(s)) => t >= s,
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if fresh {
+                    normalized.insert(logical_path.clone(), target);
+                    continue;
+                }
                 if let Err(e) = std::fs::write(&target, &normalized_bytes) {
                     warn!("texture normalization failed for {logical_path}: {e}");
                     continue;

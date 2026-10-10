@@ -878,11 +878,6 @@ pub struct UploadedGltf {
     pub material_base: u32,
 }
 
-/// Server-assigned id for a spawned model (see `SpawnModel`/`DespawnModel`).
-/// TEMPORARY test API.
-#[derive(Component, Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ModelEntityId(pub u64);
-
 /// All GPU-uploaded GLTF models, keyed by asset path.
 #[derive(Resource, Default)]
 pub struct GltfModels {
@@ -1506,51 +1501,6 @@ fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32) -> f32 {
         return IN_PLACE_RATE;
     }
     (speed / natural).clamp(0.25, 4.0)
-}
-
-/// TEMPORARY test API: spawn/despawn model entities from server messages.
-pub fn handle_spawn_model_messages(
-    mut incoming: MessageReader<IncomingPacket>,
-    mut commands: Commands,
-    existing: Query<(Entity, &ModelEntityId)>,
-) {
-    for packet in incoming.read() {
-        match &packet.0 {
-            ServerMessage::SpawnModel {
-                entity_id,
-                path,
-                x,
-                y,
-                z,
-                scale,
-            } => {
-                if !path.ends_with(".glb") || path.len() > exsolis_common::MODEL_PATH_MAX_LEN {
-                    warn!("spawn_model: rejected path {path:?}");
-                    continue;
-                }
-                // Replace semantics: one live entity per server id.
-                for (entity, id) in existing.iter() {
-                    if id.0 == *entity_id {
-                        commands.entity(entity).despawn();
-                    }
-                }
-                commands.spawn((
-                    ModelEntityId(*entity_id),
-                    GltfModelInstance::new(path.clone()),
-                    Transform::from_xyz(*x, *y, *z).with_scale(glam::Vec3::splat(*scale)),
-                    GlobalTransform::default(),
-                ));
-            }
-            ServerMessage::DespawnModel { entity_id } => {
-                for (entity, id) in existing.iter() {
-                    if id.0 == *entity_id {
-                        commands.entity(entity).despawn();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 #[cfg(test)]
