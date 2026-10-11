@@ -38,6 +38,7 @@ mod chunk;
 mod chunk_registry;
 mod entities;
 mod gltf;
+mod gltf_utils;
 mod interaction;
 mod keybinds;
 mod mesh;

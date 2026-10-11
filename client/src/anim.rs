@@ -118,16 +118,49 @@ pub enum AnimPath {
     Scale,
 }
 
+/// How a channel's keys are interpolated between samples.
+///
+/// glTF defines four interpolation modes. Every one of them is now decoded;
+/// before, anything that was not `Linear` was dropped with a warning, which
+/// silently froze the joints of any Blender or Blockbench "smooth" export
+/// (CUBICSPLINE) or any `STEP` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Interpolation {
+    #[default]
+    Linear,
+    Step,
+    CubicSpline,
+}
+
+impl Interpolation {
+    /// Map a glTF sampler's interpolation onto ours.
+    pub fn from_gltf(m: gltf::animation::Interpolation) -> Self {
+        match m {
+            gltf::animation::Interpolation::Linear => Interpolation::Linear,
+            gltf::animation::Interpolation::Step => Interpolation::Step,
+            gltf::animation::Interpolation::CubicSpline => Interpolation::CubicSpline,
+        }
+    }
+}
+
 /// One animated property of one joint.
 #[derive(Debug, Clone)]
 pub struct AnimChannel {
     /// Index into [`Skeleton::joints`].
     pub joint: usize,
     pub path: AnimPath,
+    /// How [`Self::values`] are interpolated.
+    pub interpolation: Interpolation,
     /// Key times in seconds, ascending.
     pub times: Vec<f32>,
-    /// Packed key values: 3 floats per key for translation/scale, 4 for
-    /// rotation. Kept flat so the hot sampling path is a single slice read.
+    /// Packed key values. For `Linear`/`Step`: 3 floats per key for
+    /// translation/scale, 4 for rotation — kept flat so the hot sampling path
+    /// is a single slice read.
+    ///
+    /// For `CubicSpline`: **three** entries per key, in the order
+    /// `in_tangent, value, out_tangent`, so the buffer is 3x longer than the
+    /// key count. That is the glTF `CUBICSPLINE` layout exactly, which is why
+    /// it can be consumed in place with no re-pack.
     pub values: Vec<f32>,
 }
 
@@ -139,8 +172,53 @@ impl AnimChannel {
         }
     }
 
-    /// Sample at `time`, linearly interpolating between the surrounding keys.
-    /// Times outside the clip clamp to the end keys.
+    /// How many value entries a single key occupies in [`Self::values`].
+    fn stride(&self) -> usize {
+        match self.interpolation {
+            Interpolation::CubicSpline => 3,
+            _ => 1,
+        }
+    }
+
+    /// Byte offset of key `i`'s *value* (the middle third of a CUBICSPLINE
+    /// triple; the only entry for Linear/Step).
+    #[inline]
+    fn value_at(&self, i: usize) -> &[f32] {
+        let comps = self.components();
+        let base = i * self.stride() * comps;
+        let offset = if self.interpolation == Interpolation::CubicSpline {
+            comps // skip the in-tangent
+        } else {
+            0
+        };
+        &self.values[base + offset..base + offset + comps]
+    }
+
+    /// Hermite spline interpolation for one component.
+    ///
+    /// This is the formula from the glTF spec (§3.7.3.2) and is identical to
+    /// bevy's `cubic_spline_interpolation` in
+    /// `bevy_animation/src/gltf_curves.rs`, so values match bit-for-bit.
+    #[inline]
+    fn cubic_component(
+        v0: f32,
+        out_tan0: f32,
+        in_tan1: f32,
+        v1: f32,
+        s: f32,
+        dt: f32,
+    ) -> f32 {
+        let c0 = 2.0 * s * s * s - 3.0 * s * s + 1.0;
+        let c1 = dt * (s * s * s - 2.0 * s * s + s);
+        let c2 = -2.0 * s * s * s + 3.0 * s * s;
+        let c3 = dt * (s * s * s - s * s);
+        v0 * c0 + out_tan0 * c1 + v1 * c2 + in_tan1 * c3
+    }
+
+    /// Sample at `time`, writing the joint's local TRS into `out`.
+    ///
+    /// Times outside the clip clamp to the end keys. Handles all three
+    /// glTF interpolation modes (see [`Interpolation`]).
     fn sample_into(&self, time: f32, out: &mut Transform) {
         let comps = self.components();
         let last = self.times.len().saturating_sub(1);
@@ -161,10 +239,79 @@ impl AnimChannel {
         } else {
             0.0
         };
-        let (a, b) = (
-            &self.values[lo * comps..lo * comps + comps],
-            &self.values[hi * comps..hi * comps + comps],
-        );
+
+        match self.interpolation {
+            Interpolation::Step => {
+                // Step holds the earlier key until the next one is reached.
+                let key = if time >= t1 { hi } else { lo };
+                self.write_value(self.value_at(key), out);
+            }
+            Interpolation::Linear => {
+                let a = self.value_at(lo);
+                let b = self.value_at(hi);
+                self.write_lerp(a, b, f, out);
+            }
+            Interpolation::CubicSpline => {
+                // Each key holds [in_tangent, value, out_tangent]
+                let u_base = lo * 3 * comps;
+                let v_base = hi * 3 * comps;
+                let in_tan_u = &self.values[u_base..u_base + comps];
+                let val_u = &self.values[u_base + comps..u_base + 2 * comps];
+                let out_tan_u = &self.values[u_base + 2 * comps..u_base + 3 * comps];
+                let in_tan_v = &self.values[v_base..v_base + comps];
+                let val_v = &self.values[v_base + comps..v_base + 2 * comps];
+
+                match self.path {
+                    AnimPath::Translation => {
+                        let mut t = [0.0f32; 3];
+                        for i in 0..3 {
+                            t[i] = Self::cubic_component(
+                                val_u[i], out_tan_u[i], in_tan_v[i], val_v[i], f, span,
+                            );
+                        }
+                        out.translation = Vec3::from_array(t);
+                    }
+                    AnimPath::Scale => {
+                        let mut s = [0.0f32; 3];
+                        for i in 0..3 {
+                            s[i] = Self::cubic_component(
+                                val_u[i], out_tan_u[i], in_tan_v[i], val_v[i], f, span,
+                            );
+                        }
+                        out.scale = Vec3::from_array(s);
+                    }
+                    AnimPath::Rotation => {
+                        let mut q = [0.0f32; 4];
+                        for i in 0..4 {
+                            q[i] = Self::cubic_component(
+                                val_u[i], out_tan_u[i], in_tan_v[i], val_v[i], f, span,
+                            );
+                        }
+                        // Cubic interpolation does not preserve unit length,
+                        // so the quaternion must be renormalised exactly like
+                        // bevy's `CubicRotationCurve` does.
+                        out.rotation = Quat::from_xyzw(q[0], q[1], q[2], q[3]).normalize();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Write a raw value slice into `out` (STEP path).
+    #[inline]
+    fn write_value(&self, a: &[f32], out: &mut Transform) {
+        match self.path {
+            AnimPath::Translation => out.translation = Vec3::from_array([a[0], a[1], a[2]]),
+            AnimPath::Scale => out.scale = Vec3::from_array([a[0], a[1], a[2]]),
+            AnimPath::Rotation => {
+                out.rotation = Quat::from_xyzw(a[0], a[1], a[2], a[3]).normalize()
+            }
+        }
+    }
+
+    /// Lerp two raw value slices into `out` (LINEAR path).
+    #[inline]
+    fn write_lerp(&self, a: &[f32], b: &[f32], f: f32, out: &mut Transform) {
         match self.path {
             AnimPath::Translation => {
                 out.translation = Vec3::from_array([a[0], a[1], a[2]])
@@ -851,6 +998,160 @@ mod tests {
         }
     }
 
+    /// Build a translation channel with an explicit interpolation mode.
+    fn translation_channel(
+        times: Vec<f32>,
+        values: Vec<f32>,
+        interpolation: Interpolation,
+    ) -> AnimChannel {
+        AnimChannel {
+            joint: 0,
+            path: AnimPath::Translation,
+            interpolation,
+            times,
+            values,
+        }
+    }
+
+    #[test]
+    fn linear_translation_interpolates_the_midpoint() {
+        let channel = translation_channel(
+            vec![0.0, 1.0],
+            vec![0.0, 0.0, 0.0, 10.0, 0.0, 0.0],
+            Interpolation::Linear,
+        );
+        let mut out = Transform::default();
+        channel.sample_into(0.5, &mut out);
+        assert_eq!(out.translation, Vec3::new(5.0, 0.0, 0.0));
+    }
+
+    #[test]
+    fn step_translation_holds_until_the_next_key() {
+        let channel = translation_channel(
+            vec![0.0, 1.0, 2.0],
+            vec![0.0, 0.0, 0.0, 10.0, 0.0, 0.0, 10.0, 10.0, 0.0],
+            Interpolation::Step,
+        );
+        let mut out = Transform::default();
+
+        channel.sample_into(0.0, &mut out);
+        assert_eq!(out.translation, Vec3::ZERO, "t=0 takes key 0");
+        channel.sample_into(0.5, &mut out);
+        assert_eq!(out.translation, Vec3::ZERO, "t=0.5 still holds key 0");
+        channel.sample_into(1.0, &mut out);
+        assert_eq!(out.translation, Vec3::new(10.0, 0.0, 0.0), "t=1 switches");
+        channel.sample_into(1.5, &mut out);
+        assert_eq!(out.translation, Vec3::new(10.0, 0.0, 0.0));
+        channel.sample_into(2.0, &mut out);
+        assert_eq!(out.translation, Vec3::new(10.0, 10.0, 0.0));
+        // Past the last key it clamps rather than dropping to zero.
+        channel.sample_into(3.0, &mut out);
+        assert_eq!(out.translation, Vec3::new(10.0, 10.0, 0.0));
+    }
+
+    #[test]
+    fn cubic_spline_hits_its_key_values_exactly() {
+        // Two keys, each [in_tangent, value, out_tangent].
+        // Values 0 -> 10 with zero in/out tangents at both ends and a mild
+        // out-tangent on key 0 so the curve is not a straight line.
+        let values = vec![
+            // key 0
+            0.0, 0.0, 0.0, // in_tangent (unused by the first segment)
+            0.0, 0.0, 0.0, // value
+            10.0, 0.0, 0.0, // out_tangent
+            // key 1
+            10.0, 0.0, 0.0, // in_tangent
+            10.0, 0.0, 0.0, // value
+            0.0, 0.0, 0.0, // out_tangent (unused)
+        ];
+        let channel = translation_channel(vec![0.0, 1.0], values, Interpolation::CubicSpline);
+        let mut out = Transform::default();
+
+        channel.sample_into(0.0, &mut out);
+        assert_eq!(out.translation, Vec3::ZERO, "curve starts at key 0's value");
+        channel.sample_into(1.0, &mut out);
+        assert_eq!(
+            out.translation,
+            Vec3::new(10.0, 0.0, 0.0),
+            "curve ends at key 1's value"
+        );
+    }
+
+    #[test]
+    fn cubic_spline_stays_inside_the_tangent_bounds() {
+        // A monotone ramp whose out/in tangents are flat must not overshoot.
+        let values = vec![
+            0.0, 0.0, 0.0, // key0 in_tangent
+            0.0, 0.0, 0.0, // key0 value
+            0.0, 0.0, 0.0, // key0 out_tangent (flat: no overshoot)
+            0.0, 0.0, 0.0, // key1 in_tangent
+            10.0, 0.0, 0.0, // key1 value
+            0.0, 0.0, 0.0, // key1 out_tangent
+        ];
+        let channel = translation_channel(vec![0.0, 1.0], values, Interpolation::CubicSpline);
+        let mut out = Transform::default();
+        for step in 0..=20 {
+            let t = step as f32 / 20.0;
+            channel.sample_into(t, &mut out);
+            assert!(
+                out.translation.x >= -1e-5 && out.translation.x <= 10.0 + 1e-5,
+                "t={t}: x={} escaped [0,10]",
+                out.translation.x
+            );
+        }
+    }
+
+    #[test]
+    fn cubic_spline_rotation_is_renormalised() {
+        // Cubic interpolation destroys unit length; the sampler must fix it.
+        let values = vec![
+            0.0, 0.0, 0.0, 0.0, // key0 in_tangent
+            0.0, 0.0, 0.0, 1.0, // key0 value: identity
+            0.0, 0.0, 0.0, 0.0, // key0 out_tangent
+            0.0, 0.0, 0.0, 0.0, // key1 in_tangent
+            0.0, 0.7, 0.0, 0.7, // key1 value: ~180deg around Y
+            0.0, 0.0, 0.0, 0.0, // key1 out_tangent
+        ];
+        let channel = AnimChannel {
+            joint: 0,
+            path: AnimPath::Rotation,
+            interpolation: Interpolation::CubicSpline,
+            times: vec![0.0, 1.0],
+            values,
+        };
+        let mut out = Transform::default();
+        for step in 0..=20 {
+            let t = step as f32 / 20.0;
+            channel.sample_into(t, &mut out);
+            assert!(
+                (out.rotation.length() - 1.0).abs() < 1e-4,
+                "t={t}: |q|={} is not unit length",
+                out.rotation.length()
+            );
+        }
+    }
+
+    #[test]
+    fn step_rotation_snaps_between_keys() {
+        let channel = AnimChannel {
+            joint: 0,
+            path: AnimPath::Rotation,
+            interpolation: Interpolation::Step,
+            times: vec![0.0, 1.0],
+            values: vec![0.0, 0.0, 0.0, 1.0, 0.0, 0.7, 0.0, 0.7],
+        };
+        let mut out = Transform::default();
+
+        channel.sample_into(0.5, &mut out);
+        assert_eq!(out.rotation, Quat::IDENTITY, "first half holds identity");
+        channel.sample_into(1.0, &mut out);
+        let expected = Quat::from_xyzw(0.0, 0.7, 0.0, 0.7).normalize();
+        assert!(
+            out.rotation.dot(expected).abs() > 0.999,
+            "second half should be the second key"
+        );
+    }
+
     #[test]
     fn a_single_key_clip_is_a_held_pose() {
         assert_eq!(
@@ -991,6 +1292,7 @@ models/test.glb
         AnimChannel {
             joint: 0,
             path,
+            interpolation: Interpolation::Linear,
             times: times.to_vec(),
             values: values.to_vec(),
         }

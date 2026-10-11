@@ -15,6 +15,7 @@ use vulkano::pipeline::graphics::vertex_input::Vertex;
 use vulkano_taskgraph::descriptor_set::SampledImageId;
 
 use crate::anim::{Animator, ClipRole, Skeleton, Transform as JointTransform};
+use crate::gltf_utils::vertex_attributes::convert_attribute;
 use crate::{
     assets::{AssetCacheChanged, AssetHandlerRegistry, AssetLoader, LoadedAsset},
     mesh::ChunkVertex,
@@ -435,10 +436,10 @@ fn load_gltf_material(material: &gltf::Material) -> Result<GltfMaterial, String>
         .emissive_texture()
         .map(|t| t.texture().source().index());
 
-    let alpha_mode = match material.alpha_mode() {
-        gltf::material::AlphaMode::Opaque => AlphaMode::Opaque,
-        gltf::material::AlphaMode::Mask => AlphaMode::Mask,
-        gltf::material::AlphaMode::Blend => AlphaMode::Blend,
+    let alpha_mode = match crate::gltf_utils::gltf_ext::alpha_mode(material) {
+        crate::gltf_utils::gltf_ext::AlphaMode::Opaque => AlphaMode::Opaque,
+        crate::gltf_utils::gltf_ext::AlphaMode::Mask(_) => AlphaMode::Mask,
+        crate::gltf_utils::gltf_ext::AlphaMode::Blend => AlphaMode::Blend,
     };
 
     Ok(GltfMaterial {
@@ -458,42 +459,272 @@ fn load_gltf_material(material: &gltf::Material) -> Result<GltfMaterial, String>
     })
 }
 
+/// Largest vertex count a `u16` index can address.
+const U16_INDEX_SPAN: usize = 1 << 16;
+
+/// Convert a glTF primitive's index stream to a **triangle list**.
+///
+/// glTF has five primitive `Mode`s and only one of them, `TRIANGLES` (4), is
+/// what a Vulkan `vkCmdDrawIndexed` takes. Everything else has to be
+/// triangulated on the CPU first.
+///
+/// `models/girl.glb` — the shipped avatar — stores **all 795 of its
+/// primitives as `TRIANGLE_STRIP` (mode 5)**, and Blockbench encodes its
+/// strips with duplicate vertices rather than primitive-restart indices, i.e.
+/// a stream like `0,1,2,3,3,4,4,5,6,7,7,8,8,9,...`. Reading that as a
+/// triangle list yields triangles such as `[3,3,4]` (degenerate) and
+/// `[4,5,6]` (spanning across opposite faces of the cube). With 24 verts per
+/// box, a strip is 12 real triangles where the list reading gives 11 wrong
+/// ones; across 795 boxes that is the "exploded mesh" symptom — long thin
+/// needles criss-crossing the figure.
+///
+/// Winding alternates along a strip (`[a,b,c]` then `[b,a,c]`), and the parity
+/// must be counted over the **original** index positions so that the skipped
+/// degenerate windows still consume a parity slot. Using `windows(3)` over
+/// the raw stream does exactly that.
+pub(crate) fn to_triangle_list(
+    mode: gltf::mesh::Mode,
+    indices: Vec<u32>,
+) -> Result<Vec<u32>, String> {
+    let mut out: Vec<u32> = Vec::with_capacity(indices.len() * 3);
+
+    match mode {
+        gltf::mesh::Mode::Triangles => {
+            // Already a list. Copying would be wasteful, and the caller
+            // owns the buffer, so hand it straight through.
+            return Ok(indices);
+        }
+
+        gltf::mesh::Mode::TriangleStrip => {
+            for (i, w) in indices.windows(3).enumerate() {
+                let (a, b, c) = (w[0], w[1], w[2]);
+                let (a, b) = if i % 2 == 0 { (a, b) } else { (b, a) };
+                push_triangle(&mut out, a, b, c);
+            }
+        }
+
+        gltf::mesh::Mode::TriangleFan => {
+            // A fan is `v0` plus every consecutive pair after it.
+            let (first, rest) = indices
+                .split_first()
+                .ok_or("TRIANGLE_FAN primitive with no indices")?;
+            let first = *first;
+            for w in rest.windows(2) {
+                push_triangle(&mut out, first, w[0], w[1]);
+            }
+        }
+
+        other => {
+            return Err(format!(
+                "unsupported primitive mode {other:?}: only triangle topologies are renderable"
+            ));
+        }
+    }
+
+    if out.is_empty() {
+        return Err(format!(
+            "primitive with mode {:?} produced no triangles from {} indices",
+            mode,
+            indices.len()
+        ));
+    }
+
+    Ok(out)
+}
+
+/// Emit `a,b,c` unless it is degenerate.
+///
+/// Blockbench's strip restart trick leans on zero-area triangles, so they have
+/// to be dropped here or the GPU draws invisible slivers.
+#[inline]
+fn push_triangle(out: &mut Vec<u32>, a: u32, b: u32, c: u32) {
+    if a != b && b != c && a != c {
+        out.extend_from_slice(&[a, b, c]);
+    }
+}
+
+/// Undo `u16` index wrap-around on a primitive with more than 65 536 vertices.
+///
+/// Blockbench's glTF exporter writes a non-indexed mesh as `0, 1, 2, ... n-1`
+/// into a `u16` accessor. Past vertex 65 535 the values silently wrap back to
+/// 0, so the tail of the mesh re-draws the first vertices instead, and because
+/// 65 536 is not a multiple of 3 every triangle after the wrap is shifted by
+/// two vertices and stitches corners of neighbouring cubes together.
+///
+/// A wrapped stream climbs steadily and falls by about 65 535 at each wrap, so
+/// the wraps are recovered by adding 65 536 at every large backwards jump. The
+/// result is only accepted when it is self-consistent: no index reaches
+/// `vertex_count`, and the number of wraps is exactly what `vertex_count`
+/// implies. A mesh that merely uses a scattered subset of its first 65 536
+/// vertices fails that test and is left untouched.
+///
+/// Returns `true` when `indices` were rewritten.
+pub(crate) fn repair_wrapped_u16_indices(indices: &mut [u32], vertex_count: usize) -> bool {
+    if vertex_count <= U16_INDEX_SPAN || indices.is_empty() {
+        return false;
+    }
+    let expected_wraps = (vertex_count - 1) / U16_INDEX_SPAN;
+    let mut repaired = Vec::with_capacity(indices.len());
+    let mut wraps = 0usize;
+    let mut prev = indices[0];
+    for &raw in indices.iter() {
+        if prev.saturating_sub(raw) > (U16_INDEX_SPAN / 2) as u32 {
+            wraps += 1;
+        }
+        prev = raw;
+        let index = raw as usize + wraps * U16_INDEX_SPAN;
+        if index >= vertex_count {
+            return false;
+        }
+        repaired.push(index as u32);
+    }
+    if wraps != expected_wraps {
+        return false;
+    }
+    indices.copy_from_slice(&repaired);
+    true
+}
+
 /// Load a mesh primitive from GLTF.
+///
+/// Attribute reading goes through
+/// [`crate::gltf_utils::vertex_attributes::convert_attribute`], the production
+/// port from `bevy_gltf`, which materialises *every* glTF accessor format
+/// (float / u32 / i16 / u16 / i8 / u8, normalised or not, scalar / vec2 /
+/// vec3 / vec4) instead of only the f32 triplets the old hand-rolled reader
+/// assumed. A primitive whose `POSITION` is stored as normalised `i16x3` (a
+/// compressed export) used to read as garbage geometry; now it is decoded as
+/// the spec prescribes.
+///
+/// Flat `Vec<T>` views of the converted attributes are then zipped into
+/// [`GltfVertex`]s, exactly as before — the shape of the engine-side struct is
+/// unchanged, only the decode path is.
 pub(crate) fn load_gltf_primitive(
     primitive: &gltf::Primitive,
     buffers: &[gltf::buffer::Data],
 ) -> Result<GltfPrimitive, String> {
-    let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+    use crate::gltf_utils::vertex_attributes::VertexAttributeValues as Values;
 
-    // Read positions (required)
-    let positions: Vec<[f32; 3]> = reader
-        .read_positions()
-        .ok_or("Primitive missing positions")?
+    // Buffer data as plain byte slices — the converter's accessor shape.
+    let raw: Vec<Vec<u8>> = buffers
+        .iter()
+        .map(|b| b.0.clone())
         .collect();
 
-    // Read normals (optional, default to up)
-    let normals: Vec<[f32; 3]> = reader
-        .read_normals()
-        .map(|n| n.collect())
+    // Convert each attribute through the production decoder. Unknown or
+    // unsupported variants fall back to the engine defaults below, matching
+    // the previous behaviour for optional attributes (POSITION is required
+    // and errors out, also as before).
+    let custom = Default::default();
+
+    let positions: Vec<[f32; 3]> = match primitive.get(&gltf::Semantic::Positions) {
+        None => Err("Primitive missing positions".to_string()),
+        Some(accessor) => {
+            // NOTE: `convert_coordinates` is deliberately false. The rig
+            // composes node world matrices out of the *raw* glTF transforms
+            // (`Rig::build` -> `compute_world`), so baking vertices in glTF
+            // space is what lines up with `palette[j] = posed_world *
+            // inverse(bind_world)`. The +Z-forward -> -Z-forward flip happens
+            // once, at the instance level (`entities::MODEL_YAW_OFFSET`),
+            // not inside vertex data.
+            match convert_attribute(
+                gltf::Semantic::Positions,
+                accessor,
+                &raw,
+                &custom,
+                false,
+            ) {
+                Err(e) => Err(format!("POSITION conversion failed: {e}")),
+                Ok((_, Values::Float32x3(v))) => Ok(v),
+                Ok((_, other)) => Err(format!(
+                    "POSITION decoded as {:?}, expected Float32x3",
+                    std::mem::discriminant(&other)
+                )),
+            }
+        }
+    }?;
+
+    let normals: Vec<[f32; 3]> = primitive
+        .get(&gltf::Semantic::Normals)
+        .and_then(|accessor| {
+            convert_attribute(gltf::Semantic::Normals, accessor, &raw, &custom, false)
+                .map(|(_, v)| v)
+                .ok()
+        })
+        .and_then(|v| match v {
+            Values::Float32x3(v) => Some(v),
+            _ => None,
+        })
         .unwrap_or_else(|| vec![[0.0, 1.0, 0.0]; positions.len()]);
 
-    // Read UVs (optional, default to 0,0)
-    let uvs: Vec<[f32; 2]> = reader
-        .read_tex_coords(0)
-        .map(|u| u.into_f32().collect())
+    let uvs: Vec<[f32; 2]> = primitive
+        .get(&gltf::Semantic::TexCoords(0))
+        .and_then(|accessor| {
+            convert_attribute(gltf::Semantic::TexCoords(0), accessor, &raw, &custom, false)
+                .map(|(_, v)| v)
+                .ok()
+        })
+        .and_then(|v| match v {
+            Values::Float32x2(v) => Some(v),
+            _ => None,
+        })
         .unwrap_or_else(|| vec![[0.0, 0.0]; positions.len()]);
 
-    // Read colors (optional, default to white)
-    let colors: Vec<[f32; 4]> = reader
-        .read_colors(0)
-        .map(|c| c.into_rgba_f32().collect())
+    let colors: Vec<[f32; 4]> = primitive
+        .get(&gltf::Semantic::Colors(0))
+        .and_then(|accessor| {
+            convert_attribute(gltf::Semantic::Colors(0), accessor, &raw, &custom, false)
+                .map(|(_, v)| v)
+                .ok()
+        })
+        .and_then(|v| match v {
+            Values::Float32x4(v) => Some(v),
+            _ => None,
+        })
         .unwrap_or_else(|| vec![[1.0, 1.0, 1.0, 1.0]; positions.len()]);
 
-    // Read indices (optional)
-    let indices: Vec<u32> = reader
-        .read_indices()
-        .map(|i| i.into_u32().collect())
+    let mut indices: Vec<u32> = primitive
+        .indices()
+        .map(|accessor| {
+            let reader = primitive.reader(|buffer| Some(&buffers[buffer.index()]));
+            reader
+                .read_indices()
+                .map(|i| i.into_u32().collect())
+                .unwrap_or_default()
+        })
         .unwrap_or_else(|| (0..positions.len() as u32).collect());
+
+    // glTF primitive mode -> triangle list. MUST happen before the u16 repair
+    // below: topology has to be resolved before index *values* are analysed,
+    // and an uncorrected `TRIANGLE_STRIP` read as a list is exactly the
+    // exploded-mesh bug (see `to_triangle_list`).
+    let mode = primitive.mode();
+    let index_mode = primitive
+        .indices()
+        .map(|a| Some(a.data_type()))
+        .unwrap_or(None);
+    if mode != gltf::mesh::Mode::Triangles {
+        let before = indices.len();
+        indices = to_triangle_list(mode, indices)?;
+        debug!(
+            "gltf primitive mode {:?} converted to a triangle list: {} indices -> {} indices",
+            mode,
+            before,
+            indices.len()
+        );
+    }
+
+    // Blockbench writes meshes with more than 65 536 vertices into a `u16`
+    // index accessor, so everything past vertex 65 535 wraps back to 0. Left
+    // alone, the tail of the mesh is missing and every triangle after the
+    // wrap stitches together corners of unrelated cubes (needles).
+    let u16_indexed = index_mode == Some(gltf::accessor::DataType::U16);
+    if u16_indexed && repair_wrapped_u16_indices(&mut indices, positions.len()) {
+        debug!(
+            "gltf primitive has {} vertices but u16 indices (exporter wrapped them at 65536); repaired",
+            positions.len()
+        );
+    }
 
     // Combine into vertices
     let mut vertices = Vec::with_capacity(positions.len());
@@ -539,68 +770,29 @@ pub fn register_gltf_loaders(registry: &mut crate::assets::AssetHandlerRegistry)
 }
 
 /// Compute tangents for normal mapping (Mikktspace algorithm).
+///
+/// Delegates to [`crate::gltf_utils::mikktspace::compute_tangents`], the
+/// production port of the mikktspace algorithm, which fixes three defects the
+/// hand-rolled version had:
+///
+/// 1. `tan2` was allocated but never accumulated, so handedness was always
+///    `+1`. A UV-mirrored atlas (Blockbench / the dragon) therefore produced a
+///    flipped bitangent and normal maps lit from the wrong side.
+/// 2. No area/angle weighting, so tangents visibly rotate across large
+///    triangles.
+/// 3. `r = 1.0 / (delta_uv1.x*delta_uv2.y - delta_uv1.y*delta_uv2.x)` had no
+///    degenerate-triangle guard, so a zero-area-UV triangle produced
+///    `inf`/`NaN` tangents that poisoned the TBN for the whole primitive.
+///
+/// See `gltf_utils::tests::mikktspace_test` for the regression coverage.
+#[inline]
 fn compute_tangents(
     positions: &[[f32; 3]],
     normals: &[[f32; 3]],
     uvs: &[[f32; 2]],
     indices: &[u32],
 ) -> Vec<[f32; 4]> {
-    let vertex_count = positions.len();
-    let mut tan1 = vec![[0.0f32; 3]; vertex_count];
-    let tan2 = vec![[0.0f32; 3]; vertex_count];
-
-    for chunk in indices.chunks(3) {
-        let i0 = chunk[0] as usize;
-        let i1 = chunk[1] as usize;
-        let i2 = chunk[2] as usize;
-
-        let v0 = glam::Vec3::from(positions[i0]);
-        let v1 = glam::Vec3::from(positions[i1]);
-        let v2 = glam::Vec3::from(positions[i2]);
-
-        let uv0 = glam::Vec2::from(uvs[i0]);
-        let uv1 = glam::Vec2::from(uvs[i1]);
-        let uv2 = glam::Vec2::from(uvs[i2]);
-
-        let delta_pos1 = v1 - v0;
-        let delta_pos2 = v2 - v0;
-        let delta_uv1 = uv1 - uv0;
-        let delta_uv2 = uv2 - uv0;
-
-        let r = 1.0 / (delta_uv1.x * delta_uv2.y - delta_uv1.y * delta_uv2.x);
-        let tangent = (delta_pos1 * delta_uv2.y - delta_pos2 * delta_uv1.y) * r;
-
-        tan1[i0][0] += tangent.x;
-        tan1[i0][1] += tangent.y;
-        tan1[i0][2] += tangent.z;
-        tan1[i1][0] += tangent.x;
-        tan1[i1][1] += tangent.y;
-        tan1[i1][2] += tangent.z;
-        tan1[i2][0] += tangent.x;
-        tan1[i2][1] += tangent.y;
-        tan1[i2][2] += tangent.z;
-    }
-
-    let mut tangents = Vec::with_capacity(vertex_count);
-    for i in 0..vertex_count {
-        let n = glam::Vec3::from(normals[i]);
-        let mut t = glam::Vec3::from(tan1[i]);
-
-        // Gram-Schmidt orthogonalize
-        t = (t - n * n.dot(t)).normalize_or_zero();
-
-        // Calculate handedness
-        let tan2_vec = glam::Vec3::from(tan2[i]);
-        let handedness = if n.cross(t).dot(tan2_vec) < 0.0 {
-            -1.0
-        } else {
-            1.0
-        };
-
-        tangents.push([t.x, t.y, t.z, handedness]);
-    }
-
-    tangents
+    crate::gltf_utils::mikktspace::compute_tangents(positions, normals, uvs, indices)
 }
 
 /// Compute bounding sphere for a set of positions.
@@ -1445,8 +1637,8 @@ const PALETTE_STRIDE: usize = 256;
 /// Where the first-person arms sit relative to the eye.
 ///
 /// The arms' vertices are in model space at shoulder height. The shoulder
-/// pivot (in model space) is accounted for in the translation component so
-/// the geometry stays in true model space and the bone palette is left
+/// pivot (in model space) is baked into the instance matrix as `T(-pivot)`
+/// so the geometry stays in true model space and the bone palette is left
 /// exactly as the body's — see [`crate::anim::rig::arm_shoulder`] for why
 /// doing it any other way explodes the mesh.
 fn viewmodel_matrix(
@@ -1472,16 +1664,14 @@ fn viewmodel_matrix(
     // about the eye.
     let local_pivot = rotation * glam::Vec3::new(0.0, 0.0, 0.25);
     let swing_rotation = glam::Quat::from_rotation_x(swing);
-    // Translate so the shoulder pivot ends up at `position` (eye + offset).
-    // The arms' vertices are in model space with shoulders at `pivot`.
-    // We want: model_matrix * pivot = position  =>  model_matrix = T(position - pivot) * R * S.
-    // The swing rotation is around the shoulder, so the pivot compensation
-    // is `swing_rotation * pivot` (same as the original working code).
+    // Order matters: translate the model space first (so the swing about the
+    // camera-local pivot acts on a shoulder-centred mesh), then rotate, then
+    // place. `from_scale_rotation_translation` composes as T * R * S.
     glam::Mat4::from_scale_rotation_translation(
         glam::Vec3::splat(scale.max(0.0001)),
         rotation * swing_rotation,
-        position - pivot + swing_rotation * pivot,
-    )
+        position - local_pivot + swing_rotation * local_pivot,
+    ) * glam::Mat4::from_translation(-pivot)
 }
 
 /// Compose one instance's bone palette row.
@@ -1526,12 +1716,7 @@ fn push_palette(
                 let transition = skeleton.transition(animator.current.clip, clip);
                 animator.play(clip, transition);
             }
-            let rate = playback_rate(
-                skeleton,
-                animator.current.clip,
-                animator.speed,
-                scale,
-            );
+            let rate = playback_rate(skeleton, animator.current.clip, animator.speed, scale);
             animator.advance(dt, rate);
             skeleton.sample(animator.current.clip, animator.current.time, locals);
 
@@ -1603,9 +1788,113 @@ fn playback_rate(skeleton: &Skeleton, clip: u32, speed: f32, scale: f32) -> f32 
 mod tests {
     use super::*;
 
+    /// `models/girl.glb` stores all 795 primitives as `TRIANGLE_STRIP` with
+    /// Blockbench's duplicate-vertex restart encoding. This test pins the
+    /// decoded triangle count so a regression to "read it as a triangle list"
+    /// cannot come back silently.
     #[test]
-    fn gltf_gpu_material_layout() {
-        // Must match the GLSL GltfMaterial struct under std430 exactly:
+    fn girl_glb_strip_primitives_triangulate() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/models/girl.glb");
+        let bytes = std::fs::read(&path).expect("girl.glb missing");
+        // The importer only understands PNG/JPEG and girl.glb's texture is
+        // WebP, so normalise first (same pass the server runs).
+        let bytes = normalize_model_bytes("girl.glb", &bytes);
+        let (document, buffers, _images) =
+            gltf::import_slice(&bytes).expect("girl.glb parse");
+
+        let mut prims = 0usize;
+        let mut tris = 0usize;
+        let mut verts = 0usize;
+        for mesh in document.meshes() {
+            for prim in mesh.primitives() {
+                assert_eq!(
+                    prim.mode(),
+                    gltf::mesh::Mode::TriangleStrip,
+                    "girl.glb is expected to be all TRIANGLE_STRIP"
+                );
+                let loaded = load_gltf_primitive(&prim, &buffers).expect("primitive decode");
+                prims += 1;
+                verts += loaded.vertices.len();
+                tris += loaded.indices.len() / 3;
+
+                // Every index must address a vertex this primitive owns, and
+                // no degenerate triangle may survive.
+                let nv = loaded.vertices.len() as u32;
+                assert!(
+                    loaded.indices.iter().all(|&i| i < nv),
+                    "index out of range after strip conversion"
+                );
+                for t in loaded.indices.chunks_exact(3) {
+                    assert!(
+                        t[0] != t[1] && t[1] != t[2] && t[0] != t[2],
+                        "degenerate triangle survived strip conversion"
+                    );
+                }
+            }
+        }
+
+        assert_eq!(prims, 795, "girl.glb primitive count");
+        assert_eq!(verts, 19_080, "girl.glb vertex count");
+        // 12 real triangles per 24-vertex box.
+        assert_eq!(tris, 9_540, "girl.glb triangle count after strip conversion");
+    }
+
+    #[test]
+    fn triangle_strip_conversion_alternates_winding() {
+        // A 4-vertex quad strip `[0,1,2,3]` must become two triangles with
+        // consistent winding: (0,1,2) and (2,1,3). Getting the parity wrong
+        // back-face-culls half the surface.
+        let out = to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![0, 1, 2, 3]).unwrap();
+        assert_eq!(out, vec![0, 1, 2, 2, 1, 3]);
+    }
+
+    #[test]
+    fn triangle_strip_restart_windows_are_dropped() {
+        // Blockbench's strip restart: `3,3,4` and `4,4,5` are zero-area
+        // triangles used to break the run. They must not reach the GPU.
+        let out =
+            to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![0, 1, 2, 3, 3, 4, 4, 5, 6, 7])
+                .unwrap();
+        for t in out.chunks_exact(3) {
+            assert!(
+                t[0] != t[1] && t[1] != t[2] && t[0] != t[2],
+                "degenerate survived: {:?}",
+                t
+            );
+        }
+    }
+
+    #[test]
+    fn triangles_mode_passes_through_unchanged() {
+        let idx = vec![0, 1, 2, 3, 4, 5];
+        let out = to_triangle_list(gltf::mesh::Mode::Triangles, idx.clone()).unwrap();
+        assert_eq!(out, idx, "TRIANGLES must pass through without a copy");
+    }
+
+    #[test]
+    fn triangle_fan_uses_the_first_vertex_as_pivot() {
+        // Fan: `0` then every consecutive pair.
+        let out = to_triangle_list(gltf::mesh::Mode::TriangleFan, vec![0, 1, 2, 3, 4]).unwrap();
+        assert_eq!(out, vec![0, 1, 2, 0, 2, 3, 0, 3, 4]);
+    }
+
+    #[test]
+    fn points_and_lines_are_rejected() {
+        assert!(to_triangle_list(gltf::mesh::Mode::Points, vec![0, 1, 2]).is_err());
+        assert!(to_triangle_list(gltf::mesh::Mode::Lines, vec![0, 1, 2, 3]).is_err());
+        assert!(to_triangle_list(gltf::mesh::Mode::LineStrip, vec![0, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn a_strip_with_no_usable_indices_is_an_error() {
+        // `[0, 1, 1]` and `[0, 0]` produce nothing.
+        assert!(to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![0, 0, 0]).is_err());
+        assert!(to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![]).is_err());
+    }
+
+    #[test]
+    fn gltf_gpu_material_layout() {        // Must match the GLSL GltfMaterial struct under std430 exactly:
         // vec4s first, then scalars — no implicit padding, stride 80.
         use std::mem::{offset_of, size_of};
         assert_eq!(size_of::<GltfGpuMaterial>(), 80);
@@ -1649,17 +1938,30 @@ mod tests {
             // The rig merges primitives that share a material and rewrites
             // positions through the scene graph, so a 1:1 primitive mapping
             // no longer exists. What must hold is that no geometry was lost
-            // or corrupted: the same number of vertices and indices comes
-            // out as goes in, and every index still addresses a real vertex.
+            // or corrupted: the same number of vertices comes out as goes in,
+            // every index addresses a real vertex, and the same number of
+            // *triangles* comes out as the source's primitive modes imply.
+            //
+            // Triangles, not indices: `to_triangle_list` turns a `TRIANGLE_STRIP`
+            // of N indices into N-2 triangles (minus degenerate restart
+            // windows), so a raw index-count comparison is meaningless for
+            // non-`TRIANGLES` modes. The server's converter emits `TRIANGLES`,
+            // but this must stay mode-aware or it becomes a silent trap.
             let mut src_verts = 0usize;
-            let mut src_indices = 0usize;
+            let mut src_triangles = 0usize;
             for mesh in doc["meshes"].as_array().unwrap() {
                 for p in mesh["primitives"].as_array().unwrap() {
                     let ai = p["attributes"]["POSITION"].as_u64().unwrap() as usize;
                     src_verts += accs[ai]["count"].as_u64().unwrap() as usize;
-                    src_indices += accs[p["indices"].as_u64().unwrap() as usize]["count"]
+                    let n_idx = accs[p["indices"].as_u64().unwrap() as usize]["count"]
                         .as_u64()
                         .unwrap() as usize;
+                    match p.get("mode").and_then(|m| m.as_u64()).unwrap_or(4) {
+                        4 => src_triangles += n_idx / 3,
+                        5 => src_triangles += n_idx.saturating_sub(2),
+                        6 => src_triangles += n_idx.saturating_sub(2),
+                        other => panic!("{model}: unexpected primitive mode {other}"),
+                    }
                 }
             }
 
@@ -1678,7 +1980,10 @@ mod tests {
                 .map(|p| p.indices.len())
                 .sum();
             assert_eq!(got_verts, src_verts, "{model}: vertex count");
-            assert_eq!(got_indices, src_indices, "{model}: index count");
+            assert_eq!(
+                got_indices / 3, src_triangles,
+                "{model}: triangle count — geometry lost or duplicated in triangulation"
+            );
 
             let joint_count = asset.skeleton.as_ref().map(|s| s.joints.len()).unwrap_or(1);
             for mesh in &asset.model.meshes {

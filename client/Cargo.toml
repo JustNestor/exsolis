@@ -64,4 +64,7 @@ gltf = { version = "0.16", features = ["image", "utils", "guess_mime_type"] }
 image023.workspace = true
 gltf-json = "0.16"
 
+thiserror = { version = "2.0", default-features = false }
+fixedbitset = "0.5"
+
 # taffy = "0.14.0"

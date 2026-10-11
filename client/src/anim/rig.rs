@@ -182,11 +182,12 @@ impl Rig {
                                 .unwrap_or(STATIC_JOINT)
                                 as u16;
                         }
-                        primitives.extend(split_by_joint(
-                            vertices,
-                            loaded.indices,
-                            loaded.material_index,
-                        ));
+                        // Blockbench pads every mesh element with zero-area
+                        // triangles; drop them now that each vertex has its
+                        // joint, so they never reach the GPU.
+                        let mut indices = loaded.indices;
+                        drop_degenerate_triangles(&vertices, &mut indices);
+                        primitives.extend(split_by_joint(vertices, indices, loaded.material_index));
                         continue;
                     }
                 }
@@ -560,6 +561,42 @@ struct JointBuild {
     node_index: usize,
 }
 
+/// Drop triangles that can never cover a pixel.
+///
+/// Blockbench exports every mesh element as 32 triangles over 8 corner
+/// positions, 20 of which are zero-area (a cube needs 12). They draw nothing
+/// but make up ~70% of the index stream.
+///
+/// A triangle is only dropped when all three vertices are bound to the same
+/// joint: they then share one palette matrix, so zero area at rest stays zero
+/// area in every pose. A triangle spanning two bones can grow area under
+/// animation even if it is flat at rest, so those are always kept.
+fn drop_degenerate_triangles(vertices: &[GltfVertex], indices: &mut Vec<u32>) {
+    let mut kept = Vec::with_capacity(indices.len());
+    for tri in indices.chunks_exact(3) {
+        let (Some(a), Some(b), Some(c)) = (
+            vertices.get(tri[0] as usize),
+            vertices.get(tri[1] as usize),
+            vertices.get(tri[2] as usize),
+        ) else {
+            // Out of range: leave it for the caller to trip over, not hide it.
+            kept.extend_from_slice(tri);
+            continue;
+        };
+        let flat = {
+            let pa = Vec3::from_array(a.position);
+            let pb = Vec3::from_array(b.position);
+            let pc = Vec3::from_array(c.position);
+            (pb - pa).cross(pc - pa).length_squared() < 1e-12
+        };
+        if flat && a.joint == b.joint && b.joint == c.joint {
+            continue;
+        }
+        kept.extend_from_slice(tri);
+    }
+    *indices = kept;
+}
+
 /// Split one skinned primitive into one primitive per joint, so the
 /// per-primitive `joint` that `build_arms` filters on means something.
 /// A triangle goes to the group of its first vertex; vertices keep their own
@@ -857,13 +894,7 @@ fn decode_clips(
                 continue;
             };
             let sampler = channel.sampler();
-            if sampler.interpolation() != gltf::animation::Interpolation::Linear {
-                warn!(
-                    "clip {:?}: non-LINEAR interpolation is not supported; skipping channel",
-                    animation.name()
-                );
-                continue;
-            }
+            let interpolation = crate::anim::Interpolation::from_gltf(sampler.interpolation());
             let reader = channel.reader(|buffer| Some(&buffers[buffer.index()]));
             let Some(times) = reader.read_inputs() else {
                 continue;
@@ -883,13 +914,27 @@ fn decode_clips(
             let Some(outputs) = reader.read_outputs() else {
                 continue;
             };
+            // CUBICSPLINE packs each key as [in_tangent, value, out_tangent],
+            // so the buffer is 3x wider than the key count. The other modes
+            // are a single value per key. Either way the flat layout is
+            // written straight through and `AnimChannel::sample_into` reads
+            // it with the right stride.
             let values: Vec<f32> = match outputs {
                 // Quaternion keys come back as [x, y, z, w].
-                gltf::animation::util::ReadOutputs::Rotations(r) => r
-                    .into_f32()
-                    .flat_map(|q| [q[0], q[1], q[2], q[3]])
-                    .collect(),
-                gltf::animation::util::ReadOutputs::Translations(t) => t.flatten().collect(),
+                gltf::animation::util::ReadOutputs::Rotations(r) => match interpolation {
+                    crate::anim::Interpolation::CubicSpline => r
+                        .into_f32()
+                        .flatten()
+                        .collect(),
+                    _ => r
+                        .into_f32()
+                        .flat_map(|q| [q[0], q[1], q[2], q[3]])
+                        .collect(),
+                },
+                gltf::animation::util::ReadOutputs::Translations(t) => match interpolation {
+                    crate::anim::Interpolation::CubicSpline => t.flatten().collect(),
+                    _ => t.flatten().collect(),
+                },
                 gltf::animation::util::ReadOutputs::Scales(s) => s.flatten().collect(),
                 gltf::animation::util::ReadOutputs::MorphTargetWeights(_) => continue,
             };
@@ -897,7 +942,12 @@ fn decode_clips(
                 AnimPath::Rotation => 4,
                 _ => 3,
             };
-            if values.len() < times.len() * components {
+            // Expected length: key_count * components * (3 for CUBICSPLINE).
+            let stride = match interpolation {
+                crate::anim::Interpolation::CubicSpline => 3,
+                _ => 1,
+            };
+            if values.len() < times.len() * components * stride {
                 warn!(
                     "clip {:?}: channel output shorter than its key count; skipping",
                     animation.name()
@@ -909,6 +959,7 @@ fn decode_clips(
             channels.push(AnimChannel {
                 joint,
                 path,
+                interpolation,
                 times,
                 values,
             });
@@ -1065,7 +1116,12 @@ mod tests {
             19_080,
             "vertex count must survive merge"
         );
-        assert_eq!(prim.indices.len(), 27_030);
+        // Every one of girl.glb's 795 primitives is a `TRIANGLE_STRIP` of 24
+        // indices that triangulates to 12 triangles (34 indices minus the
+        // degenerate restart windows). Reading them as a triangle list used
+        // to give 11 wrong triangles per box, many of them spanning opposite
+        // faces — the exploded-mesh symptom.
+        assert_eq!(prim.indices.len(), 795 * 12 * 3);
 
         // Only the animated nodes and their ancestors become joints; the
         // other 1800-odd nodes are baked into vertex positions.
@@ -1338,12 +1394,13 @@ mod tests {
         let n = skeleton.joints.len();
 
         let mut world = vec![glam::Mat4::IDENTITY; n];
-        let posed = |skeleton: &crate::anim::Skeleton, locals: &[JointTransform]| -> Vec<glam::Mat4> {
-            let mut world = vec![glam::Mat4::IDENTITY; n];
-            let mut bones = vec![glam::Mat4::IDENTITY; n];
-            skeleton.compose_palette(locals, &mut world, &mut bones);
-            bones
-        };
+        let posed =
+            |skeleton: &crate::anim::Skeleton, locals: &[JointTransform]| -> Vec<glam::Mat4> {
+                let mut world = vec![glam::Mat4::IDENTITY; n];
+                let mut bones = vec![glam::Mat4::IDENTITY; n];
+                skeleton.compose_palette(locals, &mut world, &mut bones);
+                bones
+            };
 
         // Rest pose.
         let mut locals = vec![JointTransform::default(); n];
@@ -1372,14 +1429,11 @@ mod tests {
                 if joint as usize >= n {
                     panic!("arm vertex references joint {joint}, only {n} exist");
                 }
-                let from = rest_bones[joint as usize]
-                    .transform_point3(glam::Vec3::from_array(v.position));
+                let from =
+                    rest_bones[joint as usize].transform_point3(glam::Vec3::from_array(v.position));
                 let to = posed_bones[joint as usize]
                     .transform_point3(glam::Vec3::from_array(v.position));
-                by_bone
-                    .entry(joint)
-                    .or_default()
-                    .push((from, to));
+                by_bone.entry(joint).or_default().push((from, to));
             }
         }
 
@@ -1467,7 +1521,13 @@ mod tests {
             names.join(", ")
         );
         // ...and it must not swallow the rest of the body.
-        for excluded in ["Head_822", "LeftLeg_52", "RightFoot_95", "Breast_1064", "Tail_182"] {
+        for excluded in [
+            "Head_822",
+            "LeftLeg_52",
+            "RightFoot_95",
+            "Breast_1064",
+            "Tail_182",
+        ] {
             assert!(
                 !names.contains(&excluded),
                 "arm cut swallowed {excluded}; it has {}",
