@@ -59,6 +59,21 @@ declare function row_stride(): i32;
 /** Byte offset of one row field ("x", "y", "z", "id"), or -1. */
 declare function row_offset(field: string): i32;
 
+// ───────────────────────── type layouts ─────────────────────────
+//
+// Offsets for *any* Rust type in the exported type database, which is what
+// makes non-`repr(C)` types usable from mods: rustc reorders struct fields and
+// inserts padding, and only the DWARF export knows the real layout. Pass a
+// fully-qualified type name and a field; you get bytes (-1 when unknown).
+//
+//   let off: i32 = field_offset("exsolis_server::chunks::PlayerPosition", "0");
+
+/** Byte offset of `field` inside `ty` (from the exported type database). */
+declare function field_offset(ty: string, field: string): i32;
+
+/** Byte size of `ty` (from the exported type database). */
+declare function type_size(ty: string): i32;
+
 /** Read a float field of row `index`. */
 declare function row_get_f32(index: i32, field: string): f64;
 

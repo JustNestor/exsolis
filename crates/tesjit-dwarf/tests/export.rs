@@ -5,7 +5,7 @@
 use std::path::PathBuf;
 use std::process::Command;
 
-use tesjit_dwarf::{TypeArgs, TypeDb, export};
+use tesjit_dwarf::{TypeArgs, TypeDb, export, export_with_dwo};
 
 /// The fixture source, kept in one place so the compiled binary matches.
 ///
@@ -148,4 +148,109 @@ fn structs_and_enum_layouts() {
         names.1 < world.size && world.size >= 8,
         "{names:?} / {world:?}"
     );
+}
+
+/// rustc's dev default here is split-DWARF: the binary holds only skeleton
+/// units, so `export` alone cannot see the crate's own types. Reading the
+/// sibling `.dwo` files must recover them — this is the whole reason
+/// `export_with_dwo` exists.
+#[test]
+fn dwo_siblings_recover_types_the_binary_cannot() {
+    // Build the fixture with split-DWARF and no embedded info, like a normal
+    // dev build, so the binary really is skeleton-only.
+    let dir = std::env::temp_dir().join(format!("tesjit-split-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let out = dir.join("out");
+    let _ = std::fs::create_dir_all(&out);
+
+    let src = dir.join("fixture.rs");
+    std::fs::write(
+        &src,
+        r#"
+        pub struct Nested { pub a: f32, pub b: u64 }
+        // Deliberately not `repr(C)`: rustc may reorder fields, and the offsets
+        // must come from DWARF rather than from this declaration order.
+        pub struct Outer { pub flag: u8, pub nested: Nested, pub n: i64 }
+        fn main() {
+            let o = Outer { flag: 1, nested: Nested { a: 1.0, b: 2 }, n: 3 };
+            std::hint::black_box((&o, o.nested.b));
+        }
+        "#,
+    )
+    .unwrap();
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let status = std::process::Command::new(rustc)
+        .arg("--edition=2021")
+        .arg("-g")
+        .arg("-Csplit-debuginfo=unpacked")
+        .arg(&src)
+        .arg("-o")
+        .arg(out.join("fixture"))
+        .status()
+        .unwrap();
+    assert!(status.success(), "split-DWARF fixture build failed");
+
+    let binary = out.join("fixture");
+    let data = std::fs::read(&binary).unwrap();
+
+    // The skeleton-only read finds no `fixture::Outer` — that is the bug this
+    // whole change is about.
+    let (plain, _) = export(&data, "fixture").expect("export fixture");
+    assert!(
+        plain.get("fixture::Outer").is_none(),
+        "a split-DWARF binary must not contain its own types; found {:?}",
+        plain.get("fixture::Outer").map(|d| d.name.to_string())
+    );
+
+    // ... and the sibling `.dwo` read must.
+    let (db, _) = export_with_dwo(&data, "fixture", &out).expect("export with dwo");
+    let outer = db.get("fixture::Outer").expect("Outer recovered from .dwo");
+    let sizes = (outer.size, outer.align);
+    let tesjit_dwarf::TypeArgs::Struct(fields) = &outer.args else {
+        panic!("Outer is a struct");
+    };
+    let offset_of = |name: &str| fields.fields.iter().find(|f| f.name == name).map(|f| f.offset);
+    // Field offsets come from DWARF, so they match the compiled layout whatever
+    // order the source declared them in.
+    assert!(offset_of("nested").is_some() && offset_of("n").is_some(), "{fields:?}");
+    let nested_off = offset_of("nested").unwrap();
+    let nested = db.get("fixture::Nested").expect("Nested recovered from .dwo");
+    let nested_a = match &nested.args {
+        tesjit_dwarf::TypeArgs::Struct(f) => f
+            .fields
+            .iter()
+            .find(|f| f.name == "a")
+            .map(|f| f.offset)
+            .expect("nested.a"),
+        _ => panic!("Nested is a struct"),
+    };
+    // This is the whole point: the source says `{ a: f32, b: u64 }`, but
+    // `repr(Rust)` puts the u64 first, so `a` lives at offset 8 — and only the
+    // DWARF export knows that. A mod reading `Nested` has to use this offset,
+    // not the declaration order.
+    assert_eq!((nested.size, nested_a), (16, 8), "repr(Rust) reorders fields");
+
+    // And the nested struct is embedded at an offset the exporter reports, not
+    // the one the source order suggests.
+    let nested_bytes = |name: &str| {
+        match &db.get("fixture::Nested").unwrap().args {
+            tesjit_dwarf::TypeArgs::Struct(f) => f
+                .fields
+                .iter()
+                .find(|f| f.name == name)
+                .map(|f| f.offset)
+                .unwrap_or(0),
+            _ => 0,
+        }
+    };
+    let _ = nested_bytes("a");
+    // The composed layout: `flag` (1 byte, u64-aligned) then `nested` then `n`.
+    assert!(nested_off % 4 == 0, "{nested_off}");
+    assert!(offset_of("n").unwrap() > nested_off, "{fields:?}");
+    let _ = (sizes.0, sizes.1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn def_of<'a>(db: &'a tesjit_dwarf::TypeDb, name: &'a str) -> Option<&'a tesjit_dwarf::TypeDef> {
+    db.get(name)
 }

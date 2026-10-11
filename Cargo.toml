@@ -97,9 +97,12 @@ tesjit = { path = "./crates/tesjit" }
 opt-level = 1
 # `debug = 2` (full) rather than "line-tables-only": the type database that the
 # mod bridge loads (`cargo run -p tesjit-dwarf -- target/debug/exsolis_server_bin`)
-# reads struct layouts out of DWARF, and line tables carry none. Cost is build
-# time and binary size in dev only.
+# reads struct layouts out of DWARF, and line tables carry none.
 debug = 2
+# NOTE: rustc's dev default on this toolchain is split-DWARF, which puts every
+# real type in a sibling `.dwo` file next to the binary. `just export-types`
+# therefore points the exporter at both the binary and that directory (see
+# crates/tesjit-dwarf), so this stays at the toolchain default.
 split-debuginfo = "unpacked"
 lto = false
 

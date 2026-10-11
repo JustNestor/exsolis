@@ -15,6 +15,7 @@
 //! - `.debug_types` (DWARF 4 type units) is not walked; only `.debug_info`
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gimli::RunTimeEndian;
 use object::{Object, ObjectSection};
@@ -55,6 +56,92 @@ pub enum ExportError {
 
 type R<'a> = gimli::EndianSlice<'a, RunTimeEndian>;
 
+/// Export the type database from a binary *and* every `.dwo` file sitting next
+/// to it.
+///
+/// rustc's dev default on this toolchain is split-DWARF: the binary itself only
+/// holds skeleton compile units that point at the real ones, so reading the
+/// binary alone yields C library types and none of the crate's own. This reads
+/// the binary and then merges every `.dwo` in `sibling_dir` (usually
+/// `build/<profile>/build/<crate>-<hash>/out`, or `.` for a single-file dwo).
+pub fn export_with_dwo(
+    data: &[u8],
+    source_name: &str,
+    sibling_dir: &Path,
+) -> Result<(TypeDb, ExportStats), ExportError> {
+    let (mut db, mut stats) = export(data, source_name)?;
+    let mut dwo_files = Vec::new();
+    if sibling_dir.is_dir() {
+        let Ok(entries) = std::fs::read_dir(sibling_dir) else {
+            return Ok((db, stats));
+        };
+        let mut paths: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("dwo"))
+            .collect();
+        paths.sort();
+        for path in paths {
+            if let Ok(bytes) = std::fs::read(&path) {
+                dwo_files.push((path, bytes));
+            }
+        }
+    }
+    if dwo_files.is_empty() {
+        return Ok((db, stats));
+    }
+
+    // Each `.dwo` is its own DWARF object; merging them one at a time keeps the
+    // existing machinery (and its dedup) exactly as it is.
+    let endian = if object::File::parse(data)?.is_little_endian() {
+        RunTimeEndian::Little
+    } else {
+        RunTimeEndian::Big
+    };
+    for (path, bytes) in dwo_files {
+        let name = path.display().to_string();
+        let mut load_section = |id: gimli::SectionId| -> Result<R<'_>, gimli::Error> {
+            // Split-DWARF sections carry a `.dwo` suffix (`.debug_info.dwo`),
+            // and rustc also emits `.debug_str_o` for the string pool. Try the
+            // plain name first (a non-split object works too), then the
+            // suffixed forms.
+            let name = id.name();
+            let bytes = file_section(&bytes, name)
+                .or_else(|| file_section(&bytes, &format!("{name}.dwo")))
+                .or_else(|| {
+                    (name == ".debug_str")
+                        .then(|| file_section(&bytes, ".debug_str_o"))
+                        .flatten()
+                })
+                .unwrap_or_default();
+            Ok(gimli::EndianSlice::new(bytes, endian))
+        };
+        let dwarf = gimli::Dwarf::load(&mut load_section)?;
+        let mut builder = Builder::new(vec![dwarf]);
+        builder.walk()?;
+        let part = builder.finish(&name, bytes.len() as u64);
+        stats.types += part.len();
+        // `Dwarf::load` on a `.dwo` yields the same type names, so the database
+        // naturally dedupes by name when merged.
+        for (name, def) in part.types {
+            db.types.entry(name).or_insert(def);
+        }
+        for (alias, target) in part.aliases {
+            db.aliases.entry(alias).or_insert(target);
+        }
+    }
+    Ok((db, stats))
+}
+
+/// Raw section bytes from an already-parsed object (compressed sections are
+/// decompressed on the way out).
+fn file_section<'a>(data: &'a [u8], name: &str) -> Option<&'a [u8]> {
+    object::File::parse(data)
+        .ok()?
+        .section_by_name(name)
+        .and_then(|section| section.data().ok())
+}
+
 /// Export the type database from the DWARF in `data`.
 ///
 /// `data` is only borrowed while parsing: the returned database owns plain
@@ -78,7 +165,7 @@ pub fn export(data: &[u8], source_name: &str) -> Result<(TypeDb, ExportStats), E
     };
     let dwarf = gimli::Dwarf::load(&mut load_section)?;
 
-    let mut builder = Builder::new(&dwarf);
+    let mut builder = Builder::new(vec![dwarf]);
     builder.walk()?;
     let db = builder.finish(source_name, data.len() as u64);
     Ok((db, builder.stats))
@@ -154,8 +241,10 @@ impl UnitDies {
     }
 }
 
-struct Builder<'a, 'b> {
-    dwarf: &'a gimli::Dwarf<R<'b>>,
+struct Builder<'b> {
+    /// Every DWARF object merged into one type table: the binary itself, then
+    /// each sibling `.dwo` (split-DWARF) file next to it.
+    dwarfs: Vec<gimli::Dwarf<R<'b>>>,
     units: Vec<UnitDies>,
     /// Absolute offset → (unit index, DIE index) for `DW_FORM_ref_addr`.
     abs_index: HashMap<u64, DieIndex>,
@@ -163,10 +252,10 @@ struct Builder<'a, 'b> {
     producer: String,
 }
 
-impl<'a, 'b> Builder<'a, 'b> {
-    fn new(dwarf: &'a gimli::Dwarf<R<'b>>) -> Self {
+impl<'b> Builder<'b> {
+    fn new(dwarfs: Vec<gimli::Dwarf<R<'b>>>) -> Self {
         Self {
-            dwarf,
+            dwarfs,
             units: Vec::new(),
             abs_index: HashMap::new(),
             stats: ExportStats::default(),
@@ -177,9 +266,13 @@ impl<'a, 'b> Builder<'a, 'b> {
     // ─────────────────────────── pass 1: collect ───────────────────────────
 
     fn walk(&mut self) -> Result<(), gimli::Error> {
-        let mut headers = self.dwarf.units();
+        // Borrowed out for the duration of the pass so `record` can take `&mut
+        // self` while a unit is being read.
+        let dwarfs = std::mem::take(&mut self.dwarfs);
+        for dwarf_index in 0..dwarfs.len() {
+        let mut headers = dwarfs[dwarf_index].units();
         while let Some(header) = headers.next()? {
-            let unit = self.dwarf.unit(header)?;
+            let unit = dwarfs[dwarf_index].unit(header)?;
             let _abbrev = &unit.abbreviations;
             let unit_index = self.units.len();
             let mut collected = UnitDies {
@@ -204,7 +297,7 @@ impl<'a, 'b> Builder<'a, 'b> {
                 // Deltas go negative while the traversal climbs back out of a
                 // subtree; the iterator itself ends at the unit's end.
                 let local = depth.max(0) as usize;
-                let rec = self.record(&unit, unit_index, entry)?;
+                let rec = self.record(&dwarfs[dwarf_index], &unit, unit_index, entry)?;
                 let die = collected.order.len();
                 collected.parents.push(usize::MAX);
                 collected.children.push(Vec::new());
@@ -232,11 +325,14 @@ impl<'a, 'b> Builder<'a, 'b> {
             self.stats.compilation_units += 1;
             self.units.push(collected);
         }
+        } // next DWARF object (sibling `.dwo` files, when present)
+        self.dwarfs = dwarfs;
         Ok(())
     }
 
     fn record(
         &mut self,
+        dwarf: &gimli::Dwarf<R<'b>>,
         unit: &gimli::Unit<R<'b>>,
         unit_index: usize,
         entry: &gimli::DebuggingInformationEntry<R<'b>>,
@@ -255,11 +351,13 @@ impl<'a, 'b> Builder<'a, 'b> {
         let mut attrs = entry.attrs();
         while let Some(attr) = attrs.next()? {
             match attr.name() {
-                gimli::DW_AT_name => rec.name = self.attr_string(unit, attr.value())?,
+                gimli::DW_AT_name => rec.name = self.attr_string(dwarf, unit, attr.value())?,
                 gimli::DW_AT_byte_size => rec.byte_size = attr.udata_value(),
                 gimli::DW_AT_alignment => rec.alignment = attr.udata_value(),
                 gimli::DW_AT_producer if self.producer.is_empty() => {
-                    self.producer = self.attr_string(unit, attr.value())?.unwrap_or_default();
+                    self.producer = self
+                        .attr_string(dwarf, unit, attr.value())?
+                        .unwrap_or_default();
                 }
                 gimli::DW_AT_type => {
                     rec.type_ref = match attr.value() {
@@ -297,10 +395,11 @@ impl<'a, 'b> Builder<'a, 'b> {
 
     fn attr_string(
         &self,
+        dwarf: &gimli::Dwarf<R<'b>>,
         unit: &gimli::Unit<R<'b>>,
         value: gimli::AttributeValue<R<'b>>,
     ) -> Result<Option<String>, gimli::Error> {
-        match self.dwarf.attr_string(unit, value) {
+        match dwarf.attr_string(unit, value) {
             Ok(reader) => Ok(Some(demangle(&reader.to_string_lossy()))),
             Err(gimli::Error::UnsupportedAttributeForm) => Ok(None),
             Err(e) => Err(e),
