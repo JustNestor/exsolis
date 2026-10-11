@@ -146,13 +146,15 @@ impl<'a> Lowerer<'a> {
                 }
             };
             if f.declare || f.body.is_none() {
-                // Builtins are runtime symbols, not host functions: declaring
-                // them is a mistake worth a clear message about.
+                // Builtins are runtime symbols, not host functions. Declaring
+                // one is redundant rather than wrong — it happens in `.d.ts`
+                // editor tooling, which must describe them to the editor — so
+                // it is accepted and skipped instead of failing the build.
                 if crate::hir::BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
-                    self.at(
-                        f.span,
-                        format!("`{name}` is a builtin — it needs no `declare`"),
-                    );
+                    // Skip: the call site is lowered by the builtin path with
+                    // the engine's own signature, so whatever a `.d.ts` claims
+                    // here is documentation and can never affect codegen.
+                    let _ = (params, ret);
                     continue;
                 }
                 // `declare function name(...)`: must match a registered host

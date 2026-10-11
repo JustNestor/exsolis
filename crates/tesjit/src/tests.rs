@@ -672,3 +672,47 @@ fn type_db_offsets_drive_region_access() {
     drop(guard);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Editor tooling (`.d.ts`) has to `declare` the builtins so editors know their
+/// signature — that redundant declaration must not fail a build.
+#[test]
+fn declaring_a_builtin_is_accepted_not_an_error() {
+    let src = r#"
+        declare function load_f64(region: i32, offset: i32): f64;
+        export function go(): f64 { return load_f64(1, 0); }
+        "#;
+    let c = build_arr(src);
+    let guard = c.enter();
+    unsafe {
+        let go: extern "C" fn() -> f64 = c.get("go").unwrap();
+        assert_eq!(go(), 0.0, "an unregistered region reads as zero, not an error");
+    }
+    drop(guard);
+}
+
+/// A stale `.d.ts` that *documents* the wrong signature does not block the
+/// module: the declaration is documentation only — the call site is checked
+/// against the engine's real signature, which is what catches a genuinely wrong
+/// call.
+#[test]
+fn a_stale_dts_signature_does_not_block_the_module() {
+    let src = r#"
+        declare function load_f64(region: i32): f64;
+        export function go(): f64 { return load_f64(1, 0); }
+        "#;
+    let c = build_arr(src);
+    let guard = c.enter();
+    unsafe {
+        let go: extern "C" fn() -> f64 = c.get("go").unwrap();
+        assert_eq!(go(), 0.0);
+    }
+    drop(guard);
+
+    // But a genuinely wrong call is still an error — the engine's signature,
+    // not the `.d.ts`, is what the checker enforces.
+    let diags = errors("declare function load_f64(region: i32): f64;\nexport function go(): f64 { return load_f64(1); }");
+    assert!(
+        diags.iter().any(|d| format!("{d:?}").contains("expects 2 arguments")),
+        "{diags:?}"
+    );
+}

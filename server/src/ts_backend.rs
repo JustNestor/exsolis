@@ -913,7 +913,16 @@ fn discover_ts_files(root: &Path) -> io::Result<Vec<PathBuf>> {
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().and_then(|e| e.to_str()) == Some("ts") {
-                out.push(path);
+                // Declaration files (`exsolis.d.ts`) are editor tooling, not
+                // mods: they contain only `declare`s and would never compile
+                // as a module.
+                let is_declaration = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|name| name.ends_with(".d.ts"));
+                if !is_declaration {
+                    out.push(path);
+                }
             }
         }
     }
@@ -1269,6 +1278,28 @@ mod tests {
         let (db, _) = tesjit_dwarf::export(&data, "fixture").expect("export fixture");
         let _ = std::fs::remove_dir_all(&dir);
         db
+    }
+
+    #[test]
+    fn declaration_files_are_not_loaded_as_mods() {
+        // `exsolis.d.ts` lives inside `mods/` because that is where mod authors
+        // look for it; it must not be compiled as a module.
+        let dir = mods_dir(&[
+            ("exsolis.d.ts", "declare function load_f64(region: i32, offset: i32): f64;\n"),
+            (
+                "real.ts",
+                "export function on_tick(): void {}\ndeclare function load_f64(r: i32, o: i32): f64;\n",
+            ),
+        ]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload();
+        let handlers = runtime.exported_handlers();
+        assert_eq!(handlers.len(), 1, "only the real mod loads: {handlers:?}");
+        assert!(
+            handlers[0].ends_with(":on_tick") && handlers[0].contains("real.ts"),
+            "unexpected handlers: {handlers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
