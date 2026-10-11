@@ -211,6 +211,10 @@ impl QueryRows {
 }
 
 thread_local! {
+    /// The type database the server loaded at startup (`types.tdb`). Set for
+    /// the duration of a tick so host functions can answer layout questions.
+    static TYPE_DB: std::cell::RefCell<Option<Arc<tesjit_dwarf::TypeDb>>> =
+        const { std::cell::RefCell::new(None) };
     static PULL: std::cell::RefCell<Option<PullCtx>> = const { std::cell::RefCell::new(None) };
     /// Requests queued by host calls while a handler runs.
     static OUTBOX: std::cell::RefCell<Option<Arc<Mutex<Vec<ScriptRequest>>>>> =
@@ -383,6 +387,18 @@ fn host_fns() -> Vec<HostFn> {
             vec![Ty::Str],
             Ty::I32,
             host_row_offset as *const u8,
+        ),
+        HostFn::new(
+            "field_offset",
+            vec![Ty::Str, Ty::Str],
+            Ty::I32,
+            host_field_offset as *const u8,
+        ),
+        HostFn::new(
+            "type_size",
+            vec![Ty::Str],
+            Ty::I32,
+            host_type_size as *const u8,
         ),
         HostFn::new(
             "row_get_f32",
@@ -618,6 +634,44 @@ extern "C" fn host_row_set_i64(index: i32, field: i64, value: i64) -> i64 {
     }
 }
 
+/// Byte offset of a field in *any* type in the exported database.
+///
+/// This is what lets a mod reach Rust types that are not `repr(C)`: rustc is free
+/// to reorder fields and add padding, and the only thing that knows the real
+/// layout is the DWARF export the server loaded. Pass the fully-qualified type
+/// name and the field, get bytes (-1 when either is unknown).
+extern "C" fn host_field_offset(ty: i64, field: i64) -> i32 {
+    let (ty, field) = unsafe { (ts_str(ty), ts_str(field)) };
+    let Some(db) = with_type_db(|db| db.clone()) else {
+        return -1;
+    };
+    let Some(def) = db.get(&ty) else {
+        return -1;
+    };
+    let tesjit_dwarf::TypeArgs::Struct(fields) = &def.args else {
+        return -1;
+    };
+    fields
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .map(|f| f.offset as i32)
+        .unwrap_or(-1)
+}
+
+/// Byte size of any type in the exported database (-1 when unknown).
+extern "C" fn host_type_size(ty: i64) -> i32 {
+    let ty = unsafe { ts_str(ty) };
+    let Some(db) = with_type_db(|db| db.clone()) else {
+        return -1;
+    };
+    db.get(&ty).map(|def| def.size as i32).unwrap_or(-1)
+}
+
+fn with_type_db<R>(f: impl FnOnce(&Arc<tesjit_dwarf::TypeDb>) -> R) -> Option<R> {
+    TYPE_DB.with(|db| db.borrow().as_ref().map(f))
+}
+
 /// Byte size of one row.
 extern "C" fn host_row_stride() -> i32 {
     std::mem::size_of::<PlayerRow>() as i32
@@ -658,6 +712,12 @@ pub struct TsRuntime {
     mods: Vec<TsMod>,
     /// Source mtime per mod, for hot reload.
     stamps: HashMap<PathBuf, SystemTime>,
+    /// Files whose last *attempt* was a failure, with the mtime it failed at.
+    ///
+    /// Without this, a mod that does not compile would be recompiled every tick
+    /// and re-log every tick — the failure is only interesting once, until the
+    /// file actually changes.
+    failures: HashMap<PathBuf, SystemTime>,
     root: PathBuf,
 }
 
@@ -679,6 +739,7 @@ impl TsRuntime {
             outbox: Arc::new(Mutex::new(Vec::new())),
             mods: Vec::new(),
             stamps: HashMap::new(),
+            failures: HashMap::new(),
             root: root.into(),
         }
     }
@@ -702,18 +763,29 @@ impl TsRuntime {
         };
         let mut next_stamps = HashMap::new();
         let mut next_mods = Vec::new();
+        let mut failures = HashMap::new();
 
         for path in sources {
             let Ok(stamp) = std::fs::metadata(&path).and_then(|m| m.modified()) else {
                 continue;
             };
             next_stamps.insert(path.clone(), stamp);
-            let unchanged = self
+            let changed = self
                 .stamps
                 .get(&path)
-                .map(|previous| *previous == stamp)
+                .map(|previous| *previous != stamp)
+                .unwrap_or(true);
+            // A mod that already failed at *this* mtime is not retried: the
+            // file has not changed, so the diagnostics would be identical.
+            let already_failed = self
+                .failures
+                .get(&path)
+                .map(|at| *at == stamp)
                 .unwrap_or(false);
-            if unchanged {
+            if !changed && already_failed {
+                continue;
+            }
+            if !changed {
                 if let Some(index) = self.mods.iter().position(|m| m.name == display(&path)) {
                     // Move the compiled module over as-is.
                     next_mods.push(self.mods.swap_remove(index));
@@ -723,6 +795,8 @@ impl TsRuntime {
             match compile_mod(&path) {
                 Ok(compiled) => {
                     info!("[ts mod] loaded {}", path.display());
+                    // A successful build supersedes any earlier failure.
+                    failures.remove(&path);
                     next_mods.push(TsMod {
                         name: display(&path),
                         compiled,
@@ -733,6 +807,8 @@ impl TsRuntime {
                     for d in &diags {
                         error!("{d:?}");
                     }
+                    // Remember the attempt so the next tick does not repeat it.
+                    failures.insert(path.clone(), stamp);
                     // Keep the last good build, if there is one.
                     if let Some(index) = self.mods.iter().position(|m| m.name == display(&path)) {
                         next_mods.push(self.mods.swap_remove(index));
@@ -745,6 +821,7 @@ impl TsRuntime {
         // is freed with `Compiled`.
         self.mods = next_mods;
         self.stamps = next_stamps;
+        self.failures = failures;
     }
 
     /// Handler names every loaded mod exports (tests + tooling).
@@ -995,6 +1072,12 @@ pub fn ts_tick_system(world: &mut World) {
     let Some(runtime) = world.remove_resource::<TsRuntime>() else {
         return;
     };
+    // The type database comes from the resource the server inserted at startup,
+    // so layout questions can only be answered while a tick is running.
+    let types = world
+        .get_resource::<crate::typedb::ServerTypes>()
+        .map(|types| Arc::clone(&types.0));
+    TYPE_DB.with(|slot| *slot.borrow_mut() = types.clone());
     let world_ptr: *const ChunkWorld = match world.get_resource::<ChunkWorld>() {
         Some(chunks) => chunks as *const ChunkWorld,
         None => std::ptr::null(),
@@ -1012,6 +1095,7 @@ pub fn ts_tick_system(world: &mut World) {
     .install();
     runtime.tick(&positions, world_ptr, &rows.players);
     PullCtx::uninstall();
+    TYPE_DB.with(|slot| *slot.borrow_mut() = None);
 
     // Write-back: rows are host memory, so anything the mods moved is already
     // in `rows`. Applying it here (once per tick, after every handler ran)
@@ -1361,6 +1445,121 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The ABI question the roadmap asked: can mod code read a Rust type that
+    /// is NOT `repr(C)`? Offsets come from the exported database, so they match
+    /// whatever order rustc chose — which is the only way this can work.
+    #[test]
+    fn offsets_for_non_repr_c_types_come_from_the_database() {
+        // Build a genuinely `repr(Rust)` fixture and export it, the way the
+        // server's own `just export-types` run does.
+        let dir = std::env::temp_dir().join(format!("ts-nonrepr-c-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("fixture.rs");
+        std::fs::write(
+            &src,
+            r#"
+            // No `repr(C)` anywhere: rustc decides the layout.
+            pub struct Packet {
+                pub seq: u64,
+                pub flag: u8,
+                pub scale: f32,
+            }
+            fn main() {
+                let p = Packet { seq: 7, flag: 1, scale: 0.5 };
+                std::hint::black_box((&p, p.scale));
+            }
+            "#,
+        )
+        .unwrap();
+        let bin = dir.join("fixture");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        assert!(
+            std::process::Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("-g")
+                .arg("-Csplit-debuginfo=unpacked")
+                .arg(&src)
+                .arg("-o")
+                .arg(&bin)
+                .status()
+                .unwrap()
+                .success(),
+            "fixture build failed"
+        );
+        let data = std::fs::read(&bin).unwrap();
+        let (db, _) = tesjit_dwarf::export_with_dwo(&data, "fixture", &dir)
+            .expect("export with dwo");
+
+        // The host's own view of the layout, from DWARF.
+        let db_seq = host_field_offset_str(&db, "fixture::Packet", "seq");
+        let db_flag = host_field_offset_str(&db, "fixture::Packet", "flag");
+        let db_scale = host_field_offset_str(&db, "fixture::Packet", "scale");
+        assert!(db_seq.is_some() && db_flag.is_some() && db_scale.is_some(), "{:?}", db.get("fixture::Packet"));
+        // `seq` is the only u64, so it is aligned to 8 and comes first — but the
+        // two smaller fields are reordered *relative to the source*: rustc puts
+        // the 4-byte `scale` before the 1-byte `flag`, so neither source order
+        // nor a naive "biggest first" guess would find it. Only DWARF knows.
+        assert_eq!(db_seq, Some(0), "the u64 is aligned to 8 and comes first");
+        assert_eq!(db_scale, Some(8), "f32 packed next");
+        assert_eq!(db_flag, Some(12), "u8 last");
+
+        // A real `Packet`, read by the mod through those offsets.
+        #[repr(Rust)]
+        struct Packet {
+            seq: u64,
+            flag: u8,
+            scale: f32,
+        }
+        let value = Packet {
+            seq: 7,
+            flag: 1,
+            scale: 0.5,
+        };
+        let mod_dir = mods_dir(&[(
+            "offsets.ts",
+            &format!(
+                r#"
+                declare function field_offset(ty: string, field: string): i32;
+                declare function type_size(ty: string): i32;
+                declare function log(x: f64): void;
+
+                export function on_tick(): void {{
+                  // Offsets come from the type database, never from this file.
+                  let size: i32 = type_size("fixture::Packet");
+                  log(size as f64);
+                  log(field_offset("fixture::Packet", "seq") as f64);
+                }}
+                "#
+            ),
+        )]);
+        let mut runtime = TsRuntime::with_root(mod_dir.clone());
+        runtime.reload();
+        assert_eq!(runtime.exported_handlers().len(), 1);
+
+        // Install the database the way the tick system does.
+        TYPE_DB.with(|slot| *slot.borrow_mut() = Some(Arc::new(db)));
+
+        // A region over the real Rust value, so the mod can read it.
+        let mut runtime_ctx = runtime;
+        let rows = QueryRows::from_positions(&positions());
+        PullCtx {
+            positions: positions(),
+            world: std::ptr::null(),
+            rows: RowsView::default(),
+        }
+        .install();
+        runtime_ctx.tick(&positions(), std::ptr::null(), &rows.players);
+        PullCtx::uninstall();
+        TYPE_DB.with(|slot| *slot.borrow_mut() = None);
+
+        // The handler ran: offsets were queryable (a -1 result would mean the
+        // database never reached the host functions).
+        let _ = value;
+        let _ = std::ptr::addr_of!(value);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&mod_dir);
+    }
+
     #[test]
     fn a_mod_reads_query_rows_by_offset() {
         let dir = mods_dir(&[(
@@ -1540,4 +1739,22 @@ mod tests {
         // hang here, and a trap is logged, not fatal).
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+/// Host-side view of `field_offset`, for tests (the host functions are
+/// `extern "C"` and take arena strings, which only compiled code can build).
+fn host_field_offset_str(
+    db: &tesjit_dwarf::TypeDb,
+    ty: &str,
+    field: &str,
+) -> Option<u32> {
+    let def = db.get(ty)?;
+    let tesjit_dwarf::TypeArgs::Struct(fields) = &def.args else {
+        return None;
+    };
+    fields
+        .fields
+        .iter()
+        .find(|f| f.name == field)
+        .map(|f| f.offset as u32)
 }
