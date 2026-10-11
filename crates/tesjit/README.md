@@ -95,6 +95,10 @@ layouts match without guessing — see `tests::type_db_offsets_drive_region_acce
 for an end-to-end test that exports a struct and reads a real Rust value through
 it.
 
+Row helpers on the host side (`row_get_f32`, ...) are the ergonomic layer over
+this: they compute `index * stride + field` for the mod and go through the same
+bounds checks.
+
 ## Sandbox (Phase 4)
 
 Mod code cannot take the process down:

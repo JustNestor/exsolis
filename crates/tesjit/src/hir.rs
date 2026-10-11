@@ -140,6 +140,14 @@ pub enum Intrinsic {
     ArrPush,
     /// `(array, index, elem_size) -> value`
     ArrGet,
+    /// `(region, offset) -> f64` (reads an `f32` and widens it)
+    LoadF32,
+    /// `(region, offset) -> i64`
+    LoadI64,
+    /// `(region, offset, f64) -> f64` (narrows to an `f32`)
+    StoreF32,
+    /// `(region, offset, i64) -> i64`
+    StoreI64,
     /// `(region, offset) -> f64`
     LoadF64,
     /// `(region, offset) -> i32`
@@ -160,6 +168,11 @@ pub enum Intrinsic {
 /// The names are reserved: a mod cannot define its own `load_f64`.
 pub const BUILTINS: &[(&str, Intrinsic)] = &[
     ("load_f64", Intrinsic::LoadF64),
+    ("load_f32", Intrinsic::LoadF32),
+    ("load_i64", Intrinsic::LoadI64),
+    ("store_f64", Intrinsic::StoreF64),
+    ("store_f32", Intrinsic::StoreF32),
+    ("store_i64", Intrinsic::StoreI64),
     ("load_i32", Intrinsic::LoadI32),
     ("store_f64", Intrinsic::StoreF64),
     ("store_i32", Intrinsic::StoreI32),
@@ -180,8 +193,12 @@ impl Intrinsic {
             Intrinsic::ArrLen => "__tesjit_arr_len",
             Intrinsic::ArrPush => "__tesjit_arr_push",
             Intrinsic::LoadF64 => "__tesjit_load_f64",
+            Intrinsic::LoadF32 => "__tesjit_load_f32",
+            Intrinsic::LoadI64 => "__tesjit_load_i64",
             Intrinsic::LoadI32 => "__tesjit_load_i32",
             Intrinsic::StoreF64 => "__tesjit_store_f64",
+            Intrinsic::StoreF32 => "__tesjit_store_f32",
+            Intrinsic::StoreI64 => "__tesjit_store_i64",
             Intrinsic::StoreI32 => "__tesjit_store_i32",
             Intrinsic::RegionId => "__tesjit_region_id",
             Intrinsic::ArrGet => "__tesjit_arr_get",

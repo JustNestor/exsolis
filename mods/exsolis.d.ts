@@ -38,6 +38,56 @@ declare function render_xml(file: string): string;
 /** Register a keybind on the client. */
 declare function register_keybind(id: string, default_key: string, description: string): void;
 
+// ───────────────────────── query rows ─────────────────────────
+//
+// The hands the mod a *view* of the world for one tick: a packed array of rows
+// in host memory. Rows are read and written through host functions that own
+// the offset math, so no mod ever hardcodes a byte offset — and every layout
+// is cross-checked against the type database exported from the server binary
+// (`just export-types`), so a Rust-side layout change is caught, not silently
+// wrong.
+
+/** Region id of this tick's player rows (0 when there is none). */
+declare function query_players(): i32;
+
+/** Number of rows in a query region. */
+declare function query_row_count(region: i32): i32;
+
+/** Byte size of one row. */
+declare function row_stride(): i32;
+
+/** Byte offset of one row field ("x", "y", "z", "id"), or -1. */
+declare function row_offset(field: string): i32;
+
+/** Read a float field of row `index`. */
+declare function row_get_f32(index: i32, field: string): f64;
+
+/** Write a float field of row `index`; applied to the world after the tick. */
+declare function row_set_f32(index: i32, field: string, value: f64): f64;
+
+/** Read a machine-word field of row `index` (e.g. "id"). */
+declare function row_get_i64(index: i32, field: string): i32;
+
+/** Write a machine-word field of row `index`. */
+declare function row_set_i64(index: i32, field: string, value: i32): i32;
+
+// ───────────────────────── builtins ─────────────────────────
+//
+// Runtime helpers shipped with the engine; they take no `declare`, and a mod
+// cannot define functions with these names. They are the raw form of the row
+// API above — bounds-checked, and intended for reading structures the host has
+// not wrapped yet.
+
+declare function load_f64(region: i32, offset: i32): f64;
+declare function load_f32(region: i32, offset: i32): f64;
+declare function load_i64(region: i32, offset: i32): i32;
+declare function load_i32(region: i32, offset: i32): i32;
+declare function store_f64(region: i32, offset: i32, value: f64): f64;
+declare function store_f32(region: i32, offset: i32, value: f64): f64;
+declare function store_i64(region: i32, offset: i32, value: i32): i32;
+declare function store_i32(region: i32, offset: i32, value: i32): i32;
+declare function region_id(name: string): i32;
+
 // ───────────────────────── handlers ─────────────────────────
 //
 // Export any of these; the host calls them when the matching thing happens.

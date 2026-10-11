@@ -146,6 +146,15 @@ impl<'a> Lowerer<'a> {
                 }
             };
             if f.declare || f.body.is_none() {
+                // Builtins are runtime symbols, not host functions: declaring
+                // them is a mistake worth a clear message about.
+                if crate::hir::BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
+                    self.at(
+                        f.span,
+                        format!("`{name}` is a builtin — it needs no `declare`"),
+                    );
+                    continue;
+                }
                 // `declare function name(...)`: must match a registered host
                 // function exactly.
                 match self.host.get(&name) {
@@ -549,13 +558,17 @@ impl<'a, 'l> FnCtx<'a, 'l> {
     /// the same adaptation machinery (`i32` ↔ machine word) applies as for any
     /// other intrinsic call.
     fn builtin_call(&mut self, intrinsic: Intrinsic, c: &oxc_ast::ast::CallExpression<'_>) -> Expr {
-        use Intrinsic::{LoadF64, LoadI32, RegionId, StoreF64, StoreI32};
+        use Intrinsic::{
+            LoadF32, LoadF64, LoadI32, LoadI64, RegionId, StoreF32, StoreF64, StoreI32, StoreI64,
+        };
         // TS-facing signature; the codegen widens to the runtime's machine
         // words exactly like any other intrinsic call.
         let (params, ret) = match intrinsic {
-            LoadF64 => (vec![Ty::I32, Ty::I32], Ty::F64),
+            LoadF64 | LoadF32 => (vec![Ty::I32, Ty::I32], Ty::F64),
+            LoadI64 => (vec![Ty::I32, Ty::I32], Ty::I32),
             LoadI32 => (vec![Ty::I32, Ty::I32], Ty::I32),
-            StoreF64 => (vec![Ty::I32, Ty::I32, Ty::F64], Ty::F64),
+            StoreF64 | StoreF32 => (vec![Ty::I32, Ty::I32, Ty::F64], Ty::F64),
+            StoreI64 => (vec![Ty::I32, Ty::I32, Ty::I32], Ty::I32),
             StoreI32 => (vec![Ty::I32, Ty::I32, Ty::I32], Ty::I32),
             RegionId => (vec![Ty::Str], Ty::I32),
             _ => unreachable!("builtin_call only handles region intrinsics"),

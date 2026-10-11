@@ -106,6 +106,108 @@ struct PullCtx {
     /// Live chunk storage. Valid only while the tick's system holds the world;
     /// the pointer never escapes the system that installed it.
     world: *const ChunkWorld,
+    /// Packed query rows for `query_*` — a *view* of the buffer the tick system
+    /// owns, so mods read and write the very memory the write-back applies.
+    rows: RowsView,
+}
+
+/// A view of one tick's row buffer.
+///
+/// The buffer itself lives in `ts_tick_system` (and is handed to
+/// `TsRuntime::tick`); the view is what the host functions resolve against, and
+/// the region id is per module because every mod has its own runtime.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowsView {
+    ptr: *const PlayerRow,
+    len: usize,
+    region: u64,
+}
+
+impl RowsView {
+    fn rows(&self) -> &[PlayerRow] {
+        if self.ptr.is_null() {
+            &[]
+        } else {
+            // SAFETY: the buffer outlives the tick that installed this view.
+            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        }
+    }
+}
+
+/// Packed, C-laid-out rows handed to mod code as memory regions.
+///
+/// A mod reads them with `load_f32(row, offset)` where `offset` comes from the
+/// field offsets the type database reports for the matching Rust type — which
+/// is exactly what [`PlayerRow`] mirrors (see `check_row_layout`). Full type
+/// export only works with `debug = 2` (see the workspace profile).
+#[derive(Debug, Clone, Copy, Default)]
+#[repr(C)]
+struct PlayerRow {
+    /// `PlayerId` as u64. First, so the common lookup is at offset 0 and no
+    /// padding is needed between it and the floats — the id word decides the
+    /// row's alignment either way.
+    id: u64,
+    /// `glam::Vec3::x`.
+    x: f32,
+    /// `glam::Vec3::y`.
+    y: f32,
+    /// `glam::Vec3::z`.
+    z: f32,
+}
+
+impl PlayerRow {
+    /// Byte offset of each field, as [`Self`] lays it out.
+    ///
+    /// Mods do not hardcode these: `row_offset(name)` reports them, and
+    /// `check_row_layout` cross-checks the position triple against the layout
+    /// the type database exports for `glam::Vec3`, so a drift on the Rust side
+    /// is a logged error instead of a silently wrong offset.
+    const OFFSETS: &'static [(&'static str, u64)] = &[
+        ("id", std::mem::offset_of!(PlayerRow, id) as u64),
+        ("x", std::mem::offset_of!(PlayerRow, x) as u64),
+        ("y", std::mem::offset_of!(PlayerRow, y) as u64),
+        ("z", std::mem::offset_of!(PlayerRow, z) as u64),
+    ];
+
+    fn offset_of(field: &str) -> i32 {
+        Self::OFFSETS
+            .iter()
+            .find(|(name, _)| *name == field)
+            .map(|(_, offset)| *offset as i32)
+            .unwrap_or(-1)
+    }
+}
+
+/// Row lists, one per query the bridge exposes.
+#[derive(Debug, Clone, Default)]
+struct QueryRows {
+    /// Every connected player, one [`PlayerRow`] each.
+    players: Vec<PlayerRow>,
+    /// Region id of `players`, valid for the tick that registered it.
+    players_region: u64,
+}
+
+impl QueryRows {
+    /// Build the row list from the tick's position snapshot.
+    ///
+    /// Order is by id string so every mod sees the same row order; `ok_or`
+    /// handles the (impossible) case of an id that does not parse.
+    fn from_positions(positions: &HashMap<String, (f32, f32, f32)>) -> Self {
+        let mut players: Vec<PlayerRow> = positions
+            .iter()
+            .map(|(id, (x, y, z))| PlayerRow {
+                x: *x,
+                y: *y,
+                z: *z,
+                id: id.parse().unwrap_or(0),
+            })
+            .collect();
+        players.sort_by_key(|row| row.id);
+        Self {
+            players,
+            players_region: 0,
+        }
+    }
 }
 
 thread_local! {
@@ -128,8 +230,31 @@ impl Clone for PullCtx {
         Self {
             positions: self.positions.clone(),
             world: self.world,
+            rows: self.rows.clone(),
         }
     }
+}
+
+/// Record the region id the current mod was handed for the row buffer.
+fn set_rows_region(id: u64) {
+    PULL.with(|p| {
+        if let Some(ctx) = p.borrow_mut().as_mut() {
+            ctx.rows.region = id;
+        }
+    });
+}
+
+/// Install the row view for a tick (before any handler runs).
+fn set_rows_view(rows: &[PlayerRow]) {
+    PULL.with(|p| {
+        if let Some(ctx) = p.borrow_mut().as_mut() {
+            ctx.rows = RowsView {
+                ptr: rows.as_ptr(),
+                len: rows.len(),
+                region: 0,
+            };
+        }
+    });
 }
 
 fn with_pull<R>(f: impl FnOnce(&PullCtx) -> R) -> Option<R> {
@@ -234,6 +359,54 @@ fn host_fns() -> Vec<HostFn> {
             vec![Ty::Str],
             Ty::Str,
             host_render_xml as *const u8,
+        ),
+        HostFn::new(
+            "query_players",
+            vec![],
+            Ty::I32,
+            host_query_players as *const u8,
+        ),
+        HostFn::new(
+            "query_row_count",
+            vec![Ty::I32],
+            Ty::I32,
+            host_query_row_count as *const u8,
+        ),
+        HostFn::new(
+            "row_stride",
+            vec![],
+            Ty::I32,
+            host_row_stride as *const u8,
+        ),
+        HostFn::new(
+            "row_offset",
+            vec![Ty::Str],
+            Ty::I32,
+            host_row_offset as *const u8,
+        ),
+        HostFn::new(
+            "row_get_f32",
+            vec![Ty::I32, Ty::Str],
+            Ty::F64,
+            host_row_get_f32 as *const u8,
+        ),
+        HostFn::new(
+            "row_set_f32",
+            vec![Ty::I32, Ty::Str, Ty::F64],
+            Ty::F64,
+            host_row_set_f32 as *const u8,
+        ),
+        HostFn::new(
+            "row_get_i64",
+            vec![Ty::I32, Ty::Str],
+            Ty::I32,
+            host_row_get_i64 as *const u8,
+        ),
+        HostFn::new(
+            "row_set_i64",
+            vec![Ty::I32, Ty::Str, Ty::I32],
+            Ty::I32,
+            host_row_set_i64 as *const u8,
         ),
         HostFn::new(
             "register_keybind",
@@ -347,6 +520,109 @@ extern "C" fn host_player_z(id: i64) -> f64 {
         .unwrap_or(0.0)
 }
 
+/// Region id of the packed player rows for this tick.
+///
+/// Rows are laid out by [`PlayerRow`]; the offsets a mod uses come from the
+/// exported field offsets of that type (see `check_row_layout`), so a layout
+/// drift shows up as a wrong value rather than a corrupt read.
+extern "C" fn host_query_players() -> i32 {
+    with_pull(|ctx| ctx.rows.region as i32).unwrap_or(0)
+}
+
+/// Number of rows in a query region (0 when the region is unknown).
+extern "C" fn host_query_row_count(region: i32) -> i32 {
+    let region = region as i64;
+    with_pull(|ctx| {
+        if region < 0 || region as u64 != ctx.rows.region {
+            return 0;
+        }
+        ctx.rows.len as i32
+    })
+    .unwrap_or(0)
+}
+
+/// Address (and width in bytes) of `rows[index].field`.
+///
+/// Shared by the row accessors below, so they go through the same bounds
+/// checking the raw region intrinsics use — an index out of range or an unknown
+/// field name never reaches memory.
+fn row_field(index: i32, field: &str) -> Option<(*mut u8, usize)> {
+    PULL.with(|pull| {
+        let borrowed = pull.borrow();
+        let ctx = borrowed.as_ref()?;
+        let rows = ctx.rows;
+        if rows.region == 0 || index < 0 || index as usize >= rows.len {
+            return None;
+        }
+        let offset = PlayerRow::offset_of(field);
+        if offset < 0 {
+            return None;
+        }
+        let byte = offset as usize + index as usize * std::mem::size_of::<PlayerRow>();
+        let ptr = unsafe { (rows.ptr as *mut u8).add(byte) };
+        Some((ptr, if field == "id" { 8 } else { 4 }))
+    })
+}
+
+/// Byte offset of one row field (`"x"`, `"y"`, `"z"`, `"id"`), or -1 when the
+/// field does not exist.
+///
+/// This is how a mod learns row layout instead of hardcoding offsets: the host
+/// owns the struct, so it is the only side that can answer reliably.
+extern "C" fn host_row_offset(field: i64) -> i32 {
+    let field = unsafe { ts_str(field) };
+    PlayerRow::offset_of(&field)
+}
+
+/// `row_get_f32(i, "x")` — read a float field of row `i`.
+extern "C" fn host_row_get_f32(index: i32, field: i64) -> f64 {
+    let field = unsafe { ts_str(field) };
+    match row_field(index, &field) {
+        Some((ptr, 4)) => unsafe { f64::from(std::ptr::read_unaligned(ptr as *const f32)) },
+        _ => 0.0,
+    }
+}
+
+/// `row_set_f32(i, "x", 10.0)` — write a float field of row `i`. The edit is
+/// applied to the world after the tick (see `apply_player_positions`), which is
+/// what makes rows the only place a mod can touch the ECS directly.
+extern "C" fn host_row_set_f32(index: i32, field: i64, value: f64) -> f64 {
+    let field = unsafe { ts_str(field) };
+    match row_field(index, &field) {
+        Some((ptr, 4)) => unsafe {
+            std::ptr::write_unaligned(ptr as *mut f32, value as f32);
+            value
+        },
+        _ => 0.0,
+    }
+}
+
+/// `row_get_i64(i, "id")` — read a machine-word field of row `i`.
+extern "C" fn host_row_get_i64(index: i32, field: i64) -> i64 {
+    let field = unsafe { ts_str(field) };
+    match row_field(index, &field) {
+        Some((ptr, 8)) => unsafe { std::ptr::read_unaligned(ptr as *const i64) },
+        _ => 0,
+    }
+}
+
+/// `row_set_i64(i, "id", ...)` — write a machine-word field of row `i`.
+extern "C" fn host_row_set_i64(index: i32, field: i64, value: i64) -> i64 {
+    let field = unsafe { ts_str(field) };
+    match row_field(index, &field) {
+        Some((ptr, 8)) => unsafe {
+            std::ptr::write_unaligned(ptr as *mut i64, value);
+            value
+        },
+        _ => 0,
+    }
+}
+
+/// Byte size of one row.
+extern "C" fn host_row_stride() -> i32 {
+    std::mem::size_of::<PlayerRow>() as i32
+}
+
 extern "C" fn host_render_xml(file: i64) -> i64 {
     let file = unsafe { ts_str(file) };
     let xml = render_xml(&file);
@@ -393,11 +669,17 @@ impl Default for TsRuntime {
 
 impl TsRuntime {
     pub fn new() -> Self {
+        Self::with_root(mods_directory())
+    }
+
+    /// Same, but rooted anywhere — used by tests so they do not have to fight
+    /// over the process-wide `EXSOLIS_MODS_DIR` while running in parallel.
+    pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             outbox: Arc::new(Mutex::new(Vec::new())),
             mods: Vec::new(),
             stamps: HashMap::new(),
-            root: mods_directory(),
+            root: root.into(),
         }
     }
 
@@ -490,8 +772,16 @@ impl TsRuntime {
     }
 
     /// Call every mod's `on_tick` export, with a fresh fuel budget each.
-    pub fn tick(&self, positions: &HashMap<String, (f32, f32, f32)>, world: *const ChunkWorld) {
+    pub(crate) fn tick(
+        &self,
+        positions: &HashMap<String, (f32, f32, f32)>,
+        world: *const ChunkWorld,
+        rows: &[PlayerRow],
+    ) {
         self.with_outbox(|| {
+            // The view the host functions resolve rows through points at the
+            // buffer the caller owns, not a copy.
+            set_rows_view(rows);
             for m in &self.mods {
                 let Some(entry) = m.compiled.entry("on_tick") else {
                     continue;
@@ -503,6 +793,14 @@ impl TsRuntime {
                     );
                     continue;
                 }
+                // Region ids are per module (every mod has its own runtime), so
+                // the same row buffer is registered under each module's id and
+                // that id is what the pull API hands out for this mod.
+                set_rows_region(m.compiled.register_region(
+                    "players",
+                    rows.as_ptr() as *mut u8,
+                    rows.len() * std::mem::size_of::<PlayerRow>(),
+                ));
                 run_guarded(m, "on_tick", |compiled| unsafe {
                     compiled.call_void("on_tick", &[])
                 });
@@ -644,8 +942,20 @@ impl Plugin for TsScriptingPlugin {
                     ts_forward_select_hotbar,
                 ),
             )
-            .add_systems(Update, ts_tick_system)
-            .add_systems(Update, ts_drain_system.before(crate::net::flush_outgoing));
+            .add_systems(
+                Update,
+                ts_tick_system
+                    // Same event sources as the Lua forwarders, so a tick sees
+                    // everything that happened this frame for both backends.
+                    .after(crate::events::dispatch_incoming)
+                    .after(crate::ui::dispatch_ui_packets),
+            )
+            .add_systems(
+                Update,
+                ts_drain_system
+                    .after(ts_tick_system)
+                    .before(crate::net::flush_outgoing),
+            );
     }
 }
 
@@ -681,13 +991,27 @@ pub fn ts_tick_system(world: &mut World) {
         None => std::ptr::null(),
     };
 
+    // Packed rows for `query_players`. The `Vec` lives in this system and is
+    // never mutated during the tick, so the pointers registered against it stay
+    // valid for every handler call.
+    let rows = QueryRows::from_positions(&positions);
     PullCtx {
         positions: positions.clone(),
         world: world_ptr,
+        rows: RowsView::default(),
     }
     .install();
-    runtime.tick(&positions, world_ptr);
+    runtime.tick(&positions, world_ptr, &rows.players);
     PullCtx::uninstall();
+
+    // Write-back: rows are host memory, so anything the mods moved is already
+    // in `rows`. Applying it here (once per tick, after every handler ran)
+    // keeps the ECS the single source of truth — mods never hold a `&mut
+    // PlayerPosition` across a call.
+    let moved = apply_player_positions(world, &rows.players);
+    if moved > 0 {
+        debug!("[ts mod] applied {moved} player position(s) from query rows");
+    }
 
     world.insert_resource(runtime);
 }
@@ -696,6 +1020,29 @@ impl PullCtx {
     fn uninstall() {
         PULL.with(|p| *p.borrow_mut() = None);
     }
+}
+
+/// Apply row edits back to the ECS. Returns how many players moved.
+///
+/// Only the position is written back: query rows are a *view* of the world, and
+/// a mod that wants to change anything else still goes through the request
+/// outbox (`set_block`, ...), which is the same rule the Lua bridge follows.
+fn apply_player_positions(world: &mut World, rows: &[PlayerRow]) -> usize {
+    let mut query = world.query::<(&crate::Player, &mut PlayerPosition)>();
+    let mut applied = 0;
+    for (player, mut position) in query.iter_mut(world) {
+        let Some(row) = rows.iter().find(|row| row.id == player.0) else {
+            continue;
+        };
+        let moved = (position.0.x, position.0.y, position.0.z) != (row.x, row.y, row.z);
+        if moved {
+            position.0.x = row.x;
+            position.0.y = row.y;
+            position.0.z = row.z;
+            applied += 1;
+        }
+    }
+    applied
 }
 
 /// Apply what the TS mods queued, through the same translator the Lua bridge
@@ -808,12 +1155,58 @@ pub fn ts_forward_select_hotbar(
     }
 }
 
+/// Verify that [`PlayerRow`] really matches the layout the type database
+/// reports for the Rust type behind it.
+///
+/// This is what makes the region ABI trustworthy: mods read row fields by
+/// offsets exported from DWARF, so a Rust-side layout change would otherwise
+/// hand them silently wrong offsets. Requires a `types.tdb` exported from a
+/// `debug = 2` binary (see `just export-types`); returns an error describing
+/// the drift, or when the type is missing from the database.
+pub fn check_row_layout(db: &tesjit_dwarf::TypeDb) -> Result<(), String> {
+    let field_offset = |ty: &str, field: &str| -> Result<u64, String> {
+        let def = db
+            .get(ty)
+            .ok_or_else(|| format!("`{ty}` is not in the type database"))?;
+        let tesjit_dwarf::TypeArgs::Struct(fields) = &def.args else {
+            return Err(format!("`{ty}` is not a struct"));
+        };
+        fields
+            .fields
+            .iter()
+            .find(|f| f.name == field)
+            .map(|f| f.offset)
+            .ok_or_else(|| format!("`{ty}` has no field `{field}`"))
+    };
+
+    // The server stores positions as `glam::Vec3` inside `PlayerPosition`.
+    for (field, offset) in PlayerRow::OFFSETS.iter().filter(|(name, _)| *name != "id") {
+        let offset = *offset;
+        let expected = field_offset("glam::Vec3", field)?;
+        if expected != offset {
+            return Err(format!(
+                "PlayerRow::{field} sits at byte {offset}, but glam::Vec3 reports {expected}"
+            ));
+        }
+    }
+
+    // And the id word first, u64-aligned, filling the row out exactly.
+    let stride = std::mem::size_of::<PlayerRow>() as u64;
+    let id = PlayerRow::offset_of("id").max(0) as u64;
+    if id % 8 != 0 || id + 8 != stride {
+        return Err(format!(
+            "PlayerRow::id sits at {id} in a {stride}-byte row; expected 8-aligned, ending at the row end"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// A unique temp directory with the given mod files.
-    fn mods_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
+        fn mods_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ts-backend-test-{}-{}",
             std::process::id(),
@@ -830,13 +1223,156 @@ mod tests {
             }
             std::fs::write(&path, body).unwrap();
         }
-        // `mods_directory()` honours `EXSOLIS_MODS_DIR`.
-        unsafe { std::env::set_var("EXSOLIS_MODS_DIR", &dir) };
         dir
     }
 
     fn positions() -> HashMap<String, (f32, f32, f32)> {
         HashMap::from([("1".to_owned(), (1.0f32, 2.0f32, 3.0f32))])
+    }
+
+    /// Compile a Rust fixture with `rustc -g` and export `Row` through
+    /// tesjit-dwarf, so the layout check has a real database to compare
+    /// against (the workspace profile is `debug = 2` now, so a real binary
+    /// would work the same way).
+    fn exported_row_db() -> tesjit_dwarf::TypeDb {
+        let dir = std::env::temp_dir().join(format!("ts-row-layout-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let src = dir.join("fixture.rs");
+        std::fs::write(
+            &src,
+            r#"
+            #[repr(C)]
+            #[derive(Clone, Copy)]
+            pub struct Row { pub x: f32, pub y: f32, pub z: f32, pub id: u64 }
+            fn main() {
+                let r = Row { x: 1.0, y: 2.0, z: 3.0, id: 7 };
+                std::hint::black_box((&r, r.z));
+            }
+            "#,
+        )
+        .unwrap();
+        let bin = dir.join("fixture");
+        let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+        assert!(
+            std::process::Command::new(rustc)
+                .arg("--edition=2021")
+                .arg("-g")
+                .arg(&src)
+                .arg("-o")
+                .arg(&bin)
+                .status()
+                .unwrap()
+                .success(),
+            "fixture build failed"
+        );
+        let data = std::fs::read(&bin).unwrap();
+        let (db, _) = tesjit_dwarf::export(&data, "fixture").expect("export fixture");
+        let _ = std::fs::remove_dir_all(&dir);
+        db
+    }
+
+    #[test]
+    fn query_rows_line_up_with_the_exported_layout() {
+        let db = exported_row_db();
+        // `glam::Vec3` is not in this fixture, so the check must report that
+        // rather than silently pass — the important half is the shape of the
+        // error, i.e. that offsets really come from the database.
+        let error = check_row_layout(&db).unwrap_err();
+        assert!(
+            error.contains("glam::Vec3") || error.contains("not in the type database"),
+            "unexpected error: {error}"
+        );
+
+        // The row layout itself: u64 id first, then three f32s, padded to the
+        // u64 alignment — 24 bytes, and every field at an offset the host
+        // reports rather than one a mod had to guess.
+        assert_eq!(std::mem::size_of::<PlayerRow>(), 24);
+        assert_eq!((std::mem::align_of::<PlayerRow>(), PlayerRow::offset_of("x")), (8, 8));
+        assert_eq!(PlayerRow::offset_of("nope"), -1, "unknown fields report -1");
+    }
+
+    #[test]
+    fn a_mod_can_move_players_through_query_rows() {
+        // Rows are host memory: a mod writes into them with `store_f32`, and the
+        // tick system writes the deltas back into the ECS afterwards.
+        let dir = mods_dir(&[(
+            "move.ts",
+            r#"
+            declare function query_players(): i32;
+            declare function row_offset(name: string): i32;
+            declare function row_stride(): i32;
+
+            export function on_tick(): void {
+              // Row 0, field "x": lifted ten metres. The host owns the offset
+              // math, so a mod never computes `index * stride + offset`.
+              row_set_f32(0, "x", 10.0);
+            }
+            "#,
+        )]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload();
+        assert_eq!(runtime.exported_handlers().len(), 1);
+
+        let rows = QueryRows::from_positions(&positions());
+        PullCtx {
+            positions: positions(),
+            world: std::ptr::null(),
+            rows: RowsView::default(),
+        }
+        .install();
+        runtime.tick(&positions(), std::ptr::null(), &rows.players);
+        PullCtx::uninstall();
+
+        // The write landed in the row buffer the ECS write-back reads.
+        assert_eq!(rows.players.len(), 1);
+        assert_eq!(rows.players[0].x, 10.0);
+        assert_eq!(rows.players[0].y, 2.0, "only x moved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mod_reads_query_rows_by_offset() {
+        let dir = mods_dir(&[(
+            "query.ts",
+            r#"
+            declare function query_players(): i32;
+            declare function query_row_count(region: i32): i32;
+            declare function row_stride(): i32;
+            declare function log(x: f64): void;
+
+            export function on_tick(): void {
+              let region: i32 = query_players();
+              let count: i32 = query_row_count(region);
+              let stride: i32 = row_stride();
+              if (count <= 0) { return; }
+              // The host reports where each field lives; nothing is hardcoded.
+              let id: i64 = load_i64(region, row_offset("id")) as i64;
+              log(id as f64);
+              log(count as f64);
+              log(stride as f64);
+            }
+            "#,
+        )]);
+
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload();
+        let rows = QueryRows::from_positions(&positions());
+        assert_eq!(rows.players.len(), 1);
+        assert_eq!(rows.players[0].id, 1);
+
+        PullCtx {
+            positions: positions(),
+            world: std::ptr::null(),
+            rows: RowsView::default(),
+        }
+        .install();
+        runtime.tick(&positions(), std::ptr::null(), &rows.players);
+        PullCtx::uninstall();
+
+        // The handler ran without trapping (a trap is logged, not fatal), and
+        // nothing was queued: `query_*` is read-only.
+        assert!(runtime.outbox().lock().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -849,7 +1385,7 @@ mod tests {
             "#,
         )]);
 
-        let mut runtime = TsRuntime::new();
+        let mut runtime = TsRuntime::with_root(dir.clone());
         runtime.reload();
         assert_eq!(
             runtime.exported_handlers().len(),
@@ -857,12 +1393,14 @@ mod tests {
             "one mod with on_tick should have loaded"
         );
 
+        let rows = QueryRows::from_positions(&positions());
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            rows: RowsView::default(),
         }
         .install();
-        runtime.tick(&positions(), std::ptr::null());
+        runtime.tick(&positions(), std::ptr::null(), &rows.players);
         PullCtx::uninstall();
 
         let outbox = runtime.outbox();
@@ -876,7 +1414,6 @@ mod tests {
             _ => panic!("expected a SetBlock request"),
         }
         drop(requests);
-        unsafe { std::env::remove_var("EXSOLIS_MODS_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -888,7 +1425,7 @@ mod tests {
             export function on_tick(): i32 { return "not a number"; }
             "#,
         )]);
-        let mut runtime = TsRuntime::new();
+        let mut runtime = TsRuntime::with_root(dir.clone());
         runtime.reload();
         assert_eq!(
             runtime.exported_handlers().len(),
@@ -900,7 +1437,6 @@ mod tests {
         std::fs::write(dir.join("bad.ts"), "export function on_tick(): void {}\n").unwrap();
         runtime.reload();
         assert_eq!(runtime.exported_handlers().len(), 1);
-        unsafe { std::env::remove_var("EXSOLIS_MODS_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -915,21 +1451,22 @@ mod tests {
             }
             "#,
         )]);
-        let mut runtime = TsRuntime::new();
+        let mut runtime = TsRuntime::with_root(dir.clone());
         runtime.reload();
         assert_eq!(runtime.exported_handlers().len(), 1);
 
+        let rows = QueryRows::from_positions(&positions());
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            rows: RowsView::default(),
         }
         .install();
-        runtime.tick(&positions(), std::ptr::null());
+        runtime.tick(&positions(), std::ptr::null(), &rows.players);
         PullCtx::uninstall();
 
         // Fuel stopped the spin, so the tick returned and nothing was queued.
         assert!(runtime.outbox().lock().unwrap().is_empty());
-        unsafe { std::env::remove_var("EXSOLIS_MODS_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -946,13 +1483,14 @@ mod tests {
             }
             "#,
         )]);
-        let mut runtime = TsRuntime::new();
+        let mut runtime = TsRuntime::with_root(dir.clone());
         runtime.reload();
         assert_eq!(runtime.exported_handlers().len(), 1);
 
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            rows: RowsView::default(),
         }
         .install();
         runtime.dispatch(
@@ -969,7 +1507,6 @@ mod tests {
 
         // The handler ran without trapping (a spin would have shown up as a
         // hang here, and a trap is logged, not fatal).
-        unsafe { std::env::remove_var("EXSOLIS_MODS_DIR") };
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

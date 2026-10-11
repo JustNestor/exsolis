@@ -79,6 +79,7 @@ naga = {version="30.0.1", features = ["spv-out", "wgsl-in"]}
 zrip = "0.8.11"
 fastpack = { package = "fastpak", path = "./crates/fastpak" }
 tesjit-dwarf = { path = "./crates/tesjit-dwarf" }
+tesjit = { path = "./crates/tesjit" }
 
 
 # [workspace.dependencies.bevy_mod_scripting]
@@ -94,7 +95,11 @@ tesjit-dwarf = { path = "./crates/tesjit-dwarf" }
 
 [profile.dev]
 opt-level = 1
-debug = "line-tables-only"
+# `debug = 2` (full) rather than "line-tables-only": the type database that the
+# mod bridge loads (`cargo run -p tesjit-dwarf -- target/debug/exsolis_server_bin`)
+# reads struct layouts out of DWARF, and line tables carry none. Cost is build
+# time and binary size in dev only.
+debug = 2
 split-debuginfo = "unpacked"
 lto = false
 

@@ -233,6 +233,10 @@ impl TesjitRuntime {
     /// Expose a host memory region to the module (replacing any region with
     /// the same name). Returns the id JIT code passes to the load/store
     /// intrinsics.
+    ///
+    /// Ids start at 1: 0 is reserved to mean "no region", which is what makes
+    /// the host side able to tell "never registered" from a real id without an
+    /// `Option` in the ABI.
     pub fn register_region(&self, name: impl Into<String>, ptr: *mut u8, len: usize) -> u64 {
         let name = name.into();
         let mut regions = self.regions.borrow_mut();
@@ -241,7 +245,7 @@ impl TesjitRuntime {
             existing.len = len;
             return existing.id;
         }
-        let id = regions.len() as u64;
+        let id = regions.len() as u64 + 1;
         regions.push(Region {
             id,
             name,
@@ -620,6 +624,56 @@ extern "C" fn store_f64(id: i64, offset: i64, value: f64) -> f64 {
     value
 }
 
+/// Read an `f32` and widen it to `f64` (positions in query rows are f32).
+extern "C" fn load_f32(id: i64, offset: i64) -> f64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0.0;
+    };
+    if offset < 0 || offset + 4 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    unsafe { f64::from(std::ptr::read_unaligned(ptr.add(offset as usize) as *const f32)) }
+}
+
+/// Read a full machine word.
+extern "C" fn load_i64(id: i64, offset: i64) -> i64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0;
+    };
+    if offset < 0 || offset + 8 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    unsafe { std::ptr::read_unaligned(ptr.add(offset as usize) as *const i64) }
+}
+
+/// Write an `f32` (narrowed from the f64 a mod hands over).
+extern "C" fn store_f32(id: i64, offset: i64, value: f64) -> f64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0.0;
+    };
+    if offset < 0 || offset + 4 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    unsafe { std::ptr::write_unaligned(ptr.add(offset as usize) as *mut f32, value as f32) };
+    value
+}
+
+/// Write a full machine word.
+extern "C" fn store_i64(id: i64, offset: i64, value: i64) -> i64 {
+    let Some((ptr, len)) = region_ptr(id) else {
+        return 0;
+    };
+    if offset < 0 || offset + 8 > len as i64 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    unsafe { std::ptr::write_unaligned(ptr.add(offset as usize) as *mut i64, value) };
+    value
+}
+
 extern "C" fn store_i32(id: i64, offset: i64, value: i64) -> i64 {
     let Some((ptr, len)) = region_ptr(id) else {
         return 0;
@@ -664,6 +718,10 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("__tesjit_arr_set", arr_set as *const u8),
         ("__tesjit_load_f64", load_f64 as *const u8),
         ("__tesjit_load_i32", load_i32 as *const u8),
+        ("__tesjit_load_f32", load_f32 as *const u8),
+        ("__tesjit_load_i64", load_i64 as *const u8),
+        ("__tesjit_store_f32", store_f32 as *const u8),
+        ("__tesjit_store_i64", store_i64 as *const u8),
         ("__tesjit_store_f64", store_f64 as *const u8),
         ("__tesjit_store_i32", store_i32 as *const u8),
         ("__tesjit_region_id", region_id as *const u8),
