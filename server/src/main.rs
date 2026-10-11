@@ -24,19 +24,14 @@ mod assets;
 mod chunks;
 mod entities;
 mod events;
-// Public so the client can reuse `normalize_glb_textures` when loading a
-// committed `.glb` straight off disk (the server normalizes at catalog build
-// time; a locally-run client has to do the same or a WebP-textured model
-// fails to load).
-// `gltf_pack` is declared in `lib.rs` so the client can reuse
-// `normalize_glb_textures`; bring it into this binary's root namespace so
-// the existing `crate::gltf_pack::…` paths keep working.
-use exsolis_server::gltf_pack;
 mod interaction;
 mod movement;
 mod net;
 mod network;
 mod scripting;
+#[cfg(feature = "advanced_worldgen")]
+mod terrain;
+mod ts_backend;
 mod typedb;
 mod ui;
 mod ui_template;
@@ -50,6 +45,7 @@ use crate::interaction::InteractionPlugin;
 use crate::net::NetPlugin;
 use crate::scripting::ScriptingPlugin;
 use crate::ui::UiPlugin;
+use exsolis_server::gltf_pack;
 // mod level;
 
 #[derive(Component)]
@@ -149,6 +145,7 @@ fn main() {
         .add_plugins(InteractionPlugin)
         .add_plugins(UiPlugin)
         .add_plugins(ScriptingPlugin)
+        .add_plugins(ts_backend::TsScriptingPlugin)
         .insert_resource(RenetServer::new(connection_config()))
         .insert_resource(new_transport())
         .init_resource::<PlayerMap>()

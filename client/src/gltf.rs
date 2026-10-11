@@ -1445,8 +1445,8 @@ const PALETTE_STRIDE: usize = 256;
 /// Where the first-person arms sit relative to the eye.
 ///
 /// The arms' vertices are in model space at shoulder height. The shoulder
-/// pivot (in model space) is baked into the instance matrix as `T(-pivot)`
-/// so the geometry stays in true model space and the bone palette is left
+/// pivot (in model space) is accounted for in the translation component so
+/// the geometry stays in true model space and the bone palette is left
 /// exactly as the body's — see [`crate::anim::rig::arm_shoulder`] for why
 /// doing it any other way explodes the mesh.
 fn viewmodel_matrix(
@@ -1472,14 +1472,16 @@ fn viewmodel_matrix(
     // about the eye.
     let local_pivot = rotation * glam::Vec3::new(0.0, 0.0, 0.25);
     let swing_rotation = glam::Quat::from_rotation_x(swing);
-    // Order matters: translate the model space first (so the swing about the
-    // camera-local pivot acts on a shoulder-centred mesh), then rotate, then
-    // place. `from_scale_rotation_translation` composes as T * R * S.
+    // Translate so the shoulder pivot ends up at `position` (eye + offset).
+    // The arms' vertices are in model space with shoulders at `pivot`.
+    // We want: model_matrix * pivot = position  =>  model_matrix = T(position - pivot) * R * S.
+    // The swing rotation is around the shoulder, so the pivot compensation
+    // is `swing_rotation * pivot` (same as the original working code).
     glam::Mat4::from_scale_rotation_translation(
         glam::Vec3::splat(scale.max(0.0001)),
         rotation * swing_rotation,
-        position - local_pivot + swing_rotation * local_pivot,
-    ) * glam::Mat4::from_translation(-pivot)
+        position - pivot + swing_rotation * pivot,
+    )
 }
 
 /// Compose one instance's bone palette row.

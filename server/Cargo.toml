@@ -15,6 +15,7 @@ path = "src/main.rs"
 exsolis_common.workspace = true
 fastpack.workspace = true
 tesjit-dwarf.workspace = true
+tesjit.workspace = true
 axum.workspace = true
 bytes.workspace = true
 tokio.workspace = true
@@ -27,7 +28,6 @@ bevy_tasks.workspace = true
 bevy_log.workspace = true
 bevy_diagnostic.workspace = true
 bevy_renet.workspace = true
-bevy_internal.workspace = true
 
 glam.workspace = true
 # Decoding embedded GLB textures at catalog build time; see
@@ -35,7 +35,7 @@ glam.workspace = true
 image = { workspace = true }
 rand.workspace = true
 rayon.workspace = true
-opensimplex2.workspace = true
+opensimplex2 = { workspace = true, optional = true }
 smallvec.workspace = true
 rustc-hash.workspace = true
 bincode.workspace = true
@@ -45,7 +45,21 @@ mlua.workspace = true
 
 mimalloc = { workspace = true, optional = true }
 
+# Server-only bevy deps (no winit/window)
+bevy_internal = { version = "0.19", features = [
+    "bevy_asset",
+    "bevy_camera",
+    "bevy_image",
+    "bevy_log",
+    "bevy_picking",
+    "bevy_text",
+    "bevy_ui",
+    "bevy_ui_widgets",
+    "bevy_input_focus"
+], default-features = false }
+
 
 [features]
 default = []
 standalone = ["dep:mimalloc"]
+advanced_worldgen = ["opensimplex2"]

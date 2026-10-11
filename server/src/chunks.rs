@@ -1,10 +1,13 @@
 use super::*;
 use crate::net::{self, OutgoingPacket, SendTarget};
+use crate::scripting::ScriptRuntime;
+#[cfg(feature = "advanced_worldgen")]
+use crate::terrain::WorldGen;
 use bevy_renet::RenetServer;
 use bevy_renet::renet::DefaultChannel;
 use bevy_tasks::futures_lite::future;
 use bevy_tasks::{AsyncComputeTaskPool, Task};
-use exsolis_common::{ChunkBlocks, ChunkCoord};
+use exsolis_common::{BlockType, ChunkBlocks, ChunkCoord};
 use glam::Vec3;
 use std::collections::{HashMap, HashSet};
 
@@ -44,6 +47,10 @@ impl Plugin for ChunksPlugin {
         app.init_resource::<ChunkWorld>()
             .init_resource::<GenerationTasks>()
             .add_systems(
+                Startup,
+                init_world_gen.in_set(net::GameplaySet),
+            )
+            .add_systems(
                 Update,
                 (
                     handle_render_distance_packets,
@@ -53,10 +60,72 @@ impl Plugin for ChunksPlugin {
                     poll_generation_tasks,
                     stream_chunks_to_players,
                     unload_out_of_range_chunks,
+                    #[cfg(feature = "advanced_worldgen")]
+                    reload_worldgen_config,
                 )
                     .chain()
                     .in_set(net::GameplaySet),
             );
+    }
+}
+
+#[cfg(feature = "advanced_worldgen")]
+/// Initialize the world generator after scripting is ready
+fn init_world_gen(mut commands: Commands, runtime: NonSend<ScriptRuntime>) {
+    let world_gen = WorldGen::from_lua(runtime.lua());
+    commands.insert_resource(world_gen);
+}
+
+#[cfg(not(feature = "advanced_worldgen"))]
+/// Initialize the world generator (simple generator - no Lua config needed)
+fn init_world_gen(mut commands: Commands, _runtime: NonSend<ScriptRuntime>) {
+    let world_gen = SimpleWorldGen::new();
+    commands.insert_resource(world_gen);
+}
+
+#[cfg(feature = "advanced_worldgen")]
+/// Reload worldgen config when mods are reloaded
+fn reload_worldgen_config(mut commands: Commands, runtime: NonSend<ScriptRuntime>) {
+    let world_gen = WorldGen::from_lua(runtime.lua());
+    commands.insert_resource(world_gen);
+}
+
+/// Simple world generator (original sine-wave based) - used when advanced_worldgen feature is disabled
+#[derive(bevy_ecs::resource::Resource, Clone)]
+pub struct SimpleWorldGen;
+
+impl SimpleWorldGen {
+    pub fn new() -> Self {
+        Self
+    }
+
+    pub fn generate_chunk(&self, coord: ChunkCoord) -> ChunkBlocks {
+        const SIZE: usize = 32;
+        let mut blocks = vec![BlockType::Air; SIZE * SIZE * SIZE];
+
+        for x in 0..SIZE {
+            for z in 0..SIZE {
+                let world_x = coord.x * SIZE as i32 + x as i32;
+                let world_z = coord.z * SIZE as i32 + z as i32;
+                let height = ((world_x as f32 * 0.1).sin() * 4.0
+                    + (world_z as f32 * 0.1).cos() * 4.0
+                    + 16.0) as i32;
+
+                for y in 0..SIZE {
+                    let world_y = coord.y * SIZE as i32 + y as i32;
+                    let idx = x + y * SIZE + z * SIZE * SIZE;
+                    blocks[idx] = if world_y < height {
+                        BlockType::Stone
+                    } else if world_y == height {
+                        BlockType::Grass
+                    } else {
+                        BlockType::Air
+                    };
+                }
+            }
+        }
+
+        ChunkBlocks::pack(&blocks)
     }
 }
 
@@ -176,10 +245,12 @@ fn compute_desired_chunks(mut query: Query<(&PlayerPosition, &mut ChunkRenderSta
 /// Look at the union of every player's desired set, diff against ChunkWorld.known,
 /// and kick off async generation tasks for anything genuinely new. This is the
 /// dedup step: two overlapping players never cause double generation.
+#[cfg(feature = "advanced_worldgen")]
 fn queue_missing_chunks(
     players: Query<&ChunkRenderState>,
     mut world: ResMut<ChunkWorld>,
     mut tasks: ResMut<GenerationTasks>,
+    world_gen: Res<WorldGen>,
 ) {
     let pool = AsyncComputeTaskPool::get();
 
@@ -190,7 +261,31 @@ fn queue_missing_chunks(
             }
             world.known.insert(coord);
 
-            let task = pool.spawn(async move { generate_chunk(coord) });
+            let generator = world_gen.clone();
+            let task = pool.spawn(async move { generator.generate_chunk(coord) });
+            tasks.in_flight.insert(coord, task);
+        }
+    }
+}
+
+#[cfg(not(feature = "advanced_worldgen"))]
+fn queue_missing_chunks(
+    players: Query<&ChunkRenderState>,
+    mut world: ResMut<ChunkWorld>,
+    mut tasks: ResMut<GenerationTasks>,
+    world_gen: Res<SimpleWorldGen>,
+) {
+    let pool = AsyncComputeTaskPool::get();
+
+    for state in &players {
+        for &coord in &state.desired {
+            if world.known.contains(&coord) {
+                continue; // already generated or already in flight
+            }
+            world.known.insert(coord);
+
+            let generator = world_gen.clone();
+            let task = pool.spawn(async move { generator.generate_chunk(coord) });
             tasks.in_flight.insert(coord, task);
         }
     }
@@ -311,39 +406,6 @@ fn world_to_chunk(pos: Vec3) -> ChunkCoord {
         (pos.y / CHUNK_SIZE).floor() as i32,
         (pos.z / CHUNK_SIZE).floor() as i32,
     )
-}
-
-/// Placeholder terrain gen — swap in your real terrain_noise.rs sin-wave/OpenSimplex2
-/// logic here. Runs off the main thread on AsyncComputeTaskPool, so it's safe for
-/// this to be as expensive as it needs to be.
-fn generate_chunk(coord: ChunkCoord) -> ChunkBlocks {
-    use exsolis_common::BlockType;
-    const SIZE: usize = 32;
-    let mut blocks = vec![BlockType::Air; SIZE * SIZE * SIZE];
-
-    for x in 0..SIZE {
-        for z in 0..SIZE {
-            let world_x = coord.x * SIZE as i32 + x as i32;
-            let world_z = coord.z * SIZE as i32 + z as i32;
-            let height = ((world_x as f32 * 0.1).sin() * 4.0
-                + (world_z as f32 * 0.1).cos() * 4.0
-                + 16.0) as i32;
-
-            for y in 0..SIZE {
-                let world_y = coord.y * SIZE as i32 + y as i32;
-                let idx = x + y * SIZE + z * SIZE * SIZE;
-                blocks[idx] = if world_y < height {
-                    BlockType::Stone
-                } else if world_y == height {
-                    BlockType::Grass
-                } else {
-                    BlockType::Air
-                };
-            }
-        }
-    }
-
-    ChunkBlocks::pack(&blocks)
 }
 
 /// Written by events.rs::dispatch_incoming from ClientMessage::Move, and
