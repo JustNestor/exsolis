@@ -1218,6 +1218,18 @@ pub struct GltfModelInstance {
     /// Where the viewmodel instance is placed relative to the eye. Ignored
     /// unless `first_person` is set.
     pub viewmodel_offset: glam::Vec3,
+    /// Client-side visual offset applied to where the model is *drawn*.
+    ///
+    /// The server's position is authoritative and is used for collision, ray
+    /// casts and movement, so this must never be written back into the
+    /// entity's `Transform`. It exists so a model whose origin is not quite
+    /// where the camera expects can be nudged without editing the asset —
+    /// e.g. raising `girl.glb` so its head sits near `FlyCamera::eye_height`,
+    /// since the halo above it makes the model taller than its own skull.
+    ///
+    /// Deliberately *not* applied to the first-person viewmodel, which has its
+    /// own eye-relative placement.
+    pub world_offset: glam::Vec3,
 }
 
 impl GltfModelInstance {
@@ -1227,6 +1239,7 @@ impl GltfModelInstance {
             scale: 1.0,
             first_person: false,
             viewmodel_offset: glam::Vec3::ZERO,
+            world_offset: glam::Vec3::ZERO,
         }
     }
 
@@ -1240,6 +1253,12 @@ impl GltfModelInstance {
     pub fn first_person(mut self, offset: glam::Vec3) -> Self {
         self.first_person = true;
         self.viewmodel_offset = offset;
+        self
+    }
+
+    /// Shift where this instance is drawn, in world space.
+    pub fn with_world_offset(mut self, offset: glam::Vec3) -> Self {
+        self.world_offset = offset;
         self
     }
 }
@@ -1684,7 +1703,9 @@ pub fn sync_gltf_instances(
             matrices.push(glam::Mat4::from_scale_rotation_translation(
                 glam::Vec3::splat(instance.scale.max(0.0001)),
                 transform.rotation(),
-                transform.translation(),
+                // The visual offset is added here and nowhere else: the
+                // entity's own transform keeps the authoritative position.
+                transform.translation() + instance.world_offset,
             ));
             push_palette(
                 skeleton.as_ref(),

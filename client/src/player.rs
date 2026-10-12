@@ -61,9 +61,22 @@ impl FlyCamera {
         transform.translation + Vec3::Y * self.eye_height
     }
 
+    /// The direction the camera looks, as a unit vector.
+    ///
+    /// Built from the camera's **own** yaw/pitch, not from the entity's
+    /// `Transform` rotation. Those are deliberately different things now:
+    /// the transform carries the *body's* yaw (which is what the model is
+    /// drawn with), while only the camera knows the full pitch. Reading the
+    /// direction out of the transform is what used to force the body to
+    /// pitch with the camera — and, because the model's origin is at its
+    /// feet, to swing its head through an enormous arc.
+    pub fn forward(&self) -> Vec3 {
+        Quat::from_euler(EulerRot::YXZ, self.yaw, self.pitch, 0.0) * Vec3::NEG_Z
+    }
+
     pub fn view_projection(&self, transform: &Transform, aspect: f32) -> glam::Mat4 {
         let eye = self.eye_position(transform);
-        let forward = transform.rotation * Vec3::NEG_Z;
+        let forward = self.forward();
         let mut proj = glam::Mat4::perspective_rh(self.fov_y, aspect, 0.1, 1000.0);
         proj.y_axis.y *= -1.0;
         proj * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
@@ -83,7 +96,7 @@ impl FlyCamera {
         far: f32,
     ) -> glam::Mat4 {
         let eye = self.eye_position(transform);
-        let forward = transform.rotation * Vec3::NEG_Z;
+        let forward = self.forward();
         let mut proj = glam::Mat4::perspective_rh(self.fov_y, aspect, near, far);
         proj.y_axis.y *= -1.0;
         proj * glam::Mat4::look_at_rh(eye, eye + forward, Vec3::Y)
@@ -121,7 +134,8 @@ fn spawn_local_player(mut commands: Commands) {
         crate::anim::Animator::new(),
         crate::gltf::GltfModelInstance::new(exsolis_server::PLAYER_MODEL)
             .with_scale(exsolis_server::PLAYER_MODEL_SCALE)
-            .first_person(VIEWMODEL_OFFSET),
+            .first_person(VIEWMODEL_OFFSET)
+            .with_world_offset(MODEL_VISUAL_LIFT),
         bevy_transform::prelude::GlobalTransform::default(),
     ));
 
@@ -188,7 +202,13 @@ fn fly_camera_look(
         cam.yaw -= delta.x * cam.sensitivity;
         cam.pitch -= delta.y * cam.sensitivity;
         cam.pitch = cam.pitch.clamp(-89_f32.to_radians(), 89_f32.to_radians());
-        transform.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, cam.pitch, 0.0);
+        // Only the yaw goes into the entity transform. The transform is the
+        // *body's* facing, and the body is drawn from it, so putting pitch in
+        // here tilted the entire avatar whenever the camera moved — pivoting
+        // around the feet, since that is where the model's origin sits, which
+        // threw the head a long way off screen. The camera builds its own
+        // view from `FlyCamera::forward()`, which still has the full pitch.
+        transform.rotation = Quat::from_euler(EulerRot::YXZ, cam.yaw, 0.0, 0.0);
     }
 }
 
@@ -401,6 +421,17 @@ fn drive_local_animator(
 /// of the frame rather than around the camera. This is the number to tune by
 /// eye; everything else about the viewmodel derives from it.
 const VIEWMODEL_OFFSET: Vec3 = Vec3::new(0.0, -0.42, -0.40);
+
+/// How far the local avatar's body is raised above its authoritative
+/// position. Purely visual — the player's collision box, movement and ray
+/// casts all still use the server's position.
+///
+/// Needed because the eye sits at `FlyCamera::eye_height` (1.62) while
+/// `girl.glb`, halo included, is about 3.19 * 0.565 = 1.80 units tall and its
+/// actual skull is below the halo. Drawn at the raw position the figure
+/// therefore reads as standing too low relative to the camera. Tune by eye;
+/// anything sane is 0.0..0.4.
+const MODEL_VISUAL_LIFT: Vec3 = Vec3::new(0.0, 0.15, 0.0);
 
 /// How fast the smoothed local speed chases the measured one. Must match
 /// `entities::sync_player_entities` on the server.

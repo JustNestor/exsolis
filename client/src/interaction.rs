@@ -291,7 +291,9 @@ fn update_targeting(
 ) {
     for (transform, cam, mut targeting) in &mut query {
         let origin = cam.eye_position(transform);
-        let dir = transform.rotation * Vec3::NEG_Z;
+        // The look direction has the full pitch, which lives on the camera,
+        // not on the body's yaw-only transform.
+        let dir = cam.forward();
         targeting.target = raycast_voxels(&registry, &chunks, origin, dir);
     }
 }
