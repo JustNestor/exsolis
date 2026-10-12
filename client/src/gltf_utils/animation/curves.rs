@@ -52,8 +52,16 @@ pub enum CurveError {
     NonIncreasingTimes,
     #[error("Invalid cubic spline data: values length must be 3x times length")]
     InvalidCubicSplineData,
-    #[error("Chunked core error: {0}")]
-    ChunkedCoreError(String),
+    /// The value buffer is neither one-per-key (Linear/Step) nor
+    /// three-per-key (CubicSpline). Silently truncating would drop the tail
+    /// of a clip and leave a joint frozen on a stale value.
+    #[error("{values_given} values for {divisor} expected slots")]
+    LengthMismatch {
+        /// Number of values given.
+        values_given: usize,
+        /// Number of slots the data should have filled.
+        divisor: usize,
+    },
 }
 
 /// ---------- LINEAR INTERPOLATION ----------
@@ -369,19 +377,41 @@ impl<T: Clone + Debug + Send + Sync> AnimationCurve<T> for ConstantCurve<T> {
 /// ---------- CURVE FACTORY ----------
 
 /// Creates a Vec3 curve from glTF data
+///
+/// `values` must be exactly as long as `times` for Linear/Step, and three
+/// times as long for CubicSpline (`in_tangent, value, out_tangent` per key).
 pub fn create_vec3_curve(
     mode: InterpolationMode,
     times: Vec<f32>,
     values: Vec<[f32; 3]>,
 ) -> Result<Box<dyn AnimationCurve<Vec3>>, CurveError> {
+    let expected = match mode {
+        InterpolationMode::CubicSpline => times.len() * 3,
+        _ => times.len(),
+    };
+    if values.len() != expected {
+        return Err(CurveError::LengthMismatch {
+            values_given: values.len(),
+            divisor: expected,
+        });
+    }
+
     let vec3_values: Vec<Vec3> = values.into_iter().map(Vec3::from).collect();
     match mode {
         InterpolationMode::Linear => {
-            let keyframes: Vec<Keyframe<Vec3>> = times.into_iter().zip(vec3_values).map(|(t, v)| Keyframe { time: t, value: v }).collect();
+            let keyframes: Vec<Keyframe<Vec3>> = times
+                .into_iter()
+                .zip(vec3_values)
+                .map(|(t, v)| Keyframe { time: t, value: v })
+                .collect();
             Ok(Box::new(LinearCurve::new(keyframes)?))
         }
         InterpolationMode::Step => {
-            let keyframes: Vec<Keyframe<Vec3>> = times.into_iter().zip(vec3_values).map(|(t, v)| Keyframe { time: t, value: v }).collect();
+            let keyframes: Vec<Keyframe<Vec3>> = times
+                .into_iter()
+                .zip(vec3_values)
+                .map(|(t, v)| Keyframe { time: t, value: v })
+                .collect();
             Ok(Box::new(StepCurve::new(keyframes)?))
         }
         InterpolationMode::CubicSpline => {
@@ -391,25 +421,48 @@ pub fn create_vec3_curve(
 }
 
 /// Creates a Quat curve from glTF data (handles cubic spline specially)
+///
+/// Same length contract as [`create_vec3_curve`].
 pub fn create_quat_curve(
     mode: InterpolationMode,
     times: Vec<f32>,
     values: Vec<[f32; 4]>,
 ) -> Result<Box<dyn AnimationCurve<Quat>>, CurveError> {
+    let expected = match mode {
+        InterpolationMode::CubicSpline => times.len() * 3,
+        _ => times.len(),
+    };
+    if values.len() != expected {
+        return Err(CurveError::LengthMismatch {
+            values_given: values.len(),
+            divisor: expected,
+        });
+    }
+
     match mode {
         InterpolationMode::CubicSpline => {
             let vec4_values: Vec<Vec4> = values.into_iter().map(Vec4::from).collect();
             Ok(Box::new(CubicRotationCurve::new(times, vec4_values)?))
         }
         InterpolationMode::Linear => {
-            let keyframes: Vec<Keyframe<Quat>> = times.into_iter().zip(values)
-                .map(|(t, v)| Keyframe { time: t, value: Quat::from_xyzw(v[0], v[1], v[2], v[3]) })
+            let keyframes: Vec<Keyframe<Quat>> = times
+                .into_iter()
+                .zip(values)
+                .map(|(t, v)| Keyframe {
+                    time: t,
+                    value: Quat::from_xyzw(v[0], v[1], v[2], v[3]),
+                })
                 .collect();
             Ok(Box::new(LinearCurve::new(keyframes)?))
         }
         InterpolationMode::Step => {
-            let keyframes: Vec<Keyframe<Quat>> = times.into_iter().zip(values)
-                .map(|(t, v)| Keyframe { time: t, value: Quat::from_xyzw(v[0], v[1], v[2], v[3]) })
+            let keyframes: Vec<Keyframe<Quat>> = times
+                .into_iter()
+                .zip(values)
+                .map(|(t, v)| Keyframe {
+                    time: t,
+                    value: Quat::from_xyzw(v[0], v[1], v[2], v[3]),
+                })
                 .collect();
             Ok(Box::new(StepCurve::new(keyframes)?))
         }

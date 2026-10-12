@@ -236,3 +236,65 @@ fn test_cubic_spline_error_length_mismatch() {
     let result = CubicSplineCurve::new(times, values);
     assert!(matches!(result, Err(CurveError::InvalidCubicSplineData)));
 }
+#[test]
+fn a_short_value_buffer_is_rejected_rather_than_truncated() {
+    // Two keys but only one value. The factory used to zip and silently
+    // produce a one-key curve, freezing the joint on a stale value.
+    let times = vec![0.0, 1.0];
+    let values = vec![[0.0, 0.0, 0.0]];
+    let result = create_vec3_curve(InterpolationMode::Linear, times, values);
+    assert!(
+        matches!(
+            result,
+            Err(CurveError::LengthMismatch {
+                values_given: 1,
+                divisor: 2
+            })
+        ),
+        "a short buffer must be an error, got {result:?}"
+    );
+}
+
+#[test]
+fn a_long_value_buffer_is_also_rejected() {
+    let times = vec![0.0, 1.0];
+    let values = vec![[0.0; 3], [1.0; 3], [2.0; 3]];
+    let result = create_vec3_curve(InterpolationMode::Linear, times, values);
+    assert!(matches!(
+        result,
+        Err(CurveError::LengthMismatch {
+            values_given: 3,
+            divisor: 2
+        })
+    ));
+}
+
+#[test]
+fn cubic_spline_needs_three_values_per_key() {
+    let times = vec![0.0, 1.0];
+    // Two entries: fine for Linear, not for CubicSpline.
+    let values = vec![[0.0, 0.0, 0.0], [1.0, 0.0, 0.0]];
+    let result = create_vec3_curve(InterpolationMode::CubicSpline, times, values);
+    assert!(matches!(
+        result,
+        Err(CurveError::LengthMismatch {
+            values_given: 2,
+            divisor: 6
+        })
+    ));
+}
+
+#[test]
+fn the_quat_factory_validates_too() {
+    let times = vec![0.0, 1.0];
+    let values = vec![[0.0, 0.0, 0.0, 1.0]];
+    let result = create_quat_curve(InterpolationMode::Linear, times, values);
+    assert!(matches!(result, Err(CurveError::LengthMismatch { .. })));
+}
+
+#[test]
+fn a_consistent_value_buffer_is_accepted() {
+    let times = vec![0.0, 1.0, 2.0];
+    let values = vec![[0.0; 3], [1.0; 3], [2.0; 3]];
+    assert!(create_vec3_curve(InterpolationMode::Linear, times, values).is_ok());
+}

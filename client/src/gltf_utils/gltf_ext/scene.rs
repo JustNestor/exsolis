@@ -23,11 +23,12 @@ pub fn check_for_cycles(document: &gltf::Document) -> Result<(), String> {
 
     Ok(())
 }
-
-/// Check if a node is part of a cycle
 fn check_is_part_of_cycle(node: &Node, visited: &mut FixedBitSet) -> Result<(), String> {
     if visited.contains(node.index()) {
-        return Err(format!("glTF nodes form a cycle involving node {}", node.index()));
+        return Err(format!(
+            "glTF nodes form a cycle involving node {}",
+            node.index()
+        ));
     }
     visited.insert(node.index());
     for kid in node.children() {
@@ -37,19 +38,32 @@ fn check_is_part_of_cycle(node: &Node, visited: &mut FixedBitSet) -> Result<(), 
     Ok(())
 }
 
+/// The scene this document's nodes live in, or an error.
+///
+/// A glTF file is not required to declare a default scene, so panicking here
+/// turns a slightly unusual-but-valid asset into a crash.
+pub fn default_scene(document: &gltf::Document) -> Result<gltf::Scene<'_>, String> {
+    document
+        .default_scene()
+        .or_else(|| document.scenes().next())
+        .ok_or_else(|| "glTF has no scene".to_string())
+}
+
 /// Calculates the world transform of a glTF node hierarchy.
+///
+/// Nodes that are not reachable from any scene root keep
+/// [`Mat4::IDENTITY`], as does every node of a scene-less document.
 pub fn compute_world_transforms(document: &gltf::Document) -> Vec<Mat4> {
     let nodes: Vec<Node> = document.nodes().collect();
     let mut world = vec![Mat4::IDENTITY; nodes.len()];
-    
-    let parent = parent_map(&nodes);
-    
-    // Find scene roots
-    let scene = document.default_scene().expect("GLTF has no default scene");
+
+    let Ok(scene) = default_scene(document) else {
+        return world;
+    };
     for root in scene.nodes().map(|n| n.index()) {
         compute_world_recursive(&nodes, root, Mat4::IDENTITY, &mut world);
     }
-    
+
     world
 }
 
@@ -59,21 +73,10 @@ fn compute_world_recursive(nodes: &[Node], index: usize, parent_world: Mat4, wor
     let local = node_transform(node);
     let node_world = parent_world * local;
     world[index] = node_world;
-    
+
     for child in node.children() {
         compute_world_recursive(nodes, child.index(), node_world, world);
     }
-}
-
-/// Parent map for node hierarchy
-fn parent_map(nodes: &[Node]) -> Vec<Option<usize>> {
-    let mut parent = vec![None; nodes.len()];
-    for node in nodes {
-        for child in node.children() {
-            parent[child.index()] = Some(node.index());
-        }
-    }
-    parent
 }
 
 /// Returns the local transform of a glTF node.
@@ -92,16 +95,20 @@ pub fn node_transform(node: &Node) -> Mat4 {
     }
 }
 
-/// Collects the path from root to each node (for animation target resolution).
+/// Collects the name path from each scene root to every node.
+///
+/// Returns an empty map for a scene-less document rather than panicking.
 pub fn collect_node_paths(document: &gltf::Document) -> HashMap<usize, Vec<String>> {
     let mut paths = HashMap::new();
     let mut visited = HashSet::new();
-    
-    let scene = document.default_scene().expect("GLTF has no default scene");
+
+    let Ok(scene) = default_scene(document) else {
+        return paths;
+    };
     for root in scene.nodes() {
         collect_path_recursive(&root, &mut Vec::new(), &mut paths, &mut visited);
     }
-    
+
     paths
 }
 
@@ -140,18 +147,24 @@ pub fn extract_skin_data(
     buffers: &[gltf::buffer::Data],
 ) -> Result<SkinData, String> {
     let joints: Vec<usize> = skin.joints().map(|j| j.index()).collect();
-    
-    let reader = skin.reader(|buffer| Some(&buffers[buffer.index()]));
+
+    // `gltf::buffer::Data` is a newtype over `Vec<u8>`; be explicit about the
+    // deref rather than relying on a coercion that is easy to break.
+    let reader = skin.reader(|buffer| Some(&buffers[buffer.index()].0));
     let inverse_bind_matrices: Vec<Mat4> = reader
         .read_inverse_bind_matrices()
         .ok_or("Skin missing inverse bind matrices")?
         .map(|m| convert_gltf_matrix(&m))
         .collect();
-    
+
     if inverse_bind_matrices.len() != joints.len() {
-        return Err("Inverse bind matrices count doesn't match joints count".into());
+        return Err(format!(
+            "inverse bind matrix count ({}) does not match joint count ({})",
+            inverse_bind_matrices.len(),
+            joints.len()
+        ));
     }
-    
+
     Ok(SkinData {
         joints,
         inverse_bind_matrices,

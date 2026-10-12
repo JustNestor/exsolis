@@ -53,6 +53,59 @@ fn test_convert_gltf_matrix() {
 }
 
 #[test]
+fn the_basis_change_is_a_rotation_not_a_reflection() {
+    // diag(-1,1,-1) has det = +1, so it is R_y(pi) and conjugating a
+    // quaternion by it is legitimate. If this ever became det = -1 the
+    // quaternion conjugation would silently mirror.
+    assert_eq!(gltf_to_engine_mat4().determinant(), 1.0);
+}
+
+#[test]
+fn an_identity_rotation_survives_conjugation() {
+    let converted =
+        convert_gltf_transform(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0, 1.0], &[1.0, 1.0, 1.0]);
+    assert_eq!(converted.w_axis, Vec4::new(-1.0, 2.0, -3.0, 1.0));
+    // No rotation introduced by the conversion itself.
+    assert!(converted
+        .to_scale_rotation_translation()
+        .1
+        .abs_diff_eq(Quat::IDENTITY, 1e-6));
+}
+
+/// The matrix and decomposed paths must agree, otherwise the two encodings of
+/// the same node render in two different places. The decomposed path has to
+/// conjugate the rotation; a plain flip of x/z mirrors it.
+#[test]
+fn matrices_and_decomposed_transforms_agree() {
+    // A deliberately awkward transform: 60deg about Y then 36deg about X,
+    // non-uniform scale, non-zero translation.
+    let rotation = Quat::from_rotation_y(std::f32::consts::FRAC_PI_3)
+        * Quat::from_rotation_x(std::f32::consts::FRAC_PI_2);
+    let translation = Vec3::new(1.5, -2.25, 0.75);
+    let scale = Vec3::new(2.0, 1.0, 3.0);
+
+    let from_trs = convert_gltf_transform(
+        &translation.to_array(),
+        &[rotation.x, rotation.y, rotation.z, rotation.w],
+        &scale.to_array(),
+    );
+
+    // Build the equivalent glTF matrix (T * R * S) and convert it.
+    let gltf_matrix =
+        Mat4::from_scale_rotation_translation(scale, rotation, translation).to_cols_array_2d();
+    let from_matrix = convert_gltf_matrix(&gltf_matrix);
+
+    for i in 0..4 {
+        let a = from_trs.col(i);
+        let b = from_matrix.col(i);
+        assert!(
+            (a - b).length() < 1e-4,
+            "column {i} differs: TRS path gave {a:?}, matrix path gave {b:?}"
+        );
+    }
+}
+
+#[test]
 fn test_convert_gltf_transform() {
     // Translation: (1, 2, 3) in glTF -> (-1, 2, -3) in engine
     // Rotation: identity

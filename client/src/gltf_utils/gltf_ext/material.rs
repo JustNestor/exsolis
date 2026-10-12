@@ -1,6 +1,5 @@
 //! Material loading helpers from glTF.
 
-use crate::gltf_utils::gltf_ext::texture::{texture_transform_to_affine2, SamplerSettings};
 use gltf::Material;
 
 /// Alpha mode for materials

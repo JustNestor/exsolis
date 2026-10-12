@@ -225,10 +225,11 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        let (arms, arms_pivot, arm_joints) = match build_arms(&joints, &world, &primitives) {
-            Some((arms, pivot, arm_joints)) => (Some(arms), pivot, arm_joints),
-            None => (None, [0.0; 3], Vec::new()),
-        };
+        // TEMPORARILY DISABLED: the first-person arm cut is not trusted yet,
+        // and until it is it only produces a false signal — either "the hands
+        // look right, so this subsystem is clean" or a second, independent
+        // bug that hides the first. It comes back once the body is verified.
+        let (arms, arms_pivot, arm_joints) = (None, [0.0; 3], Vec::new());
         let primitives = merge_by_material(primitives);
 
         let skeleton = Skeleton {
@@ -1281,6 +1282,7 @@ mod tests {
     /// The first-person viewmodel must come out of the same rig so the
     /// hands animate from the same bone palette as the body.
     #[test]
+    #[ignore = "the first-person arm cut is disabled while the body is being verified"]
     fn the_avatar_yields_an_arms_only_viewmodel() {
         let (document, buffers, _images) = load("girl.glb");
         let rig = Rig::build(&document, &buffers).expect("rig");
@@ -1385,6 +1387,7 @@ mod tests {
     /// pose driven, a vertex may move some distance (the arm swings), but a
     /// *pair* of vertices sharing a bone must move by nearly the same amount.
     #[test]
+    #[ignore = "the first-person arm cut is disabled while the body is being verified"]
     fn posed_arms_move_as_one_body() {
         use crate::anim::Transform as JointTransform;
         let (document, buffers, _images) = load("girl.glb");

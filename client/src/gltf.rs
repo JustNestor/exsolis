@@ -1201,6 +1201,38 @@ pub fn upload_gltf_assets(
         let Some(asset) = assets.get::<GltfAsset>(path) else {
             continue;
         };
+
+        // Aggregate decode diagnostics: the numbers that say whether a
+        // model's geometry survived parsing. When something renders as
+        // needles, the first question is whether its primitives' `mode` and
+        // `byteStride` were honoured — see `to_triangle_list`.
+        {
+            let verts: usize = asset
+                .model
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .map(|p| p.vertices.len())
+                .sum();
+            let tris: usize = asset
+                .model
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .map(|p| p.indices.len() / 3)
+                .sum();
+            let prims: usize = asset
+                .model
+                .meshes
+                .iter()
+                .flat_map(|m| m.primitives.iter())
+                .count();
+            debug!(
+                "gltf {path}: decoded {verts} verts, {tris} tris, {prims} prims, {} materials, {} textures",
+                asset.model.materials.len(),
+                asset.model.textures.len()
+            );
+        }
         // Keep the skeleton alongside the uploaded mesh, and stamp clip
         // roles from the authoritative manifest for this model.
         if let Some(skeleton) = &asset.skeleton {
