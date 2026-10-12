@@ -227,19 +227,9 @@ impl Rig {
         //    primitives collapse to one draw call.
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        //
-        // The arm cut is only meaningful for a model that will ever be the
-        // local player's first-person viewmodel. Every other model (duck,
-        // dragon, props) has no arm bones and only produces warnings, so the
-        // check is gated on the caller's model path rather than attempted
-        // and complained about.
-        let (arms, arms_pivot, arm_joints) = if wants_arms(document) {
-            match build_arms(&joints, &world, &primitives) {
-                Some((arms, pivot, arm_joints)) => (Some(arms), pivot, arm_joints),
-                None => (None, [0.0; 3], Vec::new()),
-            }
-        } else {
-            (None, [0.0; 3], Vec::new())
+        let (arms, arms_pivot, arm_joints) = match build_arms(&joints, &world, &primitives) {
+            Some((arms, pivot, arm_joints)) => (Some(arms), pivot, arm_joints),
+            None => (None, [0.0; 3], Vec::new()),
         };
         let primitives = merge_by_material(primitives);
 
@@ -331,9 +321,14 @@ fn build_arms(
         .collect();
 
     if kept.is_empty() {
-        warn!(
+        // This is the *expected* outcome for every model that is not the
+        // player's rig: a duck has no arm bones, and complaining about it
+        // once per non-player model is pure noise. The pathological case —
+        // the rig that *should* have arms and stopped matching — is the
+        // share>25% branch below, which still warns.
+        debug!(
             "viewmodel: no arm joints matched ({} prefixes, {} joints scanned); \
-             first-person hands will be empty",
+             no first-person hands for this model",
             ARM_JOINT_PREFIXES.len(),
             joints.len()
         );
@@ -401,7 +396,9 @@ fn arm_subtree(joints: &[&crate::anim::Joint]) -> std::collections::HashSet<u16>
         .map(|(index, _)| index as u16)
         .collect();
     if roots.is_empty() {
-        warn!(
+        // Again the normal case for a model without arm bones — the prefix
+        // walk below is the fallback, not a degraded mode worth a warning.
+        debug!(
             "viewmodel: no upper-arm joint matched {:?} ({} joints scanned); \
              falling back to name prefixes only",
             ARM_ROOT_PREFIXES,
@@ -1293,7 +1290,6 @@ mod tests {
     /// The first-person viewmodel must come out of the same rig so the
     /// hands animate from the same bone palette as the body.
     #[test]
-    #[ignore = "the first-person arm cut is disabled while the body is being verified"]
     fn the_avatar_yields_an_arms_only_viewmodel() {
         let (document, buffers, _images) = load("girl.glb");
         let rig = Rig::build(&document, &buffers).expect("rig");
@@ -1398,7 +1394,6 @@ mod tests {
     /// pose driven, a vertex may move some distance (the arm swings), but a
     /// *pair* of vertices sharing a bone must move by nearly the same amount.
     #[test]
-    #[ignore = "the first-person arm cut is disabled while the body is being verified"]
     fn posed_arms_move_as_one_body() {
         use crate::anim::Transform as JointTransform;
         let (document, buffers, _images) = load("girl.glb");
@@ -1407,7 +1402,6 @@ mod tests {
         let arms = rig.arms.as_ref().expect("arms");
         let n = skeleton.joints.len();
 
-        let mut world = vec![glam::Mat4::IDENTITY; n];
         let posed =
             |skeleton: &crate::anim::Skeleton, locals: &[JointTransform]| -> Vec<glam::Mat4> {
                 let mut world = vec![glam::Mat4::IDENTITY; n];
