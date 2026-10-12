@@ -225,11 +225,22 @@ impl Rig {
 
         // 4. Merge by material: the girl is single-material, so 795
         //    primitives collapse to one draw call.
-        // TEMPORARILY DISABLED: the first-person arm cut is not trusted yet,
-        // and until it is it only produces a false signal — either "the hands
-        // look right, so this subsystem is clean" or a second, independent
-        // bug that hides the first. It comes back once the body is verified.
-        let (arms, arms_pivot, arm_joints) = (None, [0.0; 3], Vec::new());
+        // 4. Merge by material: the girl is single-material, so 795
+        //    primitives collapse to one draw call.
+        //
+        // The arm cut is only meaningful for a model that will ever be the
+        // local player's first-person viewmodel. Every other model (duck,
+        // dragon, props) has no arm bones and only produces warnings, so the
+        // check is gated on the caller's model path rather than attempted
+        // and complained about.
+        let (arms, arms_pivot, arm_joints) = if wants_arms(document) {
+            match build_arms(&joints, &world, &primitives) {
+                Some((arms, pivot, arm_joints)) => (Some(arms), pivot, arm_joints),
+                None => (None, [0.0; 3], Vec::new()),
+            }
+        } else {
+            (None, [0.0; 3], Vec::new())
+        };
         let primitives = merge_by_material(primitives);
 
         let skeleton = Skeleton {
