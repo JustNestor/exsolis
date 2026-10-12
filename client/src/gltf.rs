@@ -237,19 +237,168 @@ pub struct GltfAsset {
     pub source_path: String,
 }
 
-/// Normalize a model's embedded texture encodings to PNG.
+/// Normalize a model's embedded texture encodings to PNG, and drop glTF
+/// constructs this `gltf` version cannot parse.
 ///
 /// The glTF importer only decodes PNG and JPEG, so a model with a WebP
 /// texture fails wholesale. The server already does this while building the
 /// asset catalog; this is the same pass for models loaded from disk.
+///
+/// The second half matters for `KHR_animation_pointer`, which animates
+/// arbitrary properties (material colours, morph weights) rather than node
+/// transforms. Such a channel has no `node` in its `target`, and `gltf-0.16`
+/// declares `node` a required field — so the *entire document* fails to
+/// deserialize, even though its geometry, nodes and node-driven clips are
+/// perfectly usable. `AnimatedColorsCube.glb` is exactly that: 3 channels of
+/// which 2 are ordinary translation/rotation and 1 is a material colour.
+///
+/// Rather than lose the whole model over a channel we could never honour
+/// anyway (nothing in the renderer animates material factors), the pointer
+/// channels are stripped *before* parsing so the rest loads.
 pub(crate) fn normalize_model_bytes(path: &str, bytes: &[u8]) -> Vec<u8> {
-    match exsolis_server::gltf_pack::normalize_glb_textures(bytes) {
+    let normalized = match exsolis_server::gltf_pack::normalize_glb_textures(bytes) {
         Ok(normalized) => normalized,
         Err(e) => {
             bevy_log::warn!("gltf texture normalization failed for {path}: {e}");
             bytes.to_vec()
         }
+    };
+
+    match strip_unsupported_animation_channels(&normalized) {
+        Ok(sanitized) => sanitized,
+        Err(e) => {
+            bevy_log::debug!("gltf animation-channel sanitizing skipped for {path}: {e}");
+            normalized
+        }
     }
+}
+
+/// Rewrite a GLB's JSON chunk with animation channels that target no node
+/// removed, plus the now-unused extension declarations.
+///
+/// Returns the input unchanged when there is nothing to strip, so the common
+/// path allocates nothing.
+fn strip_unsupported_animation_channels(glb: &[u8]) -> Result<Vec<u8>, String> {
+    // --- header + chunk table -------------------------------------------------
+    if glb.len() < 20 || &glb[0..4] != b"glTF" {
+        return Err("not a GLB".into());
+    }
+    let mut offsets: Vec<(u32, usize, usize)> = Vec::new(); // (kind, header_start, payload_len)
+    let mut pos = 12usize;
+    while pos + 8 <= glb.len() {
+        let len = u32::from_le_bytes([glb[pos], glb[pos + 1], glb[pos + 2], glb[pos + 3]]) as usize;
+        let kind = u32::from_le_bytes([glb[pos + 4], glb[pos + 5], glb[pos + 6], glb[pos + 7]]);
+        if pos + 8 + len > glb.len() {
+            return Err("truncated GLB chunk".into());
+        }
+        offsets.push((kind, pos, len));
+        pos += 8 + len;
+        pos += (4 - len % 4) % 4; // chunks are 4-byte aligned
+    }
+    let Some(&(_, json_header, json_len)) = offsets.iter().find(|(kind, _, _)| *kind == 0x4E4F534A)
+    else {
+        return Err("no JSON chunk".into());
+    };
+    let Some(&(_, bin_header, bin_len)) = offsets
+        .iter()
+        .find(|(kind, _, _)| *kind == 0x004E4942)
+    else {
+        return Err("no BIN chunk".into());
+    };
+
+    let json_bytes = &glb[json_header + 8..json_header + 8 + json_len];
+    let bin_bytes = &glb[bin_header + 8..bin_header + 8 + bin_len];
+
+    let mut doc: serde_json::Value =
+        serde_json::from_slice(json_bytes).map_err(|e| format!("bad json chunk: {e}"))?;
+
+    // A channel we cannot honour is one whose target names no node: the
+    // pointer extension puts the target in `extensions`, not `node`.
+    let mut removed: Vec<String> = Vec::new();
+    let mut removed_any = false;
+    if let Some(animations) = doc.get_mut("animations").and_then(|v| v.as_array_mut()) {
+        for animation in animations.iter_mut() {
+            let name = animation
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unnamed")
+                .to_string();
+            let Some(channels) = animation.get_mut("channels").and_then(|v| v.as_array_mut())
+            else {
+                continue;
+            };
+            let before = channels.len();
+            channels.retain(|channel| {
+                let has_node = channel
+                    .get("target")
+                    .and_then(|t| t.get("node"))
+                    .and_then(|v| v.as_u64())
+                    .is_some();
+                if has_node {
+                    return true;
+                }
+                let pointer = channel
+                    .get("target")
+                    .and_then(|t| t.get("extensions"))
+                    .and_then(|e| e.get("KHR_animation_pointer"))
+                    .and_then(|p| p.get("pointer"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                removed.push(format!("{name}:{pointer}"));
+                false
+            });
+            if channels.len() != before {
+                removed_any = true;
+            }
+        }
+        // Drop animations that no longer have any channel at all.
+        animations.retain(|animation| {
+            animation
+                .get("channels")
+                .and_then(|c| c.as_array())
+                .is_some_and(|c| !c.is_empty())
+        });
+    }
+
+    if !removed_any {
+        return Ok(glb.to_vec());
+    }
+
+    // The extension is no longer used by anything, so declaring it as
+    // required would make validators reject an otherwise-fine document.
+    for field in ["extensionsUsed", "extensionsRequired"] {
+        if let Some(list) = doc.get_mut(field).and_then(|v| v.as_array_mut()) {
+            list.retain(|v| v.as_str() != Some("KHR_animation_pointer"));
+        }
+    }
+
+    let json = serde_json::to_vec(&doc).map_err(|e| format!("re-encode json: {e}"))?;
+
+    // Rewrite the container, keeping every byte of the BIN chunk.
+    let pad = |n: usize| (4 - n % 4) % 4;
+    let json_len = json.len();
+    let header = 12 + 8 + json_len + pad(json_len);
+    let total = header + 8 + bin_len + pad(bin_len);
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(b"glTF");
+    out.extend_from_slice(&2u32.to_le_bytes());
+    out.extend_from_slice(&(total as u32).to_le_bytes());
+    out.extend_from_slice(&(json_len as u32).to_le_bytes());
+    out.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // 'JSON'
+    out.extend_from_slice(&json);
+    out.extend(std::iter::repeat(0).take(pad(json_len)));
+    out.extend_from_slice(&(bin_len as u32).to_le_bytes());
+    out.extend_from_slice(&0x004E4942u32.to_le_bytes()); // 'BIN\0'
+    out.extend_from_slice(bin_bytes);
+    out.extend(std::iter::repeat(0).take(pad(bin_len)));
+
+    bevy_log::debug!(
+        "gltf dropped {} KHR_animation_pointer channel(s) that gltf-0.16 cannot parse: {}",
+        removed.len(),
+        removed.join(", ")
+    );
+
+    Ok(out)
 }
 
 /// Decode a GLTF/GLB file from bytes.
@@ -1508,7 +1657,15 @@ pub fn sync_gltf_instances(
         // in front of the camera.
         let body_first = matrices.len() as u32;
         for (instance, transform, animator) in instances.iter_mut() {
-            if instance.model_path != *path || instance.first_person {
+            // `first_person` normally excludes an entity from the body pass,
+            // because drawing the whole body in front of the camera would
+            // swallow the view. But when the model has **no** viewmodel at
+            // all (the arm cut is disabled, or the model simply has no arms),
+            // that exclusion would drop the entity out of *every* draw list
+            // and the avatar would vanish outright. In that case the body is
+            // the only thing there is to draw, so draw it.
+            let skip_first_person = instance.first_person && viewmodel.is_some();
+            if instance.model_path != *path || skip_first_person {
                 continue;
             }
             if matrices.len() >= MAX_PALETTE_INSTANCES {
@@ -1923,6 +2080,118 @@ mod tests {
         // `[0, 1, 1]` and `[0, 0]` produce nothing.
         assert!(to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![0, 0, 0]).is_err());
         assert!(to_triangle_list(gltf::mesh::Mode::TriangleStrip, vec![]).is_err());
+    }
+
+    /// `AnimatedColorsCube.glb` animates a material colour through
+    /// `KHR_animation_pointer`. gltf-0.16 declares `node` a required field on
+    /// an animation channel target, so the whole document used to fail to
+    /// deserialize and the model never appeared at all. The sanitizer drops
+    /// the pointer channel and keeps the rest — including the ordinary
+    /// node-driven clips in the same animation.
+    #[test]
+    fn an_animation_pointer_model_still_loads() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/models/AnimatedColorsCube.glb");
+        let Ok(bytes) = std::fs::read(&path) else {
+            eprintln!("SKIPPED: AnimatedColorsCube.glb absent");
+            return;
+        };
+
+        // The pointer channel must survive sanitizing, not the parse.
+        let _sanitized = normalize_model_bytes("AnimatedColorsCube.glb", &bytes);
+
+        let loaded = decode_gltf(&bytes).expect("KHR_animation_pointer model must still load");
+        let asset = loaded.as_ref().downcast_ref::<GltfAsset>().unwrap();
+
+        assert!(
+            !asset.model.meshes.is_empty(),
+            "geometry was lost — the model must still be renderable"
+        );
+        assert!(
+            asset.skeleton.is_some(),
+            "the node-driven channels must still be decoded"
+        );
+        let clips = asset.skeleton.as_ref().unwrap().clips.len();
+        assert_eq!(clips, 1, "the animation must survive with its node channels");
+        for clip in &asset.skeleton.as_ref().unwrap().clips {
+            assert!(
+                !clip.channels.is_empty(),
+                "clip {:?} lost all its channels",
+                clip.name
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_without_pointer_channels_is_left_byte_identical() {
+        // The sanitizer must be a no-op on the common path, otherwise every
+        // hot-reload rewrites bytes and invalidates the freshness check.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/models/duck.glb");
+        let bytes = std::fs::read(&path).expect("duck.glb");
+        let sanitized = strip_unsupported_animation_channels(&bytes).expect("sanitize");
+        assert_eq!(
+            sanitized, bytes,
+            "duck.glb has no pointer channels; it must pass through untouched"
+        );
+    }
+
+    #[test]
+    fn a_glb_with_only_pointer_channels_keeps_its_geometry() {
+        // Synthetic: a minimal GLB whose single animation is all pointer.
+        let doc = serde_json::json!({
+            "asset": {"version": "2.0"},
+            "extensionsUsed": ["KHR_animation_pointer"],
+            "scenes": [{"nodes": [0]}],
+            "nodes": [{"mesh": 0}],
+            "meshes": [{"primitives": [{"attributes": {"POSITION": 0}}]}],
+            "accessors": [{
+                "bufferView": 0, "componentType": 5126, "count": 3,
+                "type": "VEC3", "min": [0.0, 0.0, 0.0], "max": [0.0, 0.0, 0.0]
+            }],
+            "bufferViews": [{"buffer": 0, "byteOffset": 0, "byteLength": 36}],
+            "buffers": [{"byteLength": 36}],
+            "animations": [{
+                "name": "pointer-only",
+                "samplers": [{"input": 1, "output": 2, "interpolation": "LINEAR"}],
+                "channels": [{
+                    "sampler": 0,
+                    "target": {
+                        "path": "pointer",
+                        "extensions": {
+                            "KHR_animation_pointer": {
+                                "pointer": "/materials/0/pbrMetallicRoughness/baseColorFactor"
+                            }
+                        }
+                    }
+                }]
+            }],
+            "materials": [{"pbrMetallicRoughness": {}}]
+        });
+        let json = serde_json::to_vec(&doc).unwrap();
+        let bin = [0u8; 36];
+        let mut glb = Vec::new();
+        glb.extend_from_slice(b"glTF");
+        glb.extend_from_slice(&2u32.to_le_bytes());
+        let total = 12 + 8 + json.len() + 8 + bin.len();
+        glb.extend_from_slice(&(total as u32).to_le_bytes());
+        glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
+        glb.extend_from_slice(&json);
+        glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
+        glb.extend_from_slice(&0x004E4942u32.to_le_bytes());
+        glb.extend_from_slice(&bin);
+
+        let sanitized = strip_unsupported_animation_channels(&glb).expect("sanitize");
+        assert_ne!(sanitized, glb, "something should have been stripped");
+
+        let (document, _buffers, _images) =
+            gltf::import_slice(&sanitized).expect("stripped GLB must parse");
+        assert!(
+            document.animations().count() == 0,
+            "an all-pointer animation must be removed, not left unusable"
+        );
+        assert_eq!(document.meshes().count(), 1, "geometry must survive");
     }
 
     #[test]
