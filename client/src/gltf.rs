@@ -375,22 +375,31 @@ fn strip_unsupported_animation_channels(glb: &[u8]) -> Result<Vec<u8>, String> {
     let json = serde_json::to_vec(&doc).map_err(|e| format!("re-encode json: {e}"))?;
 
     // Rewrite the container, keeping every byte of the BIN chunk.
-    let pad = |n: usize| (4 - n % 4) % 4;
-    let json_len = json.len();
-    let header = 12 + 8 + json_len + pad(json_len);
-    let total = header + 8 + bin_len + pad(bin_len);
-    let mut out = Vec::with_capacity(total);
+    //
+    // The reader in `gltf::binary::split_binary_gltf` advances past the JSON
+    // chunk by exactly `json_h.length` bytes and does **not** skip the
+    // alignment padding, so the BIN header must sit immediately after the
+    // padded JSON payload. Both chunk lengths are therefore the padded ones.
+    let mut json_padded = json.clone();
+    while json_padded.len() % 4 != 0 {
+        json_padded.push(b' ');
+    }
+    let mut bin_padded = bin_bytes.to_vec();
+    while bin_padded.len() % 4 != 0 {
+        bin_padded.push(0);
+    }
+
+    let total = (12 + 8 + json_padded.len() + 8 + bin_padded.len()) as u32;
+    let mut out = Vec::with_capacity(total as usize);
     out.extend_from_slice(b"glTF");
     out.extend_from_slice(&2u32.to_le_bytes());
-    out.extend_from_slice(&(total as u32).to_le_bytes());
-    out.extend_from_slice(&(json_len as u32).to_le_bytes());
-    out.extend_from_slice(&0x4E4F534Au32.to_le_bytes()); // 'JSON'
-    out.extend_from_slice(&json);
-    out.extend(std::iter::repeat(0).take(pad(json_len)));
-    out.extend_from_slice(&(bin_len as u32).to_le_bytes());
-    out.extend_from_slice(&0x004E4942u32.to_le_bytes()); // 'BIN\0'
-    out.extend_from_slice(bin_bytes);
-    out.extend(std::iter::repeat(0).take(pad(bin_len)));
+    out.extend_from_slice(&total.to_le_bytes());
+    out.extend_from_slice(&(json_padded.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"JSON");
+    out.extend_from_slice(&json_padded);
+    out.extend_from_slice(&(bin_padded.len() as u32).to_le_bytes());
+    out.extend_from_slice(b"BIN\x00");
+    out.extend_from_slice(&bin_padded);
 
     bevy_log::debug!(
         "gltf dropped {} KHR_animation_pointer channel(s) that gltf-0.16 cannot parse: {}",
@@ -2170,14 +2179,16 @@ mod tests {
         });
         let json = serde_json::to_vec(&doc).unwrap();
         let bin = [0u8; 36];
+        let json_pad = (4 - json.len() % 4) % 4;
         let mut glb = Vec::new();
         glb.extend_from_slice(b"glTF");
         glb.extend_from_slice(&2u32.to_le_bytes());
-        let total = 12 + 8 + json.len() + 8 + bin.len();
+        let total = 12 + 8 + json.len() + json_pad + 8 + bin.len();
         glb.extend_from_slice(&(total as u32).to_le_bytes());
         glb.extend_from_slice(&(json.len() as u32).to_le_bytes());
         glb.extend_from_slice(&0x4E4F534Au32.to_le_bytes());
         glb.extend_from_slice(&json);
+        glb.extend(std::iter::repeat(0).take(json_pad));
         glb.extend_from_slice(&(bin.len() as u32).to_le_bytes());
         glb.extend_from_slice(&0x004E4942u32.to_le_bytes());
         glb.extend_from_slice(&bin);
