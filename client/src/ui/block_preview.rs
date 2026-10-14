@@ -66,6 +66,7 @@ pub fn decode_block(
     name: &str,
     baked: &HashMap<String, BakedModel>,
     pack_dir: &Path,
+    embedded: &HashMap<String, (u32, u32, Vec<u8>)>,
 ) -> Result<DecodedImage, String> {
     let Some(model) = McAssets::model_for_baked(baked, name) else {
         return Err(format!("no baked model for `{name}`"));
@@ -90,8 +91,12 @@ pub fn decode_block(
         if !is_visible(quad) {
             continue;
         }
-        let tex = texture_path_for(pack_dir, &quad.texture)
-            .and_then(|p| load_texture(&mut tex_cache, &quad.texture, &p));
+        let tex = load_preview_texture(
+            &mut tex_cache,
+            &quad.texture,
+            pack_dir,
+            embedded,
+        );
         let Some((tw, th, _)) = tex else {
             if !missing_logged {
                 debug!("block preview `{name}`: missing texture, skipping quads");
@@ -110,8 +115,12 @@ pub fn decode_block(
         }
     }
     for tri in &model.tris {
-        let tex = texture_path_for(pack_dir, &tri.texture)
-            .and_then(|p| load_texture(&mut tex_cache, &tri.texture, &p));
+        let tex = load_preview_texture(
+            &mut tex_cache,
+            &tri.texture,
+            pack_dir,
+            embedded,
+        );
         if tex.is_none() {
             if !missing_logged {
                 debug!("block preview `{name}`: missing texture, skipping tris");
@@ -161,8 +170,7 @@ pub fn decode_block(
     let mut zbuf = vec![f32::NEG_INFINITY; size * size];
     for quad in kept {
         let shade = shade_for(&quad.normal);
-        let path = texture_path_for(pack_dir, &quad.texture).expect("cached above");
-        let Some((tw, th, px)) = load_texture(&mut tex_cache, &quad.texture, &path) else {
+        let Some((tw, th, px)) = tex_cache.get(&quad.texture).cloned() else {
             continue;
         };
         // Grayscale tintindex faces (grass, foliage) get the biome tint,
@@ -200,8 +208,7 @@ pub fn decode_block(
     }
     for tri in kept_tris {
         let shade = shade_for(&tri.normal);
-        let path = texture_path_for(pack_dir, &tri.texture).expect("cached above");
-        let Some((tw, th, px)) = load_texture(&mut tex_cache, &tri.texture, &path) else {
+        let Some((tw, th, px)) = tex_cache.get(&tri.texture).cloned() else {
             continue;
         };
         // bbmodel bakes carry no tint flags yet; tris draw untinted.
@@ -262,6 +269,22 @@ fn shade_for(normal: &[f32; 3]) -> f32 {
 
 fn project(c: &[f32; 3]) -> (f32, f32) {
     ((c[0] - c[2]) * COS30, (c[0] + c[2]) * SIN30 - c[1])
+}
+
+/// Resolve preview pixels: embedded bbmodel textures first, then the MC
+/// pack files. Results land in the per-call cache the draw loops read.
+fn load_preview_texture(
+    cache: &mut HashMap<String, (u32, u32, Vec<u8>)>,
+    key: &str,
+    pack_dir: &Path,
+    embedded: &HashMap<String, (u32, u32, Vec<u8>)>,
+) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(hit) = embedded.get(key) {
+        cache.insert(key.to_string(), hit.clone());
+        return Some(hit.clone());
+    }
+    let path = texture_path_for(pack_dir, key)?;
+    load_texture(cache, key, &path)
 }
 
 fn load_texture(
@@ -356,7 +379,8 @@ mod tests {
             .into_iter()
             .map(|(k, v)| (format!("minecraft:{k}"), v))
             .collect();
-        let img = decode_block("minecraft:stone", &baked, &pack_dir).expect("stone previews");
+        let img = decode_block("minecraft:stone", &baked, &pack_dir, &HashMap::new())
+            .expect("stone previews");
         assert_eq!((img.width, img.height), (PREVIEW_SIZE, PREVIEW_SIZE));
         let opaque = img.rgba.chunks_exact(4).filter(|p| p[3] > 0).count();
         let total = (PREVIEW_SIZE * PREVIEW_SIZE) as usize;

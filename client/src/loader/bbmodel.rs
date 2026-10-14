@@ -265,6 +265,10 @@ impl Transform {
         Self { stack: Vec::new() }
     }
 
+    fn is_identity(&self) -> bool {
+        self.stack.is_empty()
+    }
+
     fn rotated(&self, euler: [f32; 3], origin: [f32; 3]) -> Self {
         let mut next = self.clone();
         // Blockbench euler XYZ: apply X, then Y, then Z (intrinsic readout
@@ -397,6 +401,9 @@ fn bake_cube(
         return;
     };
     report.cubes += 1;
+    // Unrotated boxes keep axis cull faces (props collide); anything the
+    // hierarchy rotated gets none (a wrong cull hides the block).
+    let keep_cull = local.is_identity();
     for (dir, face) in faces {
         let Some(normal) = bb_face_normal(dir) else {
             continue;
@@ -437,9 +444,21 @@ fn bake_cube(
             normal: wnormal,
             uvs,
             texture,
-            cull: None,
+            cull: keep_cull.then(|| normal_dir(dir)).flatten(),
             tinted: false,
         });
+    }
+}
+
+fn normal_dir(dir: &str) -> Option<[i32; 3]> {
+    match dir {
+        "up" => Some([0, 1, 0]),
+        "down" => Some([0, -1, 0]),
+        "north" => Some([0, 0, -1]),
+        "south" => Some([0, 0, 1]),
+        "east" => Some([1, 0, 0]),
+        "west" => Some([-1, 0, 0]),
+        _ => None,
     }
 }
 

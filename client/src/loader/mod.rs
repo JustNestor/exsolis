@@ -55,7 +55,34 @@ pub fn scan_mc_block_names(pack_dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// Pre-baked MC models, shared with meshing tasks behind an `Arc`.
+/// Env var pointing at Blockbench `.bbmodel` props
+/// (`<root>/*.bbmodel`). Defaults to `assets/models/thaumcraft` (dev).
+pub fn tc_pack_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("EXSOLIS_TC_ASSETS").map(PathBuf::from) {
+        return dir.is_dir().then_some(dir);
+    }
+    let dev = PathBuf::from("assets/models/thaumcraft");
+    dev.is_dir().then_some(dev)
+}
+
+/// Scan `<dir>/*.bbmodel` stems, sorted (registry ids; mirrors server).
+pub fn scan_tc_block_names(pack_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(pack_dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bbmodel") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(format!("thaumcraft:{stem}"));
+        }
+    }
+    names.sort();
+    names
+}
 #[derive(Resource, Clone, Default)]
 pub struct McAssets {
     pub baked: Arc<HashMap<String, BakedModel>>,
@@ -69,6 +96,9 @@ pub struct McAssets {
     /// multiply them by the plains biome tint. Single tint for all foliage
     /// (oak/birch/spruce differ slightly in vanilla) — documented M-limitation.
     pub tinted_textures: HashSet<String>,
+    /// Embedded bbmodel textures (`thaumcraft/<model>/<tex>` -> pixels),
+    /// uploaded by `setup_textures` and served to `block#` previews.
+    pub embedded: Arc<HashMap<String, (u32, u32, Vec<u8>)>>,
 }
 
 /// Plains biome tint (MC grass colormap): #91BD59.
@@ -120,6 +150,33 @@ fn legacy_mc_name(name: &str) -> Option<&'static str> {
         "exsolis:chest" => "minecraft:chest",
         _ => return None,
     })
+}
+
+/// `.bbmodel` files in a prop dir, sorted for deterministic logs.
+fn sorted_bbmodels(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("bbmodel") {
+            out.push(path);
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Rewrite a bbmodel bake's texture keys into `thaumcraft/<stem>/<tex>`.
+fn retarget_bb_textures(mut model: BakedModel, stem: &str) -> BakedModel {
+    for q in &mut model.quads {
+        q.texture = format!("thaumcraft/{stem}/{}", q.texture);
+    }
+    for t in &mut model.tris {
+        t.texture = format!("thaumcraft/{stem}/{}", t.texture);
+    }
+    model
 }
 
 pub struct McAssetsPlugin;
@@ -191,6 +248,57 @@ impl Plugin for McAssetsPlugin {
                             );
                         }
                         assets.tinted_textures = tinted;
+                        // Thaumcraft bbmodel props: bake + merge under
+                        // `thaumcraft:<stem>`, rewriting texture keys to
+                        // `thaumcraft/<stem>/<tex>` (per-model namespace:
+                        // several models call their texture "texture").
+                        if let Some(tc) = tc_pack_dir() {
+                            let mut count = 0;
+                            for path in sorted_bbmodels(&tc) {
+                                let stem = path
+                                    .file_stem()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("prop")
+                                    .to_string();
+                                match load_bbmodel(&path) {
+                                    Ok((mut model, report)) => {
+                                        let key = format!("thaumcraft:{stem}");
+                                        let baked = std::mem::take(&mut model.baked);
+                                        let baked = retarget_bb_textures(baked, &stem);
+                                        for img in &model.textures {
+                                            let tkey =
+                                                format!("thaumcraft/{stem}/{}", img.name);
+                                            Arc::get_mut(&mut assets.embedded)
+                                                .expect("sole owner at startup")
+                                                .insert(
+                                                    tkey,
+                                                    (img.width, img.height, img.rgba.clone()),
+                                                );
+                                        }
+                                        Arc::get_mut(&mut assets.baked)
+                                            .expect("sole owner at startup")
+                                            .insert(key, baked);
+                                        count += 1;
+                                        bevy_log::info!(
+                                            "TcPack: {stem}: {} quads, {} tris, {} embedded tex, {} anims",
+                                            report.quads,
+                                            report.tris,
+                                            model.textures.len(),
+                                            report.animations.len()
+                                        );
+                                        for w in report.warnings.iter().take(4) {
+                                            bevy_log::warn!("TcPack {stem}: {w}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        bevy_log::warn!("TcPack: {}: {e}", path.display());
+                                    }
+                                }
+                            }
+                            if count > 0 {
+                                bevy_log::info!("TcPack: {count} prop models from {}", tc.display());
+                            }
+                        }
                         // `bake_all` keys are bare stems; the mesher looks up
                         // full `namespace:name` ids.
                         assets.baked = Arc::new(

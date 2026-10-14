@@ -61,6 +61,7 @@ pub fn decode_block(
     name: &str,
     baked: &HashMap<String, BakedModel>,
     pack_dir: &Path,
+    embedded: &HashMap<String, (u32, u32, Vec<u8>)>,
 ) -> Result<DecodedImage, String> {
-    super::block_preview::decode_block(name, baked, pack_dir)
+    super::block_preview::decode_block(name, baked, pack_dir, embedded)
 }

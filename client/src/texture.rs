@@ -543,6 +543,60 @@ fn setup_textures(
         });
     }
 
+    // Embedded bbmodel textures (Thaumcraft props): already RGBA, keyed
+    // `thaumcraft/<model>/<tex>` to match the retargeted bakes.
+    if let Some(mc) = mc.as_ref() {
+        for (key, (w, h, rgba)) in mc.embedded.iter() {
+            let (width, height) = (*w, *h);
+            if width == 0 || height == 0 || rgba.is_empty() {
+                continue;
+            }
+            let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+            let Ok(image_id) = vk.resources.create_image(
+                &ImageCreateInfo {
+                    image_type: ImageType::Dim2d,
+                    format: vulkano::format::Format::R8G8B8A8_UNORM,
+                    extent: [width, height, 1],
+                    mip_levels,
+                    usage: ImageUsage::TRANSFER_SRC | ImageUsage::TRANSFER_DST | ImageUsage::SAMPLED,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo::default(),
+            ) else {
+                continue;
+            };
+            let Some(layout) = DeviceLayout::new(
+                NonZero::new(rgba.len() as u64).unwrap(),
+                DeviceAlignment::new(4).unwrap(),
+            ) else {
+                continue;
+            };
+            let Ok(staging_id) = vk.resources.create_buffer(
+                &BufferCreateInfo {
+                    usage: BufferUsage::TRANSFER_SRC,
+                    ..Default::default()
+                },
+                &AllocationCreateInfo {
+                    memory_type_filter: MemoryTypeFilter::HOST_SEQUENTIAL_WRITE,
+                    ..Default::default()
+                },
+                layout,
+            ) else {
+                continue;
+            };
+            pending.push(PendingTexture {
+                key: key.clone(),
+                image_data: rgba.clone(),
+                width,
+                height,
+                image_id,
+                staging_id,
+                mip_levels,
+                anim: None,
+            });
+        }
+    }
+
     if pending.is_empty() {
         commands.insert_resource(manager);
         return;

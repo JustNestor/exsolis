@@ -64,6 +64,19 @@ impl Plugin for BlocksPlugin {
                 bevy_log::info!("ServerBlocks: no MC pack; 11 built-in blocks only");
             }
         }
+        // Thaumcraft bbmodel props: mirrors the client scan exactly
+        // (same dir shape, same sort => same ids). Will move to a
+        // registry-sync message with dynamic mod blocks.
+        if let Some(tc) = tc_pack_dir() {
+            let mut added = 0;
+            for name in scan_tc_block_names(&tc) {
+                if registry.id(&name).is_none() {
+                    registry.register_mod(name, true, false, false);
+                    added += 1;
+                }
+            }
+            bevy_log::info!("ServerBlocks: +{added} thaumcraft props from {}", tc.display());
+        }
         app.insert_resource(ServerBlocks(registry));
     }
 }
@@ -76,6 +89,34 @@ fn mc_pack_dir() -> Option<std::path::PathBuf> {
     }
     let dev = std::path::PathBuf::from("temp/minecraft");
     dev.is_dir().then_some(dev)
+}
+
+/// Thaumcraft prop dir: `EXSOLIS_TC_ASSETS` or `assets/models/thaumcraft`.
+/// Same mirror rule as the MC pack (client reads the same relative dir).
+fn tc_pack_dir() -> Option<std::path::PathBuf> {
+    if let Some(dir) = std::env::var_os("EXSOLIS_TC_ASSETS").map(std::path::PathBuf::from) {
+        return dir.is_dir().then_some(dir);
+    }
+    let dev = std::path::PathBuf::from("assets/models/thaumcraft");
+    dev.is_dir().then_some(dev)
+}
+
+fn scan_tc_block_names(pack_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let Ok(entries) = std::fs::read_dir(pack_dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("bbmodel") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(format!("thaumcraft:{stem}"));
+        }
+    }
+    names.sort();
+    names
 }
 
 fn scan_mc_block_names(pack_dir: &std::path::Path) -> Vec<String> {

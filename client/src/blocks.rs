@@ -83,6 +83,18 @@ impl Plugin for BlocksPlugin {
                 bevy_log::info!("ClientBlocks: no MC pack; 11 built-in blocks only");
             }
         }
+        // Thaumcraft bbmodel props (static meshes for now): same scan as
+        // the server, same sort => same ids.
+        if let Some(tc) = crate::loader::tc_pack_dir() {
+            let mut added = 0;
+            for name in crate::loader::scan_tc_block_names(&tc) {
+                if registry.id(&name).is_none() {
+                    registry.register_mod(name, true, false, false);
+                    added += 1;
+                }
+            }
+            bevy_log::info!("ClientBlocks: +{added} thaumcraft props from {}", tc.display());
+        }
         app.insert_resource(ClientBlocks(registry));
     }
 }

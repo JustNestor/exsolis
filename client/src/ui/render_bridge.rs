@@ -390,15 +390,17 @@ fn sync_ui_images(
         // model map + MC pack dir. Failures land in `failed`, so each bad
         // src warns exactly once and is never retried.
         if let Some(name) = src.strip_prefix("block#") {
-            let baked_and_dir = mc
-                .as_ref()
-                .and_then(|m| m.pack_dir.as_ref().map(|dir| (&m.baked, dir)));
-            let Some((baked, pack_dir)) = baked_and_dir else {
+            let Some(m) = mc.as_ref() else {
                 bevy_log::warn!("ui img `{src}`: no MC pack for block preview");
                 registry.failed.insert(src.clone());
                 continue;
             };
-            let decoded = match img_assets::decode_block(name, baked, pack_dir) {
+            let Some(pack_dir) = m.pack_dir.as_ref() else {
+                bevy_log::warn!("ui img `{src}`: no MC pack for block preview");
+                registry.failed.insert(src.clone());
+                continue;
+            };
+            let decoded = match img_assets::decode_block(name, &m.baked, pack_dir, &m.embedded) {
                 Ok(d) => d,
                 Err(e) => {
                     bevy_log::warn!("ui img `{src}`: {e}");
