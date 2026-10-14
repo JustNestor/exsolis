@@ -4,8 +4,15 @@ IsInvOpen = IsInvOpen or {}
 local function ensure(player_id)
     if not PlayerInventory.players[player_id] then
         local inventory = PlayerInventory.create(player_id)
-        Container.set(inventory.container, 0, { id = "wood", count = 12 })
-        Container.set(inventory.container, 2, { id = "stone", count = 3 })
+        -- Starter kit mirrors the Rust authority (attach_player_components):
+        -- same blocks, full stacks, so the E-screen matches the HUD.
+        for _, name in ipairs({
+            "exsolis:dirt", "exsolis:stone", "exsolis:sand",
+            "exsolis:snow", "exsolis:glass",
+        }) do
+            local id = api.block_id(name)
+            if id then PlayerInventory.add(player_id, id, 64) end
+        end
     end
     return PlayerInventory.get(player_id)
 end
@@ -198,6 +205,22 @@ end)
 api.on("select_hotbar", function(ev)
     if ev.index >= 0 and ev.index < 9 then
         PlayerInventory.get(ev.player_id).selected = ev.index
+        if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
+    end
+end)
+
+-- Mirror the Rust authority so the E-screen never drifts from the HUD:
+-- place consumes the selected stack, break adds the drop.
+api.on("place_block", function(ev)
+    if ev.block_id and ev.block_id >= 0 then
+        PlayerInventory.remove_one(ev.player_id, ev.block_id)
+        if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
+    end
+end)
+
+api.on("break_block", function(ev)
+    if ev.block_id and ev.block_id >= 0 then
+        PlayerInventory.add(ev.player_id, ev.block_id, 1)
         if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
     end
 end)

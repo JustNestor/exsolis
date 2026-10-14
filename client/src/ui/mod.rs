@@ -226,6 +226,7 @@ impl Plugin for UiPlugin {
                         .in_set(GameplaySet)
                         .before(handle_ui_packets),
                     hide_on_disconnect,
+                    arrow_key_scroll,
                     events::update_hover_styles,
                     spawn::update_scrollbar_thumbs,
                     spawn::update_cursor_widgets,
@@ -238,6 +239,38 @@ impl Plugin for UiPlugin {
 
         #[cfg(debug_assertions)]
         app.add_plugins(dev_reload::UiDevReloadPlugin);
+    }
+}
+
+/// Keyboard scrolling for scrollable panels (creative grid): ArrowUp/Down
+/// move every visible scroll area. Covers touchpads that never emit a
+/// `Pointer<Scroll>` the picker can route, and anyone who prefers keys.
+/// Only while a modal screen is open, so arrows never fight gameplay.
+fn arrow_key_scroll(
+    keys: Res<ButtonInput<KeyCode>>,
+    ui: Res<UiManager>,
+    mut areas: Query<(&bevy_ui::ComputedNode, &mut bevy_ui::ScrollPosition), With<spawn::UiScrollArea>>,
+) {
+    if !ui.captures_input() {
+        return;
+    }
+    let mut dy = 0.0;
+    if keys.pressed(KeyCode::ArrowDown) {
+        dy += 1.0;
+    }
+    if keys.pressed(KeyCode::ArrowUp) {
+        dy -= 1.0;
+    }
+    if dy == 0.0 {
+        return;
+    }
+    // ~2 rows per frame while held; matches wheel-step feel.
+    let step = 88.0 * dy;
+    for (computed, mut position) in &mut areas {
+        let visible = computed.size() * computed.inverse_scale_factor;
+        let content = computed.content_size() * computed.inverse_scale_factor;
+        let range = (content - visible).max(bevy_math::Vec2::ZERO);
+        position.y = (position.y + step).clamp(0.0, range.y);
     }
 }
 

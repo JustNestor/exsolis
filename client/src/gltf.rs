@@ -1596,6 +1596,7 @@ pub fn sync_gltf_instances(
     camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
     swing: Res<crate::anim::UseSwing>,
     time: Res<Time>,
+    ui: Option<Res<crate::ui::UiManager>>,
 ) {
     let (Some(vk), Some(render_state)) = (vk, render_state) else {
         return;
@@ -1813,8 +1814,18 @@ pub fn sync_gltf_instances(
         let mut shared = render_state.shared.write().unwrap();
         shared.gltf_instance_count = matrices.len() as u32;
         shared.gltf_draws = draws;
-        shared.viewmodel_draws = viewmodel_draws;
-        shared.viewmodel_instance_count = viewmodel_total;
+        // The first-person arms draw in their own pass after everything,
+        // including the UI — over an open inventory that reads as a bug.
+        // Hidden while any modal screen captures input (for now; a proper
+        // UI-last task-graph order replaces this gate).
+        let modal_open = ui.as_ref().is_some_and(|u| u.captures_input());
+        if modal_open {
+            shared.viewmodel_draws = Vec::new();
+            shared.viewmodel_instance_count = 0;
+        } else {
+            shared.viewmodel_draws = viewmodel_draws;
+            shared.viewmodel_instance_count = viewmodel_total;
+        }
         (
             shared.gltf_instance_buffer_id.unwrap(),
             shared.gltf_material_buffer_id.unwrap(),

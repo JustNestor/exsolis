@@ -42,6 +42,7 @@ impl Plugin for InteractionPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<PlaceBlockRequested>()
             .add_message::<BreakBlockRequested>()
+            .add_message::<BreakBlockApplied>()
             .add_message::<SelectHotbarRequested>()
             .add_systems(
                 Update,
@@ -69,6 +70,16 @@ pub struct PlaceBlockRequested {
 pub struct BreakBlockRequested {
     pub player_id: PlayerId,
     pub pos: BlockPos,
+}
+
+/// Fired when a break succeeds, carrying what was broken. Scripting
+/// forwards it to Lua (`break_block` with name + numeric id) so the Lua
+/// display inventory can mirror the Rust authority.
+#[derive(Message)]
+pub struct BreakBlockApplied {
+    pub player_id: PlayerId,
+    pub pos: BlockPos,
+    pub block: BlockId,
 }
 
 #[derive(Message)]
@@ -324,6 +335,7 @@ fn handle_break_block(
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
     blocks: Res<ServerBlocks>,
+    mut applied: MessageWriter<BreakBlockApplied>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -408,6 +420,11 @@ fn handle_break_block(
                 let inv = inventory.clone();
                 send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
             }
+            applied.write(BreakBlockApplied {
+                player_id: ev.player_id,
+                pos: ev.pos,
+                block: broken,
+            });
         }
     }
 }

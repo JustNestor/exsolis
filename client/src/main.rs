@@ -40,6 +40,7 @@ mod chunk_registry;
 mod entities;
 mod gltf;
 mod gltf_utils;
+mod hud;
 mod interaction;
 mod keybinds;
 mod loader;
@@ -103,6 +104,7 @@ fn main() {
         .add_plugins(crate::loader::McAssetsPlugin)
         .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
+        .add_plugins(hud::HudPlugin)
         .add_plugins(StreamingPlugin)
         .add_plugins(crate::entities::EntityClientPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)

@@ -994,8 +994,9 @@ fn forward_place_block(
 }
 
 fn forward_break_block(
-    mut events: MessageReader<BreakBlockRequested>,
+    mut events: MessageReader<crate::interaction::BreakBlockApplied>,
     runtime: NonSend<ScriptRuntime>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -1005,6 +1006,13 @@ fn forward_break_block(
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
+        // Enriched at the break site (the request only carries pos, and by
+        // the time any forwarder runs the cell is already air).
+        let _ = t.set("block_id", ev.block as i32);
+        let _ = t.set(
+            "block",
+            blocks.name(ev.block).unwrap_or("exsolis:air").to_string(),
+        );
         runtime.dispatch("break_block", t);
     }
 }
