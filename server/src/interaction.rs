@@ -19,12 +19,13 @@ use bevy_app::prelude::*;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
-use exsolis_common::{BlockPos, BlockType, ChunkCoord, PlayerId, ServerMessage};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, ChunkCoord, PlayerId, ServerMessage};
 use exsolis_common::{EntityKind, EntityState};
 use glam::Vec3;
 
 use crate::Inventory;
 use crate::PlayerMap;
+use crate::blocks::ServerBlocks;
 use crate::chunks::PlayerPosition;
 use crate::chunks::{ChunkRenderState, ChunkWorld};
 use crate::net::{self, OutgoingPacket};
@@ -60,7 +61,7 @@ impl Plugin for InteractionPlugin {
 pub struct PlaceBlockRequested {
     pub player_id: PlayerId,
     pub pos: BlockPos,
-    pub kind: BlockType,
+    pub kind: String,
 }
 
 #[derive(Message)]
@@ -132,11 +133,12 @@ fn within_reach(player_pos: Vec3, target: BlockPos) -> (bool, f32) {
 fn apply_and_broadcast(
     coord: ChunkCoord,
     idx: usize,
-    new_block: BlockType,
+    new_block: BlockId,
     pos: BlockPos,
     world: &mut ChunkWorld,
     outgoing: &mut MessageWriter<OutgoingPacket>,
     loaded_by: &Query<(&crate::Player, &ChunkRenderState)>,
+    blocks: &ServerBlocks,
 ) -> bool {
     let Some(existing) = world.ready.get(&coord) else {
         warn!(
@@ -154,14 +156,15 @@ fn apply_and_broadcast(
     };
     world.ready.insert(coord, updated);
 
+    let kind = blocks
+        .name(new_block)
+        .unwrap_or("exsolis:air")
+        .to_string();
     for (player, state) in loaded_by {
         if state.loaded.contains(&coord) {
             outgoing.write(OutgoingPacket::to(
                 player.0,
-                ServerMessage::BlockUpdate {
-                    pos,
-                    kind: new_block,
-                },
+                ServerMessage::BlockUpdate { pos, kind: kind.clone() },
             ));
         }
     }
@@ -177,6 +180,7 @@ fn handle_place_block(
     mut outgoing: MessageWriter<OutgoingPacket>,
     mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
+    blocks: Res<ServerBlocks>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -198,6 +202,20 @@ fn handle_place_block(
             );
             continue;
         }
+        let Some(resolved_id) = blocks.id(&ev.kind) else {
+            warn!(
+                "[PlaceBlock] Unknown block name {:?} for PlayerId {:?}",
+                ev.kind, ev.player_id
+            );
+            continue;
+        };
+        if blocks.is_air(resolved_id) {
+            warn!(
+                "[PlaceBlock] Cannot place air for PlayerId {:?}",
+                ev.player_id
+            );
+            continue;
+        };
         let Ok(mut inventory) = inventories.get_mut(entity) else {
             warn!(
                 "[PlaceBlock] Entity {:?} missing Inventory component",
@@ -213,7 +231,7 @@ fn handle_place_block(
             );
             continue;
         };
-        if selected.item != ev.kind {
+        if selected.item != resolved_id {
             warn!(
                 "[PlaceBlock] Item mismatch for PlayerId {:?}: hotbar holds {:?}, request claims {:?}",
                 ev.player_id, selected.item, ev.kind
@@ -233,7 +251,7 @@ fn handle_place_block(
             warn!("[PlaceBlock] Failed to unpack target chunk {:?}", coord);
             continue;
         };
-        if unpacked[idx] != BlockType::Air {
+        if unpacked[idx] != AIR_ID {
             warn!(
                 "[PlaceBlock] Target block at {:?} is not Air (currently {:?}, attempted place {:?}",
                 ev.pos, unpacked[idx], ev.kind
@@ -244,11 +262,12 @@ fn handle_place_block(
         if !apply_and_broadcast(
             coord,
             idx,
-            ev.kind,
+            resolved_id,
             ev.pos,
             &mut world,
             &mut outgoing,
             &loaded_by,
+            &blocks,
         ) {
             warn!(
                 "[PlaceBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
@@ -256,11 +275,11 @@ fn handle_place_block(
             );
         } else {
             let selected_index = inventory.selected_index();
-            inventory.remove_one(selected_index, ev.kind);
+            inventory.remove_one(selected_index, resolved_id);
             // Placing a container block brings its block entity into being.
             // Keyed by position, so replacing the block at a position that
             // already has an entity is handled by the break path first.
-            if crate::entities::is_block_entity(ev.kind) {
+            if crate::entities::is_block_entity(resolved_id, &blocks.0) {
                 spawns.write(crate::entities::SpawnEntityRequest {
                     kind: EntityKind::Block,
                     state: block_entity_state(ev.pos),
@@ -268,7 +287,7 @@ fn handle_place_block(
                     model: None,
                     scale: 1.0,
                     block_pos: Some(ev.pos),
-                    extra: crate::entities::SpawnExtra::BlockEntity(ev.kind),
+                    extra: crate::entities::SpawnExtra::BlockEntity(resolved_id),
                     player_token: None,
                 });
             }
@@ -300,6 +319,7 @@ fn handle_break_block(
     mut world: ResMut<ChunkWorld>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
+    blocks: Res<ServerBlocks>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -335,7 +355,7 @@ fn handle_break_block(
             continue;
         };
         let broken = unpacked[idx];
-        if broken == BlockType::Air {
+        if broken == AIR_ID {
             warn!(
                 "[BreakBlock] Target block at {:?} is Air (nothing to break)",
                 ev.pos
@@ -346,11 +366,12 @@ fn handle_break_block(
         if !apply_and_broadcast(
             coord,
             idx,
-            BlockType::Air,
+            AIR_ID,
             ev.pos,
             &mut world,
             &mut outgoing,
             &loaded_by,
+            &blocks,
         ) {
             warn!(
                 "[BreakBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
@@ -360,7 +381,7 @@ fn handle_break_block(
             // Breaking a container block tears down its block entity. The
             // contents are handed to the breaker rather than dropped, so a
             // chest can never be destroyed to destroy its loot.
-            if crate::entities::is_block_entity(broken)
+            if crate::entities::is_block_entity(broken, &blocks.0)
                 && let Some(block_entity_id) = registry.at_block(ev.pos)
             {
                 if let Some(be) = registry.entity_of(block_entity_id) {

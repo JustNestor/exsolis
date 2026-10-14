@@ -7,7 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{BlockType, HOTBAR_SIZE};
+use crate::{BlockId, HOTBAR_SIZE};
 
 /// Placed as a hard ceiling here (not just a UI convention) because
 /// `add_item` on the server refuses to grow a stack past it — that's what
@@ -16,7 +16,7 @@ pub const MAX_STACK: u8 = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slot {
-    pub item: BlockType,
+    pub item: BlockId,
     pub amount: u8,
 }
 
@@ -60,7 +60,7 @@ impl Inventory {
     /// before using empty slots. Returns how much didn't fit (0 = all of
     /// it went in). Mirrors the old project's `add_item`, minus the
     /// separate main-storage range (there's only the hotbar here).
-    pub fn add_item(&mut self, item: BlockType, amount: u8) -> u8 {
+    pub fn add_item(&mut self, item: BlockId, amount: u8) -> u8 {
         let mut remaining = amount;
 
         for slot in self.slots.iter_mut().flatten() {
@@ -115,7 +115,7 @@ impl Inventory {
     /// Used by place: the server decrements the selected slot only after
     /// confirming the placement is otherwise valid, so a rejected place
     /// never costs an item. Returns `true` on success.
-    pub fn remove_one(&mut self, index: u8, item: BlockType) -> bool {
+    pub fn remove_one(&mut self, index: u8, item: BlockId) -> bool {
         let Some(slot) = self.slots.get_mut(index as usize) else {
             return false;
         };

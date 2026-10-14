@@ -23,12 +23,12 @@
 
 use std::collections::HashMap;
 
-use exsolis_common::BlockType;
+use exsolis_common::{AIR_ID, BlockId, BlockRegistry};
 use glam::IVec3;
 use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
 use crate::{
-    block_textures::BlockTextures,
+    block_textures,
     chunk::{CHUNK_SIZE, Chunk},
     texture::{TextureManager, TextureMapping, sampled_image_index},
 };
@@ -254,13 +254,13 @@ impl ChunkNeighborhood {
         }
     }
 
-    fn get_block(&self, x: i32, y: i32, z: i32) -> BlockType {
+    fn get_block(&self, x: i32, y: i32, z: i32) -> BlockId {
         let (dx, lx) = Self::split(x);
         let (dy, ly) = Self::split(y);
         let (dz, lz) = Self::split(z);
         match self.chunks.get(&IVec3::new(dx, dy, dz)) {
             Some(chunk) => chunk.get(lx, ly, lz),
-            None => BlockType::Air,
+            None => AIR_ID,
         }
     }
 }
@@ -270,7 +270,8 @@ fn is_face_visible(
     x: i32,
     y: i32,
     z: i32,
-    this: BlockType,
+    this: BlockId,
+    registry: &BlockRegistry,
 ) -> bool {
     let neighbour = neighborhood.get_block(x, y, z);
     // Was `!neighbour.is_solid()`. That treats glass and leaves as solid,
@@ -278,7 +279,7 @@ fn is_face_visible(
     // see-through hole to the void once they have alpha textures. Use
     // "transparent" instead; same-type neighbours (water/water,
     // glass/glass) still get no internal face between them.
-    neighbour.is_transparent() && neighbour != this
+    registry.is_transparent(neighbour) && neighbour != this
 }
 
 #[derive(Default)]
@@ -290,6 +291,7 @@ pub(crate) struct ChunkMeshData {
 pub(crate) fn build_chunk_mesh(
     neighborhood: &ChunkNeighborhood,
     textures: &TextureManager,
+    registry: &BlockRegistry,
 ) -> ChunkMeshData {
     let mut mesh = ChunkMeshData::default();
     let chunk = &neighborhood.chunks[&IVec3::ZERO];
@@ -299,10 +301,10 @@ pub(crate) fn build_chunk_mesh(
         for y in 0..CHUNK_SIZE {
             for z in 0..CHUNK_SIZE {
                 let block = chunk.get(x, y, z);
-                if block.is_air() {
+                if registry.is_air(block) {
                     continue;
                 }
-                let Some(mapping) = block.texture_mapping() else {
+                let Some(mapping) = block_textures::texture_mapping(registry, block) else {
                     continue;
                 };
                 let (fx, fy, fz) = (
@@ -313,7 +315,7 @@ pub(crate) fn build_chunk_mesh(
                 let (ix, iy, iz) = (x as i32, y as i32, z as i32);
 
                 for &(face, dir) in &FACE_DIRS {
-                    if !is_face_visible(neighborhood, ix + dir.x, iy + dir.y, iz + dir.z, block) {
+                    if !is_face_visible(neighborhood, ix + dir.x, iy + dir.y, iz + dir.z, block, registry) {
                         continue;
                     }
                     // `get` only returns None when NO texture loaded at all,

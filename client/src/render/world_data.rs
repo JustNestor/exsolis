@@ -26,11 +26,11 @@
 
 use bevy_ecs::prelude::*;
 use bevy_transform::prelude::Transform;
-use exsolis_common::{BlockType, ChunkCoord};
+use exsolis_common::{BlockId, BlockRegistry, ChunkCoord};
 use glam::IVec3;
 
 use crate::{
-    block_textures::BlockTextures,
+    blocks::ClientBlocks,
     chunk::{CHUNK_SIZE, Chunk},
     chunk_registry::ChunkRegistry,
     player::LocalPlayer,
@@ -145,27 +145,27 @@ fn cell_index(coord: IVec3, dims: IVec3) -> usize {
 
 /// Decides what shaders can know about a block: id (low byte) and flags.
 /// Extend this (and the WGSL import) to expose more, e.g. a liquid flag.
-fn pack_block(block: BlockType) -> u16 {
-    let mut packed = (block as u32 & 0xFF) as u16;
-    if block.is_solid() {
+fn pack_block(block: BlockId, registry: &BlockRegistry) -> u16 {
+    let mut packed = block & 0xFF;
+    if registry.is_solid(block) {
         packed |= FLAG_SOLID;
     }
-    if block.is_transparent() {
+    if registry.is_transparent(block) {
         packed |= FLAG_TRANSPARENT;
     }
-    if block.is_air() {
+    if registry.is_air(block) {
         packed |= FLAG_AIR;
     }
     packed
 }
 
-fn pack_chunk(chunk: &Chunk) -> Box<[u32]> {
+fn pack_chunk(chunk: &Chunk, registry: &BlockRegistry) -> Box<[u32]> {
     let mut words = vec![0u32; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE / 2];
     for y in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let voxel = (y * CHUNK_SIZE + z) * CHUNK_SIZE + x;
-                words[voxel / 2] |= u32::from(pack_block(chunk.get(x, y, z))) << ((voxel % 2) * 16);
+                words[voxel / 2] |= u32::from(pack_block(chunk.get(x, y, z), registry)) << ((voxel % 2) * 16);
             }
         }
     }
@@ -178,12 +178,23 @@ fn pack_chunk(chunk: &Chunk) -> Box<[u32]> {
 pub(super) fn update_world_window(
     mut window: ResMut<WorldWindow>,
     registry: Option<Res<ChunkRegistry>>,
+    blocks: Option<Res<ClientBlocks>>,
     chunks: Query<Ref<Chunk>>,
     camera: Query<&Transform, With<LocalPlayer>>,
 ) {
     window.pending.clear();
     let (Some(registry), Ok(transform)) = (registry, camera.single()) else {
         return;
+    };
+    // Registry flags for pack_block; fall back to default flags when the
+    // ClientBlocks resource is absent (e.g. early startup).
+    let default_registry;
+    let block_registry: &BlockRegistry = match blocks.as_ref() {
+        Some(b) => &b.0,
+        None => {
+            default_registry = BlockRegistry::default_registry();
+            &default_registry
+        }
     };
 
     let dims = IVec3::new(
@@ -248,7 +259,7 @@ pub(super) fn update_world_window(
         uploads.push(WorldUpload {
             cell: cell as u32,
             tag: [coord.x, coord.y, coord.z, 1],
-            voxels: Some(pack_chunk(&chunk)),
+            voxels: Some(pack_chunk(&chunk, block_registry)),
             desired: CellState::Loaded(coord, tick),
         });
     }

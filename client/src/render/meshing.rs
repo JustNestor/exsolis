@@ -12,6 +12,7 @@ use exsolis_common::ChunkCoord;
 use glam::IVec3;
 
 use crate::{
+    blocks::ClientBlocks,
     chunk::Chunk,
     chunk_registry::ChunkRegistry,
     mesh::{ChunkMeshData, ChunkNeighborhood, ChunkVertex, build_chunk_mesh},
@@ -160,6 +161,7 @@ pub(super) fn queue_chunk_meshing(
     mut commands: Commands,
     textures: Option<Res<TextureManager>>,
     registry: Res<ChunkRegistry>,
+    blocks: Option<Res<ClientBlocks>>,
     all_chunks: Query<&Chunk>,
     needs_mesh: Query<
         (Entity, &Chunk),
@@ -212,11 +214,15 @@ pub(super) fn queue_chunk_meshing(
         // borrow wrapper (not 'static, can't move into the task). TextureManager
         // wraps its map in an Arc, so this is a refcount bump, not a HashMap copy.
         let textures: TextureManager = (*textures).clone();
+        let registry_owned: exsolis_common::BlockRegistry = blocks
+            .as_ref()
+            .map(|b| b.0.clone())
+            .unwrap_or_else(exsolis_common::BlockRegistry::default_registry);
         let task = pool.spawn(async move {
             let neighborhood = ChunkNeighborhood {
                 chunks: neighbor_chunks,
             };
-            build_chunk_mesh(&neighborhood, &textures)
+            build_chunk_mesh(&neighborhood, &textures, &registry_owned)
         });
         commands
             .entity(entity)

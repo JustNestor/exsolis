@@ -6,7 +6,7 @@ use crate::scripting::KeybindActionRequested;
 use super::*;
 use bevy_ecs::message::Message;
 use chunks::{PlayerPosition, RenderDistanceRequested};
-use exsolis_common::{BlockType, EntityKind, EntityState, SPAWN_POS};
+use exsolis_common::{BlockRegistry, EntityKind, EntityState, SPAWN_POS};
 use glam::Vec3;
 use movement::{PlayerInput, PlayerLook, PositionSync};
 use std::collections::HashSet;
@@ -175,16 +175,22 @@ pub struct JoiningPlayers {
 
 /// Components only a player entity carries: input, look, the authoritative
 /// position, sync state and a starting inventory.
-pub(crate) fn attach_player_components(commands: &mut Commands, entity: Entity) {
+pub(crate) fn attach_player_components(
+    commands: &mut Commands,
+    entity: Entity,
+    registry: &BlockRegistry,
+) {
     let mut inventory = crate::Inventory::default();
-    for block in [
-        BlockType::Dirt,
-        BlockType::Stone,
-        BlockType::Sand,
-        BlockType::Snow,
-        BlockType::Glass,
+    for name in [
+        "exsolis:dirt",
+        "exsolis:stone",
+        "exsolis:sand",
+        "exsolis:snow",
+        "exsolis:glass",
     ] {
-        inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+        if let Some(block) = registry.id(name) {
+            inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+        }
     }
     commands.entity(entity).insert((
         PlayerPosition(Vec3::from(SPAWN_POS)),
@@ -256,7 +262,7 @@ pub fn dispatch_incoming(
                 commands.write_message(PlaceBlockRequested {
                     player_id: client_id,
                     pos: *pos,
-                    kind: *kind,
+                    kind: kind.clone(),
                 });
             }
             ClientMessage::BreakBlock { pos } => {

@@ -1,14 +1,16 @@
 use serde::{Deserialize, Serialize};
 
 mod chunk_blocks;
+pub mod blocks;
 pub mod inventory;
 
+pub use blocks::{AIR_ID, BlockDef, BlockId, BlockRegistry};
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
 /// `EntityStateUpdate`). `EntityKind` gained variants, so an old client's
 /// decode of a new server's stream would desync rather than fail cleanly.
-pub const PROTOCOL_ID: u64 = 3;
+pub const PROTOCOL_ID: u64 = 4;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -55,52 +57,20 @@ impl BlockPos {
 /// `#[repr(u8)]` + explicit discriminants: the numeric id is what goes into
 /// `ChunkBlocks` palettes on the wire. Never reorder/renumber existing
 /// variants without bumping the protocol; append new ones and extend `ALL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum BlockType {
-    Air = 0,
-    Stone = 1,
-    Dirt = 2,
-    Grass = 3,
-    Sand = 4,
-    Water = 5,
-    Snow = 6,
-    Glass = 7,
-    Log = 8,
-    Leaves = 9,
-    /// Carries a `Container`. Placing one creates a block entity; breaking it
-    /// despawns that entity and spills its slots.
-    Chest = 10,
-}
-
-impl BlockType {
-    /// Every variant, indexed by its `u8` discriminant (checked by a test in
-    /// chunk_blocks.rs).
-    pub const ALL: [BlockType; 11] = [
-        BlockType::Air,
-        BlockType::Stone,
-        BlockType::Dirt,
-        BlockType::Grass,
-        BlockType::Sand,
-        BlockType::Water,
-        BlockType::Snow,
-        BlockType::Glass,
-        BlockType::Log,
-        BlockType::Leaves,
-        BlockType::Chest,
-    ];
-
-    pub fn from_u8(id: u8) -> Option<Self> {
-        Self::ALL.get(id as usize).copied()
-    }
-
-    pub fn is_air(self) -> bool {
-        matches!(self, BlockType::Air)
-    }
-
-    pub fn is_solid(self) -> bool {
-        !matches!(self, BlockType::Air | BlockType::Water)
-    }
+/// Legacy numeric ids for the 11 built-in blocks (frozen for compat).
+/// New code should use `BlockRegistry` names (`"exsolis:stone"`) instead.
+pub mod legacy_ids {
+    pub const AIR: u8 = 0;
+    pub const STONE: u8 = 1;
+    pub const DIRT: u8 = 2;
+    pub const GRASS: u8 = 3;
+    pub const SAND: u8 = 4;
+    pub const WATER: u8 = 5;
+    pub const SNOW: u8 = 6;
+    pub const GLASS: u8 = 7;
+    pub const LOG: u8 = 8;
+    pub const LEAVES: u8 = 9;
+    pub const CHEST: u8 = 10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,7 +166,7 @@ pub enum ClientMessage {
     },
     PlaceBlock {
         pos: BlockPos,
-        kind: BlockType,
+        kind: String,
     },
     BreakBlock {
         pos: BlockPos,
@@ -267,7 +237,7 @@ pub enum ServerMessage {
     },
     BlockUpdate {
         pos: BlockPos,
-        kind: BlockType,
+        kind: String,
     },
     /// Authoritative position of the receiving player themself. Sent on the
     /// unreliable channel whenever it changes (and repeated a few ticks

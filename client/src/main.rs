@@ -34,6 +34,7 @@ use exsolis_common::{PROTOCOL_ID, SERVER_ADDR};
 mod anim;
 mod assets;
 mod block_textures;
+mod blocks;
 mod chunk;
 mod chunk_registry;
 mod entities;
@@ -97,6 +98,7 @@ fn main() {
         .insert_resource(RenetClient::new(connection_config()))
         .add_observer(log_netcode_error)
         .add_plugins(NetPlugin)
+        .add_plugins(crate::blocks::BlocksPlugin)
         .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)

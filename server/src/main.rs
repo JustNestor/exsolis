@@ -21,6 +21,7 @@ use bevy_renet::{
 use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMessage, TICK_RATE};
 
 mod assets;
+mod blocks;
 mod chunks;
 mod entities;
 mod events;
@@ -137,6 +138,7 @@ fn main() {
         ))
         .add_plugins((RenetServerPlugin, NetcodeServerPlugin))
         .add_plugins(NetPlugin)
+        .add_plugins(blocks::BlocksPlugin)
         .add_plugins(assets::AssetServerPlugin)
         .add_plugins(entities::EntityPlugin)
         .add_plugins(EventsPlugin)

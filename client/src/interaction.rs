@@ -9,9 +9,10 @@ use bevy_input::mouse::MouseButton;
 use bevy_log::{info, warn};
 use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
-use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, HOTBAR_SIZE};
 use glam::{IVec3, Vec3};
 
+use crate::blocks::ClientBlocks;
 use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
 use crate::net::{GameplaySet, NetConnected, OutgoingPacket};
@@ -49,23 +50,14 @@ pub struct TargetedBlock {
 
 #[derive(Resource, Debug)]
 pub struct ClientInventory {
-    pub slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
+    pub slots: [Option<(BlockId, u8)>; HOTBAR_SIZE],
     pub selected: u8,
 }
 
 impl Default for ClientInventory {
     fn default() -> Self {
         let mut slots = [None; HOTBAR_SIZE];
-        for (index, item) in [
-            BlockType::Dirt,
-            BlockType::Stone,
-            BlockType::Sand,
-            BlockType::Snow,
-            BlockType::Glass,
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        for (index, item) in [2u16, 1, 4, 6, 7].into_iter().enumerate() {
             slots[index] = Some((item, 64));
         }
         Self { slots, selected: 0 }
@@ -73,7 +65,7 @@ impl Default for ClientInventory {
 }
 
 impl ClientInventory {
-    pub fn selected_item(&self) -> Option<BlockType> {
+    pub fn selected_item(&self) -> Option<BlockId> {
         self.slots[self.selected as usize].map(|(item, _)| item)
     }
 }
@@ -162,7 +154,7 @@ fn select_hotbar_by_number_input(
     )));
 }
 
-fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockType> {
+fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockId> {
     let coord = exsolis_common::ChunkCoord::new(
         world.x.div_euclid(CHUNK_SIZE_I32),
         world.y.div_euclid(CHUNK_SIZE_I32),
@@ -253,7 +245,7 @@ fn raycast_voxels(
 
     for _ in 0..RAYCAST_STEP_LIMIT {
         let block = read_block(registry, chunks, cell)?;
-        if block != BlockType::Air {
+        if block != AIR_ID {
             return Some(TargetedBlock {
                 pos: cell,
                 place_pos: prev_cell,
@@ -356,6 +348,7 @@ fn handle_place_input(
     connected: Res<NetConnected>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     inventory: Res<ClientInventory>,
+    blocks: Option<Res<ClientBlocks>>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
     if !mouse.pressed(MouseButton::Right) {
@@ -403,9 +396,13 @@ fn handle_place_input(
             "[PlaceBlock] Sending PlaceBlock packet for item {:?} at place_pos {:?}",
             item, target.place_pos
         );
+        let kind = blocks
+            .as_ref()
+            .and_then(|b| b.0.def(item).map(|d| d.name.clone()))
+            .unwrap_or_else(|| "exsolis:stone".to_string());
         outgoing.write(OutgoingPacket::reliable(ClientMessage::PlaceBlock {
             pos: BlockPos::new(target.place_pos.x, target.place_pos.y, target.place_pos.z),
-            kind: item,
+            kind,
         }));
     }
 }

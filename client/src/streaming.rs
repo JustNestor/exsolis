@@ -7,6 +7,7 @@ use exsolis_common::{ChunkCoord, PlayerId, SPAWN_POS, ServerMessage};
 use glam::Vec3;
 
 use crate::{
+    blocks::ClientBlocks,
     chunk::Chunk,
     chunk_registry::ChunkRegistry,
     net::{GameplaySet, IncomingPacket},
@@ -33,6 +34,7 @@ fn receive_chunk_updates(
     mut commands: Commands,
     mut incoming: MessageReader<IncomingPacket>,
     mut registry: ResMut<ChunkRegistry>,
+    blocks: Option<Res<ClientBlocks>>,
     mut local_player_id: ResMut<LocalPlayerId>,
     mut chunks: Query<&mut Chunk>,
     remote_players: Query<(Entity, &RemotePlayer)>,
@@ -62,9 +64,13 @@ fn receive_chunk_updates(
                 let ly = pos.y.rem_euclid(CHUNK_SIZE_I32) as usize;
                 let lz = pos.z.rem_euclid(CHUNK_SIZE_I32) as usize;
 
+                let Some(id) = blocks.as_ref().and_then(|b| b.0.id(kind)) else {
+                    warn!("BlockUpdate for unknown block {kind:?}, dropping");
+                    continue;
+                };
                 if let Some(entity) = registry.entity_at(coord) {
                     if let Ok(mut chunk) = chunks.get_mut(entity) {
-                        chunk.set(lx, ly, lz, *kind);
+                        chunk.set(lx, ly, lz, id);
                     }
                 }
             }

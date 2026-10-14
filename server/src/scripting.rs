@@ -47,7 +47,7 @@ use bevy_ecs::prelude::*;
 use bevy_log::{debug, error, info, warn};
 use mlua::{Lua, MultiValue, Table, Value};
 
-use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId, ServerMessage};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, KeybindState, PlayerId, ServerMessage};
 use fastpack;
 
 use crate::Player;
@@ -175,7 +175,7 @@ pub(crate) enum ScriptRequest {
     },
     SetBlock {
         pos: BlockPos,
-        block: BlockType,
+        block: BlockId,
     },
     RegisterKeybind {
         id: String,
@@ -622,15 +622,18 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         )?;
     }
 
-    // --- api.set_block(x, y, z, block_id) : queue a world edit ---------
+    // --- api.set_block(x, y, z, name) : queue a world edit ---------
     {
         let outbox = outbox.clone();
+        // Resolved against the frozen M0 registry at install time; the
+        // drain step re-validates the id against the live registry.
+        let registry = exsolis_common::BlockRegistry::default_registry();
         api.set(
             "set_block",
-            lua.create_function(move |_, (x, y, z, block_id): (i32, i32, i32, u8)| {
-                let Some(block) = BlockType::from_u8(block_id) else {
+            lua.create_function(move |_, (x, y, z, name): (i32, i32, i32, String)| {
+                let Some(block) = registry.id(&name) else {
                     return Err(mlua::Error::RuntimeError(format!(
-                        "set_block: invalid block id {block_id}"
+                        "set_block: unknown block '{name}'"
                     )));
                 };
                 outbox.borrow_mut().push(ScriptRequest::SetBlock {
@@ -898,6 +901,7 @@ pub(crate) fn world_to_chunk_index(pos: BlockPos) -> (exsolis_common::ChunkCoord
 fn forward_place_block(
     mut events: MessageReader<PlaceBlockRequested>,
     runtime: NonSend<ScriptRuntime>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -907,7 +911,9 @@ fn forward_place_block(
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
-        let _ = t.set("block_id", ev.kind as u8);
+        let block_id = blocks.id(&ev.kind).map(|id| id as i32).unwrap_or(-1);
+        let _ = t.set("block_id", block_id);
+        let _ = t.set("block", ev.kind.clone());
         runtime.dispatch("place_block", t);
     }
 }
@@ -1039,6 +1045,7 @@ fn run_on_tick(
     positions: Query<(&Player, &PlayerPosition)>,
     world: Res<ChunkWorld>,
     registry: Res<crate::entities::EntityRegistry>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     let positions: HashMap<PlayerId, (f32, f32, f32)> = positions
         .iter()
@@ -1084,8 +1091,8 @@ fn run_on_tick(
                 .get(&coord)
                 .and_then(|c| c.unpack())
                 .and_then(|u| u.get(idx).copied())
-                .unwrap_or(BlockType::Air);
-            Ok(block as u8)
+                .unwrap_or(AIR_ID);
+            Ok(blocks.name(block).unwrap_or("exsolis:air").to_string())
         })?;
         api.set("get_block", get_block)?;
 
@@ -1150,6 +1157,7 @@ pub(crate) fn drain_script_requests(
     despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     apply_script_requests(
         runtime.take_requests(),
@@ -1160,6 +1168,7 @@ pub(crate) fn drain_script_requests(
         despawns,
         outgoing,
         loaded_by,
+        &blocks,
     );
 }
 
@@ -1178,6 +1187,7 @@ pub(crate) fn apply_script_requests(
     mut despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: &crate::blocks::ServerBlocks,
 ) {
     for req in requests {
         match req {
@@ -1228,7 +1238,11 @@ pub(crate) fn apply_script_requests(
                 }));
             }
             ScriptRequest::SetBlock { pos, block } => {
-                set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by);
+                if blocks.0.def(block).is_none() {
+                    warn!("scripting: api.set_block: unknown block id {block}");
+                    continue;
+                }
+                set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by, blocks);
             }
             ScriptRequest::SpawnEntity {
                 kind,
@@ -1256,10 +1270,13 @@ pub(crate) fn apply_script_requests(
                 let mut extra = crate::entities::SpawnExtra::None;
                 let mut block_pos = None;
                 if kind == exsolis_common::EntityKind::Block {
+                    let chest = blocks
+                        .id("exsolis:chest")
+                        .unwrap_or(exsolis_common::legacy_ids::CHEST as BlockId);
                     let block = block_pos_from_state(kind, x, y, z)
                         .map(|p| block_at(&world, p))
-                        .unwrap_or(BlockType::Chest);
-                    if !crate::entities::is_block_entity(block) {
+                        .unwrap_or(chest);
+                    if !crate::entities::is_block_entity(block, &blocks.0) {
                         warn!(
                             "scripting: api.spawn_entity: {:?} is not a block entity",
                             block
@@ -1367,15 +1384,15 @@ fn block_pos_from_state(
         .then(|| BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32))
 }
 
-/// The block currently at `pos`, or `Air`.
-fn block_at(world: &ChunkWorld, pos: BlockPos) -> BlockType {
+/// The block currently at `pos`, or air.
+fn block_at(world: &ChunkWorld, pos: BlockPos) -> BlockId {
     let (coord, idx) = world_to_chunk_index(pos);
     world
         .ready
         .get(&coord)
         .and_then(|c| c.unpack())
         .map(|blocks| blocks[idx])
-        .unwrap_or(BlockType::Air)
+        .unwrap_or(AIR_ID)
 }
 
 const MOD_ACTION_MAX_DEPTH: usize = 8;
@@ -1511,10 +1528,11 @@ fn build_server_message(kind: &str, args: &[LuaScalar]) -> Result<ServerMessage,
 /// threading unused params through one side or the other.
 fn set_block_and_broadcast(
     pos: BlockPos,
-    block: BlockType,
+    block: BlockId,
     world: &mut ChunkWorld,
     outgoing: &mut MessageWriter<OutgoingPacket>,
     loaded_by: &Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: &crate::blocks::ServerBlocks,
 ) {
     let (coord, idx) = world_to_chunk_index(pos);
 
@@ -1528,11 +1546,12 @@ fn set_block_and_broadcast(
     };
     world.ready.insert(coord, updated);
 
+    let kind = blocks.name(block).unwrap_or("exsolis:air").to_string();
     for (player, state) in loaded_by {
         if state.loaded.contains(&coord) {
             outgoing.write(OutgoingPacket::to(
                 player.0,
-                ServerMessage::BlockUpdate { pos, kind: block },
+                ServerMessage::BlockUpdate { pos, kind: kind.clone() },
             ));
         }
     }
