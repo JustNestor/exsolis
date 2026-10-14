@@ -73,6 +73,9 @@ pub struct LoadReport {
     pub blocks_baked: usize,
     pub blocks_fallback: usize,
     pub animated_textures: usize,
+    pub opaque: usize,
+    pub cutout: usize,
+    pub translucent: usize,
     pub warnings: Vec<String>,
 }
 
@@ -265,6 +268,11 @@ impl McPack {
         for name in names {
             match self.bake_default(&name, &mut report) {
                 Some(model) => {
+                    match model.render_type {
+                        crate::loader::RenderType::Opaque => report.opaque += 1,
+                        crate::loader::RenderType::Cutout => report.cutout += 1,
+                        crate::loader::RenderType::Translucent => report.translucent += 1,
+                    }
                     out.insert(name, model);
                     report.blocks_baked += 1;
                 }

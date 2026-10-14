@@ -170,6 +170,35 @@ fn is_face_visible(
 pub(crate) struct ChunkMeshData {
     pub vertices: Vec<ChunkVertex>,
     pub indices: Vec<u32>,
+    /// Translucent geometry (water, ice), kept apart so a future
+    /// transparent pipeline can draw it after opaque without re-meshing.
+    /// The uploader concatenates both for now (single draw).
+    pub trans_vertices: Vec<ChunkVertex>,
+    pub trans_indices: Vec<u32>,
+}
+
+impl ChunkMeshData {
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty() && self.trans_indices.is_empty()
+    }
+
+    /// Merge for upload: opaque first, translucent appended with rebased indices.
+    pub fn merged(self) -> (Vec<ChunkVertex>, Vec<u32>) {
+        let mut vertices = self.vertices;
+        let mut indices = self.indices;
+        if !self.trans_indices.is_empty() {
+            let base = vertices.len() as u32;
+            vertices.extend(self.trans_vertices);
+            indices.extend(self.trans_indices.iter().map(|i| i + base));
+        }
+        (vertices, indices)
+    }
+}
+
+/// Route quads/tris of one block into the opaque or translucent bucket.
+struct Bucket<'a> {
+    vertices: &'a mut Vec<ChunkVertex>,
+    indices: &'a mut Vec<u32>,
 }
 
 pub(crate) fn build_chunk_mesh(
@@ -206,6 +235,20 @@ pub(crate) fn build_chunk_mesh(
                     origin.z + z as f32,
                 );
                 let (ix, iy, iz) = (x as i32, y as i32, z as i32);
+                let translucent =
+                    model.render_type == crate::loader::RenderType::Translucent;
+                let mut bucket = Bucket {
+                    vertices: if translucent {
+                        &mut mesh.trans_vertices
+                    } else {
+                        &mut mesh.vertices
+                    },
+                    indices: if translucent {
+                        &mut mesh.trans_indices
+                    } else {
+                        &mut mesh.indices
+                    },
+                };
 
                 for quad in &model.quads {
                     if let Some(dir) = quad.cull {
@@ -224,8 +267,8 @@ pub(crate) fn build_chunk_mesh(
                         continue;
                     };
                     push_baked_quad(
-                        &mut mesh.vertices,
-                        &mut mesh.indices,
+                        bucket.vertices,
+                        bucket.indices,
                         fx,
                         fy,
                         fz,
@@ -238,8 +281,8 @@ pub(crate) fn build_chunk_mesh(
                         continue;
                     };
                     push_baked_tri(
-                        &mut mesh.vertices,
-                        &mut mesh.indices,
+                        bucket.vertices,
+                        bucket.indices,
                         fx,
                         fy,
                         fz,

@@ -270,10 +270,11 @@ pub(super) fn upload_ready_chunk_meshes(
     let mut pending: Vec<Pending> = Vec::new();
     for (entity, mut mesh_ready) in ready.iter_mut().take(MAX_UPLOADS_PER_FRAME) {
         let mesh = std::mem::take(&mut mesh_ready.0);
+        let (vertices, indices) = mesh.merged();
         pending.push(Pending {
             entity,
-            vertices: mesh.vertices,
-            indices: mesh.indices,
+            vertices,
+            indices,
         });
     }
 
@@ -350,6 +351,7 @@ pub(super) fn upload_ready_chunk_meshes(
             .insert(ChunkMeshReady(ChunkMeshData {
                 vertices: item.vertices,
                 indices: item.indices,
+                ..Default::default()
             }));
     }
 

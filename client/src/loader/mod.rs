@@ -110,11 +110,14 @@ impl Plugin for McAssetsPlugin {
                     Ok(pack) => {
                         let (models, report) = pack.bake_all();
                         bevy_log::info!(
-                            "McPack: baked {}/{} blocks ({} textured-cube stubs, {} animated textures) from {}",
+                            "McPack: baked {}/{} blocks ({} stubs, {} animated; opaque={} cutout={} translucent={}) from {}",
                             report.blocks_baked,
                             report.blocks_total,
                             report.blocks_fallback,
                             report.animated_textures,
+                            report.opaque,
+                            report.cutout,
+                            report.translucent,
                             dir.display()
                         );
                         for w in report.warnings.iter().take(12) {
