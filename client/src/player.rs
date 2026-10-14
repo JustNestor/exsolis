@@ -132,7 +132,7 @@ fn spawn_local_player(mut commands: Commands) {
         // `first_person` draws only the arms, in their own depth range,
         // from in front of the camera.
         crate::anim::Animator::new(),
-        crate::gltf::GltfModelInstance::new(exsolis_server::PLAYER_MODEL)
+        crate::gltf::GltfModelInstance::new(exsolis_server::PLAYER_VIEWMODEL)
             .with_scale(exsolis_server::PLAYER_MODEL_SCALE)
             .first_person(VIEWMODEL_OFFSET)
             .with_world_offset(MODEL_VISUAL_LIFT),

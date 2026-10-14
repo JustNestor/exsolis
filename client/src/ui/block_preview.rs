@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use bevy_log::debug;
 
 use crate::loader::McAssets;
-use crate::loader::baked::{BakedModel, BakedQuad};
+use crate::loader::baked::{BakedModel, BakedQuad, BakedTri};
 use crate::ui::img_assets::DecodedImage;
 
 /// Fixed preview size advertised by `probe_size` and produced here.
@@ -70,8 +70,8 @@ pub fn decode_block(
     let Some(model) = McAssets::model_for_baked(baked, name) else {
         return Err(format!("no baked model for `{name}`"));
     };
-    if model.quads.is_empty() {
-        return Err(format!("`{name}` has no quads to preview"));
+    if model.quads.is_empty() && model.tris.is_empty() {
+        return Err(format!("`{name}` has no geometry to preview"));
     }
     // Cache decoded PNGs for the duration of this call; a cube reuses one
     // texture across all six faces.
@@ -79,7 +79,11 @@ pub fn decode_block(
     let mut missing_logged = false;
 
     // Project every kept corner so the whole model fits the 48x48 box.
+    // Quads (MC/bbmodel cubes) and tris (bbmodel/OBJ meshes) both draw;
+    // face-visibility culling applies to quads only (tris are usually
+    // already the visible shell).
     let mut kept: Vec<&BakedQuad> = Vec::new();
+    let mut kept_tris: Vec<&BakedTri> = Vec::new();
     let mut min = [f32::INFINITY; 2];
     let mut max = [f32::NEG_INFINITY; 2];
     for quad in &model.quads {
@@ -105,7 +109,26 @@ pub fn decode_block(
             max[1] = max[1].max(sy);
         }
     }
-    if kept.is_empty() {
+    for tri in &model.tris {
+        let tex = texture_path_for(pack_dir, &tri.texture)
+            .and_then(|p| load_texture(&mut tex_cache, &tri.texture, &p));
+        if tex.is_none() {
+            if !missing_logged {
+                debug!("block preview `{name}`: missing texture, skipping tris");
+                missing_logged = true;
+            }
+            continue;
+        }
+        kept_tris.push(tri);
+        for v in &tri.verts {
+            let (sx, sy) = project(v);
+            min[0] = min[0].min(sx);
+            min[1] = min[1].min(sy);
+            max[0] = max[0].max(sx);
+            max[1] = max[1].max(sy);
+        }
+    }
+    if kept.is_empty() && kept_tris.is_empty() {
         return Err(format!("nothing to preview for `{name}`"));
     }
 
@@ -174,6 +197,25 @@ pub fn decode_block(
                 &mut zbuf,
             );
         }
+    }
+    for tri in kept_tris {
+        let shade = shade_for(&tri.normal);
+        let path = texture_path_for(pack_dir, &tri.texture).expect("cached above");
+        let Some((tw, th, px)) = load_texture(&mut tex_cache, &tri.texture, &path) else {
+            continue;
+        };
+        // bbmodel bakes carry no tint flags yet; tris draw untinted.
+        let px = &px;
+        let pts: Vec<(f32, f32, f32, f32, f32)> = tri
+            .verts
+            .iter()
+            .zip(tri.uvs.iter())
+            .map(|(v, uv)| {
+                let (sx, sy) = map(project(v).0, project(v).1);
+                (sx, sy, (v[0] + v[2]) - v[1], uv[0], uv[1])
+            })
+            .collect();
+        draw_tri(&pts[0], &pts[1], &pts[2], tw, th, px, shade, &mut rgba, &mut zbuf);
     }
 
     let opaque = rgba.chunks_exact(4).filter(|p| p[3] > 0).count();

@@ -2071,6 +2071,37 @@ mod tests {
     }
 
     #[test]
+    fn girl_base_copy_matches_girl() {
+        // `assets/models/player/girl_base.glb` is the first-person working
+        // copy of the avatar. Until adaptation starts it must decode
+        // identically to `girl.glb`; this pins that.
+        for name in ["girl.glb", "player/girl_base.glb"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../assets/models")
+                .join(name);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("SKIPPED: {name} absent");
+                return;
+            };
+            let bytes = normalize_model_bytes(name, &bytes);
+            let (document, buffers, _images) =
+                gltf::import_slice(&bytes).expect("glb parse");
+            let mut prims = 0usize;
+            let mut tris = 0usize;
+            for mesh in document.meshes() {
+                for prim in mesh.primitives() {
+                    let loaded =
+                        load_gltf_primitive(&prim, &buffers).expect("primitive decode");
+                    prims += 1;
+                    tris += loaded.indices.len() / 3;
+                }
+            }
+            assert_eq!(prims, 795, "{name} primitive count");
+            assert_eq!(tris, 9_540, "{name} triangle count");
+        }
+    }
+
+    #[test]
     fn triangle_strip_conversion_alternates_winding() {
         // A 4-vertex quad strip `[0,1,2,3]` must become two triangles with
         // consistent winding: (0,1,2) and (2,1,3). Getting the parity wrong

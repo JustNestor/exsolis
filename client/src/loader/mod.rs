@@ -5,10 +5,12 @@
 //! (blockstates + models + mcmeta) plus the minimal OBJ loader in [`obj`].
 
 pub mod baked;
+pub mod bbmodel;
 pub mod mcmodel;
 pub mod obj;
 
-pub use baked::{BakedModel, BakedQuad, BakedTri, BlockPack, RenderType, face_quad};
+pub use baked::{BakedModel, BakedQuad, BakedTri, BlockPack, RenderType, face_quad, rotate_point};
+pub use bbmodel::{BbAnimInfo, BbLoadReport, BbModel, BbTextureImage, load_bbmodel, parse_bbmodel};
 pub use mcmodel::{AnimInfo, LoadReport, McPack};
 pub use obj::{ObjMesh, parse_mtl, parse_obj};
 

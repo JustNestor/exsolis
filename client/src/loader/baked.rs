@@ -87,6 +87,20 @@ impl BakedModel {
 /// One axis-aligned face of the box `[min,max]` (0-1 space) with outward
 /// normal `normal`. Corner order matches the chunk mesher's
 /// `face_positions` layout so winding stays CCW-from-outside.
+/// Rotate a point around `origin` by `angle_deg` about `axis` (shared by
+/// the MC and Blockbench bakers: element/cube rotations).
+pub fn rotate_point(p: [f32; 3], origin: [f32; 3], axis: char, angle_deg: f32) -> [f32; 3] {
+    let t = angle_deg.to_radians();
+    let (s, c) = (t.sin(), t.cos());
+    let q = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    let r = match axis {
+        'x' => [q[0], c * q[1] - s * q[2], s * q[1] + c * q[2]],
+        'y' => [c * q[0] + s * q[2], q[1], -s * q[0] + c * q[2]],
+        _ => [c * q[0] - s * q[1], s * q[0] + c * q[1], q[2]],
+    };
+    [r[0] + origin[0], r[1] + origin[1], r[2] + origin[2]]
+}
+
 pub fn face_quad(
     min: [f32; 3],
     max: [f32; 3],

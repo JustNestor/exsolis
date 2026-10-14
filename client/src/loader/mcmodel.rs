@@ -18,7 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::loader::baked::{BakedModel, BakedQuad, BlockPack, RenderType, face_quad};
+use crate::loader::baked::{BakedModel, BakedQuad, BlockPack, RenderType, face_quad, rotate_point};
 
 /// `.mcmeta` animation metadata for one texture.
 #[derive(Debug, Clone)]
@@ -721,20 +721,6 @@ fn apply_face_uv(q: &mut BakedQuad, face: &FaceDef, _normal: [f32; 3]) {
         uvs = [uvs[3], uvs[0], uvs[1], uvs[2]];
     }
     q.uvs = uvs;
-}
-
-/// Rotate a point around `origin` by `angle_deg` about `axis`.
-/// Used for element-level `rotation` (arbitrary angles, e.g. 45° crosses).
-fn rotate_point(p: [f32; 3], origin: [f32; 3], axis: char, angle_deg: f32) -> [f32; 3] {
-    let t = angle_deg.to_radians();
-    let (s, c) = (t.sin(), t.cos());
-    let q = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
-    let r = match axis {
-        'x' => [q[0], c * q[1] - s * q[2], s * q[1] + c * q[2]],
-        'y' => [c * q[0] + s * q[2], q[1], -s * q[0] + c * q[2]],
-        _ => [c * q[0] - s * q[1], s * q[0] + c * q[1], q[2]],
-    };
-    [r[0] + origin[0], r[1] + origin[1], r[2] + origin[2]]
 }
 
 /// Rotate corners + normal around the block center for blockstate x/y.
