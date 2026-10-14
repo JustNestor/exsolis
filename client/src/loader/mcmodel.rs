@@ -673,8 +673,9 @@ fn short_model_name(model: &str, namespace: &str) -> Option<String> {
 
 fn normalize_texture_key(raw: &str, namespace: &str) -> String {
     if raw.contains(':') {
+        // Already `ns:path` — the path includes `block/...`, so join as-is.
         let (ns, path) = raw.split_once(':').unwrap();
-        return format!("{ns}/block/{path}");
+        return format!("{ns}/{path}");
     }
     let path = raw.strip_prefix("block/").unwrap_or(raw);
     format!("{namespace}/block/{path}")

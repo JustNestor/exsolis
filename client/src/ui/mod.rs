@@ -27,6 +27,7 @@ pub const LOOPBACK_UI_PREFIX: &str = "clientui:";
 pub mod client_ui;
 #[cfg(debug_assertions)]
 pub mod dev_reload;
+pub mod block_preview;
 pub mod drag;
 pub mod events;
 pub mod parse;

@@ -1,12 +1,12 @@
 // src/interaction.rs
 
 use bevy_app::prelude::*;
-use bevy_ecs::message::MessageWriter;
+use bevy_ecs::message::{MessageReader, MessageWriter};
 use bevy_ecs::prelude::*;
 use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
-use bevy_input::mouse::MouseButton;
-use bevy_log::{info, warn};
+use bevy_input::mouse::{MouseButton, MouseScrollUnit, MouseWheel};
+use bevy_log::{debug, info, warn};
 use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
 use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, HOTBAR_SIZE};
@@ -99,6 +99,7 @@ impl Plugin for InteractionPlugin {
                     ensure_targeting_component,
                     (
                         select_hotbar_by_number_input,
+                        select_hotbar_by_wheel,
                         update_targeting,
                         handle_break_input,
                         handle_place_input,
@@ -152,6 +153,38 @@ fn select_hotbar_by_number_input(
     outgoing.write(OutgoingPacket::reliable(ClientMessage::SelectHotbar(
         index as u8,
     )));
+}
+
+/// Mouse wheel cycles the hotbar selection (same gates as place/break via
+/// `gameplay_input_allowed`). Scroll up steps back, scroll down steps
+/// forward; the local slot updates immediately and the server is told via
+/// `SelectHotbar` (authoritative state comes back through `InventorySync`).
+fn select_hotbar_by_wheel(
+    mut wheels: MessageReader<MouseWheel>,
+    connected: Res<NetConnected>,
+    mut inventory: ResMut<ClientInventory>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
+) {
+    let mut steps = 0i32;
+    for ev in wheels.read() {
+        steps += match ev.unit {
+            MouseScrollUnit::Line => ev.y.signum() as i32,
+            MouseScrollUnit::Pixel => (ev.y / 50.0).signum() as i32,
+        };
+    }
+    if steps == 0 {
+        return;
+    }
+    if !connected.get() {
+        warn!("[SelectHotbar] Mouse wheel scroll detected, but not connected");
+        return;
+    }
+    let n = HOTBAR_SIZE as i32;
+    // Positive `steps` (scroll up) moves toward slot 0, negative down.
+    let next = (inventory.selected as i32 - steps).rem_euclid(n) as u8;
+    inventory.selected = next;
+    debug!("[SelectHotbar] Wheel scrolled {steps}, selecting slot {next}");
+    outgoing.write(OutgoingPacket::reliable(ClientMessage::SelectHotbar(next)));
 }
 
 fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockId> {

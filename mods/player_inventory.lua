@@ -1,6 +1,14 @@
 -- Player inventory policy layered on the reusable generic Container.
 -- Kept in Lua so item rules and future equipment/crafting slots can evolve
 -- independently from the wire protocol and entity storage.
+--
+-- Server-authoritative sync: the engine sends `InventorySync` on join and
+-- after every change (give, place, break, select); the client renders
+-- exactly that. Hotbar selection arrives here as `api.on("select_hotbar",
+-- function(ev) ... end)` with `ev = { player_id, index }`.
+-- Creative gives go through `api.give_block(player_id, name, count)` (see
+-- `PlayerInventory.give` below): Lua never resolves names to numeric ids
+-- itself, the engine does that against the live `ServerBlocks` registry.
 PlayerInventory = PlayerInventory or {}
 PlayerInventory.players = PlayerInventory.players or {}
 -- Slots 0..8 are the hotbar; 9..35 are the three main inventory rows.
@@ -60,4 +68,13 @@ end
 
 function PlayerInventory.swap(player_id, first, second)
     return Container.swap(PlayerInventory.get(player_id).container, first, second)
+end
+
+-- Creative give via the engine: `name` is a registered block name
+-- (e.g. "exsolis:stone"), `count` is clamped 1..576 server-side. The
+-- engine validates the player, resolves the name, adds the items and
+-- pushes an `InventorySync` to that player. The numeric-id Container
+-- logic above is untouched — this never touches slots directly.
+function PlayerInventory.give(player_id, name, count)
+    api.give_block(player_id, name, count or 64)
 end

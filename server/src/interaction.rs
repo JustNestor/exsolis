@@ -18,7 +18,7 @@
 use bevy_app::prelude::*;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
-use bevy_log::warn;
+use bevy_log::{debug, warn};
 use exsolis_common::{AIR_ID, BlockId, BlockPos, ChunkCoord, PlayerId, ServerMessage};
 use exsolis_common::{EntityKind, EntityState};
 use glam::Vec3;
@@ -28,6 +28,7 @@ use crate::PlayerMap;
 use crate::blocks::ServerBlocks;
 use crate::chunks::PlayerPosition;
 use crate::chunks::{ChunkRenderState, ChunkWorld};
+use crate::creative::send_inventory_sync;
 use crate::net::{self, OutgoingPacket};
 
 /// Blocks. A block is 1 world unit, so this is also world units. Generous
@@ -80,6 +81,8 @@ fn handle_select_hotbar(
     mut events: MessageReader<SelectHotbarRequested>,
     player_map: Res<PlayerMap>,
     mut inventories: Query<&mut Inventory>,
+    blocks: Res<ServerBlocks>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -97,6 +100,8 @@ fn handle_select_hotbar(
             continue;
         };
         inventory.select(ev.index);
+        let inv = inventory.clone();
+        send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
     }
 }
 
@@ -202,20 +207,9 @@ fn handle_place_block(
             );
             continue;
         }
-        let Some(resolved_id) = blocks.id(&ev.kind) else {
-            warn!(
-                "[PlaceBlock] Unknown block name {:?} for PlayerId {:?}",
-                ev.kind, ev.player_id
-            );
-            continue;
-        };
-        if blocks.is_air(resolved_id) {
-            warn!(
-                "[PlaceBlock] Cannot place air for PlayerId {:?}",
-                ev.player_id
-            );
-            continue;
-        };
+        // The server's selected slot is authoritative: the client's
+        // `kind` guess is never trusted. A mismatch is logged but the
+        // server item is what gets placed and broadcast.
         let Ok(mut inventory) = inventories.get_mut(entity) else {
             warn!(
                 "[PlaceBlock] Entity {:?} missing Inventory component",
@@ -231,12 +225,20 @@ fn handle_place_block(
             );
             continue;
         };
-        if selected.item != resolved_id {
+        let resolved_id = selected.item;
+        if blocks.is_air(resolved_id) {
             warn!(
-                "[PlaceBlock] Item mismatch for PlayerId {:?}: hotbar holds {:?}, request claims {:?}",
-                ev.player_id, selected.item, ev.kind
+                "[PlaceBlock] Cannot place air for PlayerId {:?}",
+                ev.player_id
             );
             continue;
+        };
+        let server_kind = blocks.name(resolved_id).unwrap_or("exsolis:air");
+        if server_kind != ev.kind {
+            debug!(
+                "[PlaceBlock] Kind mismatch for PlayerId {:?}: server selected {:?}, request claims {:?} — proceeding with server item",
+                ev.player_id, server_kind, ev.kind
+            );
         }
 
         let (coord, idx) = world_to_chunk(ev.pos);
@@ -276,6 +278,8 @@ fn handle_place_block(
         } else {
             let selected_index = inventory.selected_index();
             inventory.remove_one(selected_index, resolved_id);
+            let inv = inventory.clone();
+            send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
             // Placing a container block brings its block entity into being.
             // Keyed by position, so replacing the block at a position that
             // already has an entity is handled by the break path first.
@@ -401,6 +405,8 @@ fn handle_break_block(
             }
             if let Ok(mut inventory) = inventories.get_mut(entity) {
                 inventory.add_item(broken, 1);
+                let inv = inventory.clone();
+                send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
             }
         }
     }

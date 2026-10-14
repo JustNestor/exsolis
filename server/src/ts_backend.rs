@@ -1160,6 +1160,8 @@ fn ts_drain_system(
     outgoing: MessageWriter<crate::net::OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &crate::chunks::ChunkRenderState)>,
     blocks: Res<crate::blocks::ServerBlocks>,
+    player_map: Res<crate::PlayerMap>,
+    mut inventories: Query<&mut crate::Inventory>,
 ) {
     let outbox = runtime.outbox();
     let requests = outbox
@@ -1180,6 +1182,8 @@ fn ts_drain_system(
         outgoing,
         loaded_by,
         &blocks,
+        &player_map,
+        &mut inventories,
     );
 }
 

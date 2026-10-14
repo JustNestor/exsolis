@@ -177,6 +177,16 @@ pub(crate) enum ScriptRequest {
         pos: BlockPos,
         block: BlockId,
     },
+    /// `api.give_block(player_id, name, count)` — creative give from a
+    /// mod. The name is resolved against the frozen M0 registry at call
+    /// time (same as `set_block`); the drain step re-validates the id
+    /// against the live registry. `amount` is clamped 1..=576 (9 stacks)
+    /// at call time; whatever does not fit is dropped with a warning.
+    GiveBlock {
+        player_id: PlayerId,
+        block: BlockId,
+        amount: u16,
+    },
     RegisterKeybind {
         id: String,
         default_key: String,
@@ -642,6 +652,34 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
                 });
                 Ok(())
             })?,
+        )?;
+    }
+
+    // --- api.give_block(player_id, name, count?) : queue a creative give --
+    {
+        let outbox = outbox.clone();
+        // Same frozen-registry caveat as `set_block` above.
+        let registry = exsolis_common::BlockRegistry::default_registry();
+        api.set(
+            "give_block",
+            lua.create_function(
+                move |_, (player_id, name, count): (Value, String, Option<i64>)| {
+                    let player_id =
+                        pop_player_id(&mut std::iter::once(player_id))?;
+                    let Some(block) = registry.id(&name) else {
+                        return Err(mlua::Error::RuntimeError(format!(
+                            "give_block: unknown block '{name}'"
+                        )));
+                    };
+                    let amount = count.unwrap_or(64).clamp(1, 64 * 9) as u16;
+                    outbox.borrow_mut().push(ScriptRequest::GiveBlock {
+                        player_id,
+                        block,
+                        amount,
+                    });
+                    Ok(())
+                },
+            )?,
         )?;
     }
 
@@ -1158,6 +1196,8 @@ pub(crate) fn drain_script_requests(
     outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
     blocks: Res<crate::blocks::ServerBlocks>,
+    player_map: Res<crate::PlayerMap>,
+    mut inventories: Query<&mut crate::Inventory>,
 ) {
     apply_script_requests(
         runtime.take_requests(),
@@ -1169,6 +1209,8 @@ pub(crate) fn drain_script_requests(
         outgoing,
         loaded_by,
         &blocks,
+        &player_map,
+        &mut inventories,
     );
 }
 
@@ -1188,6 +1230,8 @@ pub(crate) fn apply_script_requests(
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
     blocks: &crate::blocks::ServerBlocks,
+    player_map: &crate::PlayerMap,
+    inventories: &mut Query<&mut crate::Inventory>,
 ) {
     for req in requests {
         match req {
@@ -1243,6 +1287,40 @@ pub(crate) fn apply_script_requests(
                     continue;
                 }
                 set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by, blocks);
+            }
+            ScriptRequest::GiveBlock {
+                player_id,
+                block,
+                amount,
+            } => {
+                if blocks.0.def(block).is_none() {
+                    warn!("scripting: api.give_block: unknown block id {block}");
+                    continue;
+                }
+                let Some(&entity) = player_map.playerid_to_entity.get(&player_id) else {
+                    warn!("scripting: api.give_block: unknown player {player_id}");
+                    continue;
+                };
+                let Ok(mut inventory) = inventories.get_mut(entity) else {
+                    warn!("scripting: api.give_block: player {player_id} has no inventory");
+                    continue;
+                };
+                let mut remaining = amount;
+                while remaining > 0 {
+                    let chunk =
+                        remaining.min(exsolis_common::inventory::MAX_STACK as u16) as u8;
+                    let fitted = chunk - inventory.add_item(block, chunk);
+                    remaining -= fitted as u16;
+                    if fitted < chunk {
+                        warn!(
+                            "scripting: api.give_block: {remaining} of block {block} did not fit in player {player_id} inventory — dropped"
+                        );
+                        break;
+                    }
+                }
+                info!("scripting: api.give_block: player {player_id} given block {block} x{amount}");
+                let inv = inventory.clone();
+                crate::creative::send_inventory_sync(player_id, &inv, blocks, &mut outgoing);
             }
             ScriptRequest::SpawnEntity {
                 kind,

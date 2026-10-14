@@ -23,6 +23,7 @@ use exsolis_common::{ClientMessage, PROTOCOL_ID, PlayerId, SERVER_ADDR, ServerMe
 mod assets;
 mod blocks;
 mod chunks;
+mod creative;
 mod entities;
 mod events;
 mod interaction;
@@ -145,6 +146,7 @@ fn main() {
         .add_plugins(MovementPlugin)
         .add_plugins(ChunksPlugin)
         .add_plugins(InteractionPlugin)
+        .add_plugins(creative::CreativePlugin)
         .add_plugins(UiPlugin)
         .add_plugins(ScriptingPlugin)
         .add_plugins(ts_backend::TsScriptingPlugin)

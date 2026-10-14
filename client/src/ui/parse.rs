@@ -242,7 +242,7 @@ fn convert(
         match def.src.take() {
             Some(s) if is_valid_img_src(&s) => def.src = Some(s),
             Some(s) => warnings.push(format!(
-                "<img>: invalid `src` {s:?} (needs a relative .png/.jpg/.jpeg path inside assets/ui)"
+                "<img>: invalid `src` {s:?} (needs a relative .png/.jpg/.jpeg path inside assets/ui, or `block#namespace:name`)"
             )),
             None => warnings.push("<img>: missing `src`".into()),
         }
@@ -294,7 +294,38 @@ fn convert(
 /// `src` comes from the server, so it is sandboxed to `assets/ui/`: only
 /// `[A-Za-z0-9_-./]`, no absolute paths, no empty/hidden/`..` segments, and
 /// only formats we decode (png, jpg, jpeg).
+///
+/// A second, synthetic form is also accepted: `block#namespace:name`
+/// renders a 48x48 3D-cube preview rasterized on the CPU from the block's
+/// baked model (see `ui::block_preview`). The name uses the same
+/// `namespace:name` charset as mod action ids (`[A-Za-z0-9_.-]` for the
+/// namespace, plus `/` in the name); total length after `block#` is capped
+/// at 160. These sources never touch disk — `probe_size` reports 48x48 and
+/// `render_bridge` uploads the rasterized pixels like any other `<img>`.
+pub fn is_block_preview_src(src: &str) -> bool {
+    let Some(name) = src.strip_prefix("block#") else {
+        return false;
+    };
+    if name.is_empty() || name.len() > 160 {
+        return false;
+    }
+    let Some((namespace, item)) = name.split_once(':') else {
+        return false;
+    };
+    !namespace.is_empty()
+        && !item.is_empty()
+        && namespace
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+        && item
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b'/'))
+}
+
 pub fn is_valid_img_src(src: &str) -> bool {
+    if is_block_preview_src(src) {
+        return true;
+    }
     if src.is_empty() || src.len() > 128 {
         return false;
     }
@@ -373,6 +404,18 @@ mod tests {
             assert!(!is_valid_img_src(bad), "{bad}");
         }
         assert!(is_valid_img_src("a/b_c-1.PNG"));
+        assert!(is_valid_img_src("block#minecraft:stone"));
+        assert!(is_valid_img_src("block#mymod:dirt/path-1"));
+        for bad in [
+            "block#",
+            "block#:stone",
+            "block#minecraft:",
+            "block#minecraft",
+            "block#mc/stone.png",
+            "block#minecraft:st one",
+        ] {
+            assert!(!is_valid_img_src(bad), "{bad}");
+        }
         let ui = parse_ui(r#"<img src="../x.png"/>"#).unwrap();
         assert_eq!(ui.warnings.len(), 1);
         assert!(ui.root.src.is_none());

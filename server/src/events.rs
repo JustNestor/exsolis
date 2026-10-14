@@ -1,4 +1,6 @@
 use crate::entities::{DespawnEntityRequest, SpawnEntityRequest, SpawnExtra};
+use crate::blocks::ServerBlocks;
+use crate::creative::CreativeGiveRequested;
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::{IncomingPacket, OutgoingPacket};
 use crate::scripting::KeybindActionRequested;
@@ -116,6 +118,7 @@ pub(crate) fn spawn_joined_player(
     positions: &Query<(&PlayerPosition, &PlayerLook)>,
     outgoing: &mut MessageWriter<OutgoingPacket>,
     spawns: &mut MessageWriter<SpawnEntityRequest>,
+    blocks: &ServerBlocks,
 ) {
     if !joining.requested.insert(client_id) {
         return;
@@ -123,6 +126,16 @@ pub(crate) fn spawn_joined_player(
     outgoing.write(OutgoingPacket::to(
         client_id,
         ServerMessage::YourPlayerId(client_id),
+    ));
+    let block_list = crate::creative::sorted_block_names(blocks);
+    info!(
+        "[BlockList] sending {} blocks to player {}",
+        block_list.len(),
+        client_id
+    );
+    outgoing.write(OutgoingPacket::to(
+        client_id,
+        ServerMessage::BlockList { blocks: block_list },
     ));
     // Everyone already here, so a joining client can render them before it
     // receives any of their movement updates.
@@ -282,6 +295,12 @@ pub fn dispatch_incoming(
                     id: id.clone(),
                     state: *state,
                     player_id: client_id,
+                });
+            }
+            ClientMessage::CreativeGive { name } => {
+                commands.write_message(CreativeGiveRequested {
+                    player_id: client_id,
+                    name: name.clone(),
                 });
             }
             _ => {}

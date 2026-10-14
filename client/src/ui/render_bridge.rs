@@ -353,6 +353,7 @@ fn sync_ui_images(
     mut registry: ResMut<UiImageRegistry>,
     wanted: Query<&UiImageSrc>,
     mut cache_changes: MessageReader<crate::assets::AssetCacheChanged>,
+    mc: Option<Res<crate::loader::McAssets>>,
 ) {
     for change in cache_changes.read() {
         for asset in &change.assets {
@@ -384,6 +385,44 @@ fn sync_ui_images(
             break;
         }
         budget -= 1;
+
+        // `block#` previews never touch disk: rasterize from the baked
+        // model map + MC pack dir. Failures land in `failed`, so each bad
+        // src warns exactly once and is never retried.
+        if let Some(name) = src.strip_prefix("block#") {
+            let baked_and_dir = mc
+                .as_ref()
+                .and_then(|m| m.pack_dir.as_ref().map(|dir| (&m.baked, dir)));
+            let Some((baked, pack_dir)) = baked_and_dir else {
+                bevy_log::warn!("ui img `{src}`: no MC pack for block preview");
+                registry.failed.insert(src.clone());
+                continue;
+            };
+            let decoded = match img_assets::decode_block(name, baked, pack_dir) {
+                Ok(d) => d,
+                Err(e) => {
+                    bevy_log::warn!("ui img `{src}`: {e}");
+                    registry.failed.insert(src.clone());
+                    continue;
+                }
+            };
+            match upload_pixels(&vk, decoded.width, decoded.height, format, &decoded.rgba) {
+                Some(bindless_id) => {
+                    registry.entries.insert(
+                        src.clone(),
+                        UiImageEntry {
+                            bindless_id,
+                            tex_id: sampled_image_index(bindless_id),
+                        },
+                    );
+                }
+                None => {
+                    bevy_log::warn!("ui img `{src}`: GPU upload failed");
+                    registry.failed.insert(src.clone());
+                }
+            }
+            continue;
+        }
 
         let decoded = match img_assets::decode(src) {
             Ok(d) => d,

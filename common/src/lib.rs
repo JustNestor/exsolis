@@ -10,7 +10,7 @@ pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
 /// `EntityStateUpdate`). `EntityKind` gained variants, so an old client's
 /// decode of a new server's stream would desync rather than fail cleanly.
-pub const PROTOCOL_ID: u64 = 4;
+pub const PROTOCOL_ID: u64 = 5;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -213,6 +213,12 @@ pub enum ClientMessage {
     AssetLoadComplete {
         paths: Vec<String>,
     },
+    /// Creative-tab request: give one stack of a registered block.
+    /// The server validates the name and decides the slot; the client's
+    /// inventory is updated via `InventorySync`. Appended last.
+    CreativeGive {
+        name: String,
+    },
 }
 
 #[non_exhaustive]
@@ -335,6 +341,19 @@ pub enum ServerMessage {
     EntityStateUpdate {
         entity_id: EntityId,
         state: EntityState,
+    },
+    /// Full sorted block-name list for the creative tab. Sent once per join
+    /// (reliable). The client renders `block#<name>` icons from it.
+    /// Appended last so existing variant indices don't shift.
+    BlockList {
+        blocks: Vec<String>,
+    },
+    /// Authoritative hotbar contents: `(block name, count)` per slot plus
+    /// the selected index. Sent on join and after every change (give, place,
+    /// break, select). The client renders exactly this. Appended last.
+    InventorySync {
+        slots: Vec<Option<(String, u8)>>,
+        selected: u8,
     },
 }
 
