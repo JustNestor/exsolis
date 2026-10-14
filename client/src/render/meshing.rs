@@ -162,6 +162,7 @@ pub(super) fn queue_chunk_meshing(
     textures: Option<Res<TextureManager>>,
     registry: Res<ChunkRegistry>,
     blocks: Option<Res<ClientBlocks>>,
+    mc: Option<Res<crate::loader::McAssets>>,
     all_chunks: Query<&Chunk>,
     needs_mesh: Query<
         (Entity, &Chunk),
@@ -187,6 +188,9 @@ pub(super) fn queue_chunk_meshing(
         );
         return;
     }
+    let Some(mc) = mc else {
+        return;
+    };
     let pool = AsyncComputeTaskPool::get();
 
     for (entity, chunk) in needs_mesh.iter().take(MAX_MESH_TASKS_STARTED_PER_FRAME) {
@@ -218,11 +222,12 @@ pub(super) fn queue_chunk_meshing(
             .as_ref()
             .map(|b| b.0.clone())
             .unwrap_or_else(exsolis_common::BlockRegistry::default_registry);
+        let baked = mc.baked.clone();
         let task = pool.spawn(async move {
             let neighborhood = ChunkNeighborhood {
                 chunks: neighbor_chunks,
             };
-            build_chunk_mesh(&neighborhood, &textures, &registry_owned)
+            build_chunk_mesh(&neighborhood, &textures, &registry_owned, &baked)
         });
         commands
             .entity(entity)

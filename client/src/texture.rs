@@ -363,6 +363,20 @@ fn setup_textures(
     let base_dir = crate::assets::asset_directory();
     let mut discovered = Vec::new();
     TextureManager::discover_pngs(&base_dir, &base_dir, &mut discovered);
+    // MC pack textures (`minecraft/block/stone.png` -> key
+    // `"minecraft/block/stone"`, matching baked quad texture keys).
+    if let Some(mc) = crate::loader::mc_pack_dir() {
+        let tex_base = mc.join("assets").join("minecraft").join("textures");
+        let mut mc_found = Vec::new();
+        TextureManager::discover_pngs(&tex_base, &tex_base, &mut mc_found);
+        let n = mc_found.len();
+        for (key, path) in mc_found {
+            discovered.push((format!("minecraft/{key}"), path));
+        }
+        if n > 0 {
+            bevy_log::info!("TextureManager: +{n} MC pack textures from {}", tex_base.display());
+        }
+    }
 
     let mut manager = TextureManager::default();
     // A rebuild replaces the whole resource, invalidating every bindless id

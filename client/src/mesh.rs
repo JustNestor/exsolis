@@ -28,9 +28,8 @@ use glam::IVec3;
 use vulkano::{buffer::BufferContents, pipeline::graphics::vertex_input::Vertex};
 
 use crate::{
-    block_textures,
     chunk::{CHUNK_SIZE, Chunk},
-    texture::{TextureManager, TextureMapping, sampled_image_index},
+    texture::{TextureManager, sampled_image_index},
 };
 
 #[derive(Clone, Copy, BufferContents, Vertex)]
@@ -114,121 +113,6 @@ pub mod fs {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Face {
-    Top,
-    Bottom,
-    Left,
-    Right,
-    Front,
-    Back,
-}
-
-const FACE_DIRS: [(Face, IVec3); 6] = [
-    (Face::Top, IVec3::new(0, 1, 0)),
-    (Face::Bottom, IVec3::new(0, -1, 0)),
-    (Face::Left, IVec3::new(-1, 0, 0)),
-    (Face::Right, IVec3::new(1, 0, 0)),
-    (Face::Front, IVec3::new(0, 0, 1)),
-    (Face::Back, IVec3::new(0, 0, -1)),
-]; // Const array instead of a match-based iterator: this list gets walked
-// once per solid block, so at 32^3 blocks/chunk keeping it a flat,
-// branch-free table (rather than 6 separate maybe_push_face call sites
-// like the textured version uses) cuts per-block dispatch overhead.
-
-fn face_positions(face: Face, x: f32, y: f32, z: f32) -> [[f32; 3]; 4] {
-    match face {
-        Face::Top => [
-            [x, y + 1.0, z],
-            [x + 1.0, y + 1.0, z],
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x, y + 1.0, z + 1.0],
-        ],
-        Face::Bottom => [
-            [x, y, z + 1.0],
-            [x + 1.0, y, z + 1.0],
-            [x + 1.0, y, z],
-            [x, y, z],
-        ],
-        Face::Back => [
-            [x + 1.0, y + 1.0, z],
-            [x, y + 1.0, z],
-            [x, y, z],
-            [x + 1.0, y, z],
-        ],
-        Face::Right => [
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x + 1.0, y + 1.0, z],
-            [x + 1.0, y, z],
-            [x + 1.0, y, z + 1.0],
-        ],
-        Face::Front => [
-            [x, y + 1.0, z + 1.0],
-            [x + 1.0, y + 1.0, z + 1.0],
-            [x + 1.0, y, z + 1.0],
-            [x, y, z + 1.0],
-        ],
-        Face::Left => [
-            [x, y + 1.0, z],
-            [x, y + 1.0, z + 1.0],
-            [x, y, z + 1.0],
-            [x, y, z],
-        ],
-    }
-}
-
-fn push_face(
-    vertices: &mut Vec<ChunkVertex>,
-    indices: &mut Vec<u32>,
-    x: f32,
-    y: f32,
-    z: f32,
-    face: Face,
-    sampled_text: u32,
-) {
-    let start = vertices.len() as u32;
-    let positions = face_positions(face, x, y, z);
-    // Corner order matches `face_positions` (top-left, top-right,
-    // bottom-right, bottom-left as seen from outside), so v=0 is the top
-    // edge and side textures come out upright.
-    const UVS: [[f32; 2]; 4] = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-    let shade = face_shade(face);
-
-    for (pos, uv) in positions.into_iter().zip(UVS) {
-        vertices.push(ChunkVertex {
-            position: pos,
-            uv,
-            sampled_text,
-            shade,
-        });
-    }
-
-    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
-}
-
-/// Fixed directional lighting: sky-lit top is full brightness, bottom is
-/// darkest, and the two horizontal axes differ slightly so adjacent side
-/// faces of a cube are distinguishable. Placeholder for real AO/lighting.
-fn face_shade(face: Face) -> f32 {
-    match face {
-        Face::Top => 1.0,
-        Face::Front | Face::Back => 0.8,
-        Face::Left | Face::Right => 0.65,
-        Face::Bottom => 0.5,
-    }
-}
-
-fn texture_name_for_face(mapping: TextureMapping, face: Face) -> &'static str {
-    match mapping {
-        TextureMapping::Single(name) => name,
-        TextureMapping::TopBottomSide { top, bottom, side } => match face {
-            Face::Top => top,
-            Face::Bottom => bottom,
-            Face::Left | Face::Right | Face::Front | Face::Back => side,
-        },
-    }
-}
-
 /// Up to 6 face-adjacent chunks (plus the center one) around the chunk
 /// being meshed, keyed by direction offset. A neighbour that isn't loaded
 /// yet is simply absent from the map — treated as "no data", which
@@ -292,6 +176,7 @@ pub(crate) fn build_chunk_mesh(
     neighborhood: &ChunkNeighborhood,
     textures: &TextureManager,
     registry: &BlockRegistry,
+    baked: &std::collections::HashMap<String, crate::loader::BakedModel>,
 ) -> ChunkMeshData {
     let mut mesh = ChunkMeshData::default();
     let chunk = &neighborhood.chunks[&IVec3::ZERO];
@@ -304,9 +189,17 @@ pub(crate) fn build_chunk_mesh(
                 if registry.is_air(block) {
                     continue;
                 }
-                let Some(mapping) = block_textures::texture_mapping(registry, block) else {
+                let Some(def) = registry.def(block) else {
                     continue;
                 };
+                // Baked MC model, with legacy exsolis:* -> minecraft:* mapping.
+                let model = crate::loader::McAssets::model_for_baked(baked, &def.name);
+                let Some(model) = model else {
+                    continue;
+                };
+                if model.is_empty() {
+                    continue; // air-like stubs (air, barrier): draw nothing
+                }
                 let (fx, fy, fz) = (
                     origin.x + x as f32,
                     origin.y + y as f32,
@@ -314,22 +207,43 @@ pub(crate) fn build_chunk_mesh(
                 );
                 let (ix, iy, iz) = (x as i32, y as i32, z as i32);
 
-                for &(face, dir) in &FACE_DIRS {
-                    if !is_face_visible(neighborhood, ix + dir.x, iy + dir.y, iz + dir.z, block, registry) {
-                        continue;
+                for quad in &model.quads {
+                    if let Some(dir) = quad.cull {
+                        if !is_face_visible(
+                            neighborhood,
+                            ix + dir[0],
+                            iy + dir[1],
+                            iz + dir[2],
+                            block,
+                            registry,
+                        ) {
+                            continue;
+                        }
                     }
-                    // `get` only returns None when NO texture loaded at all,
-                    // which render.rs already refuses to mesh through.
-                    let Some(id) = textures.get(texture_name_for_face(mapping, face)) else {
+                    let Some(id) = textures.get(&quad.texture) else {
                         continue;
                     };
-                    push_face(
+                    push_baked_quad(
                         &mut mesh.vertices,
                         &mut mesh.indices,
                         fx,
                         fy,
                         fz,
-                        face,
+                        quad,
+                        sampled_image_index(id),
+                    );
+                }
+                for tri in &model.tris {
+                    let Some(id) = textures.get(&tri.texture) else {
+                        continue;
+                    };
+                    push_baked_tri(
+                        &mut mesh.vertices,
+                        &mut mesh.indices,
+                        fx,
+                        fy,
+                        fz,
+                        tri,
                         sampled_image_index(id),
                     );
                 }
@@ -338,4 +252,60 @@ pub(crate) fn build_chunk_mesh(
     }
 
     mesh
+}
+
+fn shade_for_normal(normal: [f32; 3]) -> f32 {
+    if normal[1] > 0.5 {
+        1.0
+    } else if normal[1] < -0.5 {
+        0.5
+    } else if normal[0].abs() > 0.5 {
+        0.65
+    } else {
+        0.8
+    }
+}
+
+fn push_baked_quad(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    fx: f32,
+    fy: f32,
+    fz: f32,
+    quad: &crate::loader::BakedQuad,
+    sampled_text: u32,
+) {
+    let start = vertices.len() as u32;
+    let shade = shade_for_normal(quad.normal);
+    for (corner, uv) in quad.corners.iter().zip(quad.uvs.iter()) {
+        vertices.push(ChunkVertex {
+            position: [fx + corner[0], fy + corner[1], fz + corner[2]],
+            uv: *uv,
+            sampled_text,
+            shade,
+        });
+    }
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn push_baked_tri(
+    vertices: &mut Vec<ChunkVertex>,
+    indices: &mut Vec<u32>,
+    fx: f32,
+    fy: f32,
+    fz: f32,
+    tri: &crate::loader::BakedTri,
+    sampled_text: u32,
+) {
+    let start = vertices.len() as u32;
+    let shade = shade_for_normal(tri.normal);
+    for (vert, uv) in tri.verts.iter().zip(tri.uvs.iter()) {
+        vertices.push(ChunkVertex {
+            position: [fx + vert[0], fy + vert[1], fz + vert[2]],
+            uv: *uv,
+            sampled_text,
+            shade,
+        });
+    }
+    indices.extend_from_slice(&[start, start + 1, start + 2]);
 }

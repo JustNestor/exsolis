@@ -42,6 +42,7 @@ mod gltf;
 mod gltf_utils;
 mod interaction;
 mod keybinds;
+mod loader;
 mod mesh;
 mod net;
 mod player;
@@ -99,6 +100,7 @@ fn main() {
         .add_observer(log_netcode_error)
         .add_plugins(NetPlugin)
         .add_plugins(crate::blocks::BlocksPlugin)
+        .add_plugins(crate::loader::McAssetsPlugin)
         .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)
