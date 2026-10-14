@@ -75,6 +75,7 @@ impl Plugin for ScriptingPlugin {
                 Update,
                 (
                     reload_mods_system,
+                    publish_blocks_to_lua,
                     forward_place_block,
                     forward_break_block,
                     forward_select_hotbar,
@@ -455,6 +456,42 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
             let len = list.raw_len();
             list.raw_set(len + 1, f)?;
             Ok(())
+        })?,
+    )?;
+
+    // --- api.blocks() : full registered block-name list ----------------
+    // Persistent (NOT tick-scoped): keybind/ui handlers run outside
+    // run_on_tick's scope, where scoped callbacks are destructed. Reads
+    // the `__block_list` global published by `publish_blocks_to_lua`.
+    api.set(
+        "blocks",
+        lua.create_function(|lua, ()| {
+            let t = lua.create_table()?;
+            let globals = lua.globals();
+            let Ok(list) = globals.get::<Table>("__block_list") else {
+                return Ok(t);
+            };
+            let mut i = 1;
+            for name in list.sequence_values::<String>().flatten() {
+                t.raw_set(i, name)?;
+                i += 1;
+            }
+            Ok(t)
+        })?,
+    )?;
+
+    // --- api.block_id(name) : numeric id or nil (via `__block_ids`) ----
+    api.set(
+        "block_id",
+        lua.create_function(|lua, name: String| {
+            let globals = lua.globals();
+            let Ok(map) = globals.get::<Table>("__block_ids") else {
+                return Ok(Value::Nil);
+            };
+            match map.get::<i32>(name) {
+                Ok(id) => Ok(Value::Integer(id as i64)),
+                Err(_) => Ok(Value::Nil),
+            }
         })?,
     )?;
 
@@ -1134,25 +1171,8 @@ fn run_on_tick(
         })?;
         api.set("get_block", get_block)?;
 
-        // Full registered block-name list for the creative tab (Lua
-        // inventory). Sorted, so the grid order is stable.
-        let blocks_fn = scope.create_function(|lua, ()| {
-            let mut names: Vec<&str> = blocks.0.iter().map(|(_, d)| d.name.as_str()).collect();
-            names.sort();
-            let t = lua.create_table()?;
-            for (i, name) in names.iter().enumerate() {
-                t.raw_set(i + 1, *name)?;
-            }
-            Ok(t)
-        })?;
-        api.set("blocks", blocks_fn)?;
-
-        // Numeric id for a block name (or nil). Lets the Lua inventory keep
-        // its numeric-id containers in sync with name-based apis.
-        let block_id = scope.create_function(|_, name: String| {
-            Ok(blocks.id(&name).map(|id| id as i32))
-        })?;
-        api.set("block_id", block_id)?;
+        // NOTE: no api.blocks here — the persistent versions live in
+        // install_api (keybind/ui handlers run outside this scope).
 
         // The entity id of the block entity at a position, or nil. Same
         // string-id caveat as every other id crossing into Lua.
@@ -1657,6 +1677,45 @@ fn set_block_and_broadcast(
 
 fn reload_mods_system(runtime: NonSend<ScriptRuntime>) {
     runtime.check_and_reload_mods();
+}
+
+/// Publish the block registry into Lua globals (`__block_list` array +
+/// `__block_ids` name->id map) that the persistent `api.blocks()` /
+/// `api.block_id()` read. Republished only when the registry size changes
+/// (startup + mod reloads that register blocks).
+fn publish_blocks_to_lua(
+    runtime: NonSend<ScriptRuntime>,
+    blocks: Res<crate::blocks::ServerBlocks>,
+    mut last_len: Local<usize>,
+) {
+    if *last_len == blocks.0.len() {
+        return;
+    }
+    *last_len = blocks.0.len();
+    let result = (|| -> mlua::Result<()> {
+        let lua = &runtime.lua;
+        let mut names: Vec<&str> =
+            blocks.0.iter().map(|(_, d)| d.name.as_str()).collect();
+        names.sort();
+        let list = lua.create_table()?;
+        let ids = lua.create_table()?;
+        for (i, name) in names.iter().enumerate() {
+            list.raw_set(i + 1, *name)?;
+            if let Some(id) = blocks.id(name) {
+                ids.raw_set(*name, id as i32)?;
+            }
+        }
+        lua.globals().set("__block_list", list)?;
+        lua.globals().set("__block_ids", ids)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => info!(
+            "scripting: published {} blocks to Lua globals",
+            blocks.0.len()
+        ),
+        Err(e) => warn!("scripting: block publish failed: {e}"),
+    }
 }
 
 #[cfg(test)]
