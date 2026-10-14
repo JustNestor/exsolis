@@ -300,7 +300,9 @@ pub struct TexturePlugin;
 impl Plugin for TexturePlugin {
     fn build(&self, app: &mut App) {
         app.init_resource::<TextureReload>()
-            .add_systems(Update, (request_texture_reload, setup_textures).chain());
+            .init_resource::<BlockAnims>()
+            .add_systems(Update, (request_texture_reload, setup_textures).chain())
+            .add_systems(Update, tick_block_anims);
     }
 }
 
@@ -326,6 +328,34 @@ struct PendingTexture {
     image_id: Id<vulkano::image::Image>,
     staging_id: Id<vulkano::buffer::Buffer>,
     mip_levels: u32,
+    /// Pre-split `.mcmeta` animation frames (ordered RGBA frame buffers).
+    /// The uploaded base image is frame 0 at frame size, not the strip.
+    anim: Option<AnimFrames>,
+}
+
+struct AnimFrames {
+    frames: Vec<Vec<u8>>,
+    /// MC ticks per frame (20 ticks = 1 second).
+    frametime: u32,
+}
+
+/// Runtime state for one cycling `.mcmeta` texture. The GPU image holds a
+/// single frame; `tick_block_anims` uploads the next frame in place, so the
+/// bindless id baked into chunk vertices never changes.
+struct AnimEntry {
+    key: String,
+    image_id: Id<vulkano::image::Image>,
+    staging_id: Id<vulkano::buffer::Buffer>,
+    frames: Vec<Vec<u8>>,
+    frametime: u32,
+    current: usize,
+    elapsed_ticks: f32,
+}
+
+#[derive(Resource, Default)]
+pub struct BlockAnims {
+    entries: Vec<AnimEntry>,
+    logged: bool,
 }
 
 struct PendingGltfTexture {
@@ -351,6 +381,8 @@ fn setup_textures(
     vk: Option<Res<VulkanContext>>,
     textures: Option<Res<TextureManager>>,
     mut reload: ResMut<TextureReload>,
+    mc: Option<Res<crate::loader::McAssets>>,
+    mut anims: ResMut<BlockAnims>,
 ) {
     let Some(vk) = vk else {
         return;
@@ -401,9 +433,55 @@ fn setup_textures(
             continue;
         };
         let dynamic_img = dynamic_img.to_rgba8();
-        let (width, height) = dynamic_img.dimensions();
-        let image_data = dynamic_img.into_raw();
-        let mip_levels = (width.max(height) as f32).log2().floor() as u32 + 1;
+        let (full_w, full_h) = dynamic_img.dimensions();
+        let full = dynamic_img.into_raw();
+
+        // `.mcmeta` split: the base upload is frame 0 at frame size, and the
+        // ordered frames ride along for the cycler. Animated images get no
+        // mip chain (the cycler rewrites level 0 in place).
+        let mut anim: Option<AnimFrames> = None;
+        let mut image_data = full;
+        let (mut width, mut height) = (full_w, full_h);
+        if let Some(meta) = mc.as_ref().and_then(|m| m.anims.iter().find(|a| a.texture == key))
+            && meta.frame_count > 1
+            && full_h >= full_w
+            && full_h % meta.frame_count as u32 == 0
+        {
+            let frame_h = full_h / meta.frame_count as u32;
+            let row_bytes = (full_w * 4) as usize;
+            let order: Vec<usize> = if meta.frames.is_empty() {
+                (0..meta.frame_count).collect()
+            } else {
+                meta.frames
+                    .iter()
+                    .map(|&i| (i as usize) % meta.frame_count)
+                    .collect()
+            };
+            let mut frames = Vec::with_capacity(order.len());
+            for strip_idx in order {
+                let mut buf = vec![0u8; (row_bytes * frame_h as usize)];
+                for row in 0..frame_h as usize {
+                    let src = ((strip_idx * frame_h as usize + row) * row_bytes)..;
+                    let dst = (row * row_bytes)..((row + 1) * row_bytes);
+                    buf[dst].copy_from_slice(&image_data[src.start..src.start + row_bytes]);
+                }
+                frames.push(buf);
+            }
+            if let Some(first) = frames.first().cloned() {
+                image_data = first;
+                width = full_w;
+                height = frame_h;
+                anim = Some(AnimFrames {
+                    frames,
+                    frametime: meta.frametime.max(1),
+                });
+            }
+        }
+        let mip_levels = if anim.is_some() {
+            1
+        } else {
+            (width.max(height) as f32).log2().floor() as u32 + 1
+        };
 
         let Ok(image_id) = vk.resources.create_image(
             &ImageCreateInfo {
@@ -448,6 +526,7 @@ fn setup_textures(
             image_id,
             staging_id,
             mip_levels,
+            anim,
         });
     }
 
@@ -525,6 +604,9 @@ fn setup_textures(
 
     let global_set = vk.resources.bindless_context().unwrap().global_set();
 
+    // A rebuild replaces every image, so the cycler is rebuilt too.
+    anims.entries.clear();
+    anims.logged = false;
     for p in pending {
         let Ok(bindless_id) = global_set.create_sampled_image(
             p.image_id,
@@ -547,11 +629,99 @@ fn setup_textures(
         if manager.fallback.is_none() {
             manager.fallback = Some(bindless_id);
         }
-        loaded.insert(p.key, bindless_id);
+        loaded.insert(p.key.clone(), bindless_id);
+        // Keep the staging buffer: the cycler reuses it for frame uploads.
+        if let Some(anim) = p.anim {
+            anims.entries.push(AnimEntry {
+                key: p.key,
+                image_id: p.image_id,
+                staging_id: p.staging_id,
+                frames: anim.frames,
+                frametime: anim.frametime,
+                current: 0,
+                elapsed_ticks: 0.0,
+            });
+        }
     }
 
     manager.textures = Arc::new(loaded);
     commands.insert_resource(manager);
+}
+
+/// Advance `.mcmeta` textures: when an entry's frame is due, upload the
+/// next frame into its GPU image in place (bindless ids stay valid).
+/// Bounded per frame so 100+ animated textures can't spike.
+fn tick_block_anims(
+    vk: Option<Res<VulkanContext>>,
+    time: Res<bevy_time::Time>,
+    mut anims: ResMut<BlockAnims>,
+) {
+    if anims.entries.is_empty() {
+        return;
+    }
+    if !anims.logged {
+        let frames: usize = anims.entries.iter().map(|e| e.frames.len()).sum();
+        bevy_log::info!(
+            "BlockAnims: cycling {} animated textures ({frames} frames)",
+            anims.entries.len()
+        );
+        anims.logged = true;
+    }
+    let Some(vk) = vk else {
+        return;
+    };
+    const MAX_UPLOADS_PER_FRAME: usize = 4;
+    let mut due = Vec::new();
+    for (i, entry) in anims.entries.iter_mut().enumerate() {
+        if entry.frames.len() < 2 {
+            continue;
+        }
+        entry.elapsed_ticks += time.delta_secs() * 20.0;
+        if entry.elapsed_ticks >= entry.frametime as f32 {
+            entry.elapsed_ticks = 0.0;
+            entry.current = (entry.current + 1) % entry.frames.len();
+            due.push(i);
+            if due.len() >= MAX_UPLOADS_PER_FRAME {
+                break;
+            }
+        }
+    }
+    if due.is_empty() {
+        return;
+    }
+    let host_accesses: Vec<_> = due
+        .iter()
+        .map(|&i| (anims.entries[i].staging_id, HostAccessType::Write))
+        .collect();
+    vk.resources.flight(vk.flight_id).wait(None).unwrap();
+    unsafe {
+        vulkano_taskgraph::execute(
+            &vk.queue,
+            &vk.resources,
+            vk.flight_id,
+            |cbf, tcx| {
+                for &i in &due {
+                    let entry = &anims.entries[i];
+                    let bytes = &entry.frames[entry.current];
+                    tcx.try_write_buffer::<[u8]>(
+                        entry.staging_id,
+                        0..bytes.len() as u64,
+                    )?
+                    .copy_from_slice(bytes);
+                    cbf.copy_buffer_to_image(&CopyBufferToImageInfo {
+                        src_buffer: entry.staging_id,
+                        dst_image: entry.image_id,
+                        ..Default::default()
+                    });
+                }
+                Ok(())
+            },
+            host_accesses,
+            [],
+            [],
+        )
+        .unwrap();
+    }
 }
 
 /// Extracts the raw bindless index from a `SampledImageId` for embedding

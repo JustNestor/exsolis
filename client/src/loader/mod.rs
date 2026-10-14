@@ -58,6 +58,9 @@ pub struct McAssets {
     pub baked: Arc<HashMap<String, BakedModel>>,
     pub pack_dir: Option<PathBuf>,
     pub animated: usize,
+    /// `.mcmeta` animation metadata (texture key -> frames). The texture
+    /// cycler (`texture.rs::BlockAnims`) consumes this after upload.
+    pub anims: Vec<AnimInfo>,
 }
 
 impl McAssets {
@@ -151,6 +154,7 @@ impl Plugin for McAssetsPlugin {
                             }
                         }
                         assets.animated = report.animated_textures;
+                        assets.anims = pack.anim_textures().cloned().collect();
                         // `bake_all` keys are bare stems; the mesher looks up
                         // full `namespace:name` ids.
                         assets.baked = Arc::new(
