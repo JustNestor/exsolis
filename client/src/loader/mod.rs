@@ -13,6 +13,7 @@ pub use mcmodel::{AnimInfo, LoadReport, McPack};
 pub use obj::{ObjMesh, parse_mtl, parse_obj};
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -61,6 +62,23 @@ pub struct McAssets {
     /// `.mcmeta` animation metadata (texture key -> frames). The texture
     /// cycler (`texture.rs::BlockAnims`) consumes this after upload.
     pub anims: Vec<AnimInfo>,
+    /// Texture keys used by at least one `tintindex` quad (grass, foliage).
+    /// MC ships these grayscale; both the world upload and the UI previews
+    /// multiply them by the plains biome tint. Single tint for all foliage
+    /// (oak/birch/spruce differ slightly in vanilla) — documented M-limitation.
+    pub tinted_textures: HashSet<String>,
+}
+
+/// Plains biome tint (MC grass colormap): #91BD59.
+pub const GRASS_TINT: [u8; 3] = [145, 189, 89];
+
+/// Multiply straight-alpha RGBA pixels by the biome tint (alpha untouched).
+pub fn apply_biome_tint(px: &mut [u8]) {
+    for p in px.chunks_exact_mut(4) {
+        for (c, t) in p.iter_mut().take(3).zip(GRASS_TINT.iter()) {
+            *c = ((*c as u16 * *t as u16) / 255) as u8;
+        }
+    }
 }
 
 impl McAssets {
@@ -155,6 +173,22 @@ impl Plugin for McAssetsPlugin {
                         }
                         assets.animated = report.animated_textures;
                         assets.anims = pack.anim_textures().cloned().collect();
+                        // Tinted texture set: any key behind a tintindex quad.
+                        let mut tinted = HashSet::new();
+                        for model in models.values() {
+                            for q in &model.quads {
+                                if q.tinted {
+                                    tinted.insert(q.texture.clone());
+                                }
+                            }
+                        }
+                        if !tinted.is_empty() {
+                            bevy_log::info!(
+                                "McPack: {} grayscale textures use biome tint",
+                                tinted.len()
+                            );
+                        }
+                        assets.tinted_textures = tinted;
                         // `bake_all` keys are bare stems; the mesher looks up
                         // full `namespace:name` ids.
                         assets.baked = Arc::new(

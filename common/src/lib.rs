@@ -367,8 +367,9 @@ pub const HOTBAR_SIZE: usize = 9;
 
 // ---- SDUI limits, shared so server-side validation matches the client ----
 
-/// Max size of one `UiShow.xml` payload.
-pub const UI_MAX_XML_BYTES: usize = 64 * 1024;
+/// Max size of one `UiShow.xml` payload. Sized for the Lua creative tab
+/// (~1200 `block#` cells); reliable-ordered, sent on open only.
+pub const UI_MAX_XML_BYTES: usize = 256 * 1024;
 /// Max length of `ui_id` / `element_id`.
 pub const UI_MAX_ID_LEN: usize = 64;
 /// Max length of `UiAction.action` and `UiAction.data`.

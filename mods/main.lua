@@ -10,15 +10,17 @@ local function ensure(player_id)
     return PlayerInventory.get(player_id)
 end
 
-local function item_view(item)
+local function item_view(item, names)
     if not item then return nil end
     local short_names = { wood = "W", stone = "S" }
     local colors = { wood = "#8a5a32", stone = "#777777" }
+    local name = names and names[item.id] or nil
     return {
         id = item.id,
         count = item.count,
-        short = short_names[item.id] or string.upper(string.sub(item.id, 1, 1)),
+        short = short_names[item.id] or string.upper(string.sub(tostring(item.id), 1, 1)),
         color = colors[item.id] or "#6f8f55",
+        img = name and ("block#" .. name) or nil,
     }
 end
 
@@ -37,6 +39,12 @@ end
 local function inv_data(player_id)
     local inv = ensure(player_id).container
     local selected = ensure(player_id).selected
+    -- Reverse id -> block name for block# icons. One pass over api.blocks().
+    local names = {}
+    for _, name in ipairs(api.blocks()) do
+        local id = api.block_id(name)
+        if id and not names[id] then names[id] = name end
+    end
     local slots = {}
     local slots2 = {}
     -- The 27 main-inventory slots follow the 9 hotbar slots in storage.
@@ -44,23 +52,30 @@ local function inv_data(player_id)
         local index = i + 9
         slots[i + 1] = {
             index = index,
-            item = item_view(Container.get(inv, index)),
+            item = item_view(Container.get(inv, index), names),
         }
     end
     for i = 0, 8 do
         local item = Container.get(inv, i)
         slots2[i + 1] = {
             index = i,
-            item = item_view(item),
+            item = item_view(item, names),
             selected_bg = selected == i and "#b5b5b5" or "#777777",
         }
+    end
+    -- Creative grid: every registered block, wheel-scrollable, no paging
+    -- buttons. Click gives a full stack (Rust authority + Lua mirror).
+    local creative = {}
+    for _, name in ipairs(api.blocks()) do
+        creative[#creative + 1] = { name = name, img = "block#" .. name }
     end
     return {
         title = "Inventory",
         slots = slots,
         slots2 = slots2,
         selected = selected,
-        held_item = item_view(ensure(player_id).held_item),
+        held_item = item_view(ensure(player_id).held_item, names),
+        creative = creative,
     }
 end
 
@@ -168,6 +183,15 @@ api.on("ui_action", function(ev)
         local index = tonumber(string.match(payload, "(%d+)$"))
         local right_click = string.find(payload, "right", 1, true) ~= nil
         click_slot(ev.player_id, index, right_click)
+    elseif ev.action == "inventory:creative" then
+        -- Creative give: Rust authority first, Lua display mirror second.
+        local name = ev.data or ""
+        api.give_block(ev.player_id, name, 64)
+        local id = api.block_id(name)
+        if id then
+            PlayerInventory.add(ev.player_id, id, 64)
+        end
+        if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
     end
 end)
 

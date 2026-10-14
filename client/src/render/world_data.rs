@@ -24,6 +24,8 @@
 //! produced by [`pack_block`], the single place that decides what shaders can
 //! know about a block.
 
+use std::collections::HashMap;
+
 use bevy_ecs::prelude::*;
 use bevy_transform::prelude::Transform;
 use exsolis_common::{BlockId, BlockRegistry, ChunkCoord};
@@ -144,10 +146,26 @@ fn cell_index(coord: IVec3, dims: IVec3) -> usize {
 }
 
 /// Decides what shaders can know about a block: id (low byte) and flags.
-/// Extend this (and the WGSL import) to expose more, e.g. a liquid flag.
-fn pack_block(block: BlockId, registry: &BlockRegistry) -> u16 {
+/// Solidity is geometry-derived, not heuristic: a block is solid only when
+/// the registry says so AND its baked model has at least one cullable face
+/// (full cubes, stairs, fences...). Cross plants, torches, rails, carpets
+/// have no cull faces, so effects no longer collide with grass tops.
+/// Unknown models fall back to the registry flag.
+fn pack_block(
+    block: BlockId,
+    registry: &BlockRegistry,
+    baked: &HashMap<String, crate::loader::BakedModel>,
+) -> u16 {
     let mut packed = block & 0xFF;
-    if registry.is_solid(block) {
+    let mut solid = registry.is_solid(block);
+    if solid
+        && let Some(def) = registry.def(block)
+        && let Some(model) = crate::loader::McAssets::model_for_baked(baked, &def.name)
+        && !model.is_empty()
+    {
+        solid = model.quads.iter().any(|q| q.cull.is_some());
+    }
+    if solid {
         packed |= FLAG_SOLID;
     }
     if registry.is_transparent(block) {
@@ -159,13 +177,17 @@ fn pack_block(block: BlockId, registry: &BlockRegistry) -> u16 {
     packed
 }
 
-fn pack_chunk(chunk: &Chunk, registry: &BlockRegistry) -> Box<[u32]> {
+fn pack_chunk(
+    chunk: &Chunk,
+    registry: &BlockRegistry,
+    baked: &HashMap<String, crate::loader::BakedModel>,
+) -> Box<[u32]> {
     let mut words = vec![0u32; CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE / 2];
     for y in 0..CHUNK_SIZE {
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let voxel = (y * CHUNK_SIZE + z) * CHUNK_SIZE + x;
-                words[voxel / 2] |= u32::from(pack_block(chunk.get(x, y, z), registry)) << ((voxel % 2) * 16);
+                words[voxel / 2] |= u32::from(pack_block(chunk.get(x, y, z), registry, baked)) << ((voxel % 2) * 16);
             }
         }
     }
@@ -179,6 +201,7 @@ pub(super) fn update_world_window(
     mut window: ResMut<WorldWindow>,
     registry: Option<Res<ChunkRegistry>>,
     blocks: Option<Res<ClientBlocks>>,
+    mc: Option<Res<crate::loader::McAssets>>,
     chunks: Query<Ref<Chunk>>,
     camera: Query<&Transform, With<LocalPlayer>>,
 ) {
@@ -252,6 +275,14 @@ pub(super) fn update_world_window(
 
     jobs.sort_by_key(|job| job.0);
     let mut jobs = jobs.into_iter();
+    let baked_empty;
+    let baked: &HashMap<String, crate::loader::BakedModel> = match mc.as_ref() {
+        Some(m) => &m.baked,
+        None => {
+            baked_empty = HashMap::new();
+            &baked_empty
+        }
+    };
     for (_, cell, coord, entity, tick) in jobs.by_ref().take(MAX_CHUNK_UPLOADS_PER_FRAME) {
         let Ok(chunk) = chunks.get(entity) else {
             continue;
@@ -259,7 +290,7 @@ pub(super) fn update_world_window(
         uploads.push(WorldUpload {
             cell: cell as u32,
             tag: [coord.x, coord.y, coord.z, 1],
-            voxels: Some(pack_chunk(&chunk, block_registry)),
+            voxels: Some(pack_chunk(&chunk, block_registry, baked)),
             desired: CellState::Loaded(coord, tick),
         });
     }

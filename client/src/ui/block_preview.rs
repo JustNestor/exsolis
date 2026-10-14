@@ -115,10 +115,12 @@ pub fn decode_block(
     let scale = ((PREVIEW_SIZE as f32 - 2.0 * pad) / span_x)
         .min((PREVIEW_SIZE as f32 - 2.0 * pad) / span_y);
     let map = |sx: f32, sy: f32| -> (f32, f32) {
-        // Screen y grows downwards; iso y grows upwards, hence the flip.
+        // Iso `sy` grows upwards with the cube top; screen y grows
+        // downwards, so map min->top directly (no flip: flipping here is
+        // what turned every icon upside down).
         (
             pad + (sx - min[0]) * scale,
-            pad + (max[1] - sy) * scale,
+            pad + (sy - min[1]) * scale,
         )
     };
 
@@ -140,6 +142,16 @@ pub fn decode_block(
         let Some((tw, th, px)) = load_texture(&mut tex_cache, &quad.texture, &path) else {
             continue;
         };
+        // Grayscale tintindex faces (grass, foliage) get the biome tint,
+        // same as the world upload.
+        let mut owned;
+        let px = if quad.tinted {
+            owned = px.clone();
+            crate::loader::apply_biome_tint(&mut owned);
+            &owned
+        } else {
+            &px
+        };
         let pts: Vec<(f32, f32, f32, f32, f32)> = quad
             .corners
             .iter()
@@ -156,7 +168,7 @@ pub fn decode_block(
                 &pts[tri.2],
                 tw,
                 th,
-                &px,
+                px,
                 shade,
                 &mut rgba,
                 &mut zbuf,

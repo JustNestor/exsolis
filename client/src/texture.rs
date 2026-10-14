@@ -477,6 +477,19 @@ fn setup_textures(
                 });
             }
         }
+        // Grayscale tintindex textures (grass, foliage) ship gray; the
+        // plains biome tint makes them read as MC grass/leaves.
+        if mc
+            .as_ref()
+            .is_some_and(|m| m.tinted_textures.contains(&key))
+        {
+            crate::loader::apply_biome_tint(&mut image_data);
+            if let Some(anim) = anim.as_mut() {
+                for frame in anim.frames.iter_mut() {
+                    crate::loader::apply_biome_tint(frame);
+                }
+            }
+        }
         let mip_levels = if anim.is_some() {
             1
         } else {

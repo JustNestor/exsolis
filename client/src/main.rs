@@ -37,7 +37,6 @@ mod block_textures;
 mod blocks;
 mod chunk;
 mod chunk_registry;
-mod creative;
 mod entities;
 mod gltf;
 mod gltf_utils;
@@ -105,7 +104,6 @@ fn main() {
         .add_plugins(assets::AssetClientPlugin)
         .add_plugins(ui::UiPlugin)
         .add_plugins(StreamingPlugin)
-        .add_plugins(crate::creative::CreativePlugin)
         .add_plugins(crate::entities::EntityClientPlugin)
         .add_plugins(crate::interaction::InteractionPlugin)
         .add_plugins((RendererPlugin, PlayerPlugin))

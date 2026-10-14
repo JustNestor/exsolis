@@ -1134,6 +1134,26 @@ fn run_on_tick(
         })?;
         api.set("get_block", get_block)?;
 
+        // Full registered block-name list for the creative tab (Lua
+        // inventory). Sorted, so the grid order is stable.
+        let blocks_fn = scope.create_function(|lua, ()| {
+            let mut names: Vec<&str> = blocks.0.iter().map(|(_, d)| d.name.as_str()).collect();
+            names.sort();
+            let t = lua.create_table()?;
+            for (i, name) in names.iter().enumerate() {
+                t.raw_set(i + 1, *name)?;
+            }
+            Ok(t)
+        })?;
+        api.set("blocks", blocks_fn)?;
+
+        // Numeric id for a block name (or nil). Lets the Lua inventory keep
+        // its numeric-id containers in sync with name-based apis.
+        let block_id = scope.create_function(|_, name: String| {
+            Ok(blocks.id(&name).map(|id| id as i32))
+        })?;
+        api.set("block_id", block_id)?;
+
         // The entity id of the block entity at a position, or nil. Same
         // string-id caveat as every other id crossing into Lua.
         let registry = &registry;
