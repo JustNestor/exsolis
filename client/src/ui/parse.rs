@@ -31,8 +31,11 @@ use std::fmt;
 use exsolis_common::UI_MAX_XML_BYTES;
 
 pub const MAX_DEPTH: usize = 32;
-/// roxmltree counts every node (elements, text, attributes).
-pub const MAX_XML_NODES: u32 = 4096;
+/// roxmltree counts every node (elements, text, attributes). Sized for the
+/// Lua creative tab (~1200 cells x ~10 nodes). The extractor walks the
+/// mounted tree every frame, so a virtualized grid replaces this brute
+/// force once the catalog grows further.
+pub const MAX_XML_NODES: u32 = 16384;
 
 pub type Attrs = HashMap<String, String>;
 
