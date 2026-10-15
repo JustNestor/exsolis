@@ -11,6 +11,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::Face;
+
 /// Numeric block handle. `0` is always air.
 pub type BlockId = u16;
 
@@ -32,6 +34,10 @@ pub struct BlockDef {
     /// Set on masters (beds, doors): placing/breaking resolves the parts.
     #[serde(default)]
     pub multiblock: Option<MultiblockLayout>,
+    /// Set on orientation parts (`oak_stairs__…`, door tops): the base to
+    /// drop on break and to show in creative. `None` everywhere else.
+    #[serde(default)]
+    pub part_of: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -134,6 +140,7 @@ impl BlockRegistry {
                 placeable: !air_like,
                 hidden: air_like,
                 multiblock: None,
+                part_of: None,
             },
         )
     }
@@ -184,6 +191,7 @@ impl BlockRegistry {
                 placeable: !air_like,
                 hidden: air_like,
                 multiblock: None,
+                part_of: None,
             },
         )
     }
@@ -201,6 +209,7 @@ impl BlockRegistry {
                 placeable: false,
                 hidden: false,
                 multiblock: None,
+                part_of: None,
             },
         )
     }
@@ -218,8 +227,38 @@ impl BlockRegistry {
                 placeable: false,
                 hidden: true,
                 multiblock: None,
+                part_of: None,
             },
         )
+    }
+
+    /// Register a hidden orientation part (`oak_stairs__facing=east…`):
+    /// unplaceable directly, drops `master`, invisible in creative.
+    pub fn register_opart(&mut self, name: String, master: String, solid: bool, transparent: bool) -> BlockId {
+        self.register_full(
+            &name.clone(),
+            BlockDef {
+                name,
+                solid,
+                transparent,
+                block_entity: false,
+                placeable: false,
+                hidden: true,
+                multiblock: None,
+                part_of: Some(master),
+            },
+        )
+    }
+
+    /// Drop id for a broken cell: orientation parts drop their master,
+    /// everything else drops itself.
+    pub fn drop_for(&self, id: BlockId) -> BlockId {
+        if let Some(master) = self.def(id).and_then(|d| d.part_of.clone())
+            && let Some(mid) = self.id(&master)
+        {
+            return mid;
+        }
+        id
     }
 
     /// Attach a multiblock layout to an already-registered master.
@@ -354,6 +393,135 @@ pub fn mc_item_template(stem: &str) -> bool {
     )
 }
 
+/// Orientation variants for view-dependent placement. Returns
+/// `(part_name, bake_base, state)`; part names are deterministic so the
+/// baker, both registries and placement all agree without messaging.
+///
+/// - stairs `<x>_stairs` → 8 × (facing, half=bottom/top, shape=straight)
+/// - slabs `<x>_slab` → 2 × (type=bottom/top)
+/// - pillars `<x>_log|_stem|_pillar|hay_block|bone_block` → 3 × axis
+/// - `torch` → floor default + 4 wall facings (baked from `wall_torch`)
+pub fn orientation_parts(master: &str) -> Vec<(String, String, Vec<(String, String)>)> {
+    let Some(base) = master.strip_prefix("minecraft:") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let part_name = |state: &[(String, String)]| {
+        let mut suffix = String::new();
+        for (k, v) in state {
+            suffix.push_str("__");
+            suffix.push_str(k);
+            suffix.push('=');
+            suffix.push_str(v);
+        }
+        format!("{master}{suffix}")
+    };
+    if base.ends_with("_stairs") {
+        for f in ["north", "east", "south", "west"] {
+            for h in ["bottom", "top"] {
+                let state = vec![
+                    ("facing".to_string(), f.to_string()),
+                    ("half".to_string(), h.to_string()),
+                    ("shape".to_string(), "straight".to_string()),
+                ];
+                out.push((part_name(&state), master.to_string(), state));
+            }
+        }
+    } else if base.ends_with("_slab") {
+        for t in ["bottom", "top"] {
+            let state = vec![("type".to_string(), t.to_string())];
+            out.push((part_name(&state), master.to_string(), state));
+        }
+    } else if base.ends_with("_log")
+        || base.ends_with("_stem")
+        || base.ends_with("_pillar")
+        || matches!(base, "hay_block" | "bone_block" | "basalt" | "polished_basalt")
+    {
+        for a in ["x", "y", "z"] {
+            let state = vec![("axis".to_string(), a.to_string())];
+            out.push((part_name(&state), master.to_string(), state));
+        }
+    } else if base == "torch" {
+        for f in ["north", "east", "south", "west"] {
+            let state = vec![("facing".to_string(), f.to_string())];
+            out.push((
+                part_name(&state),
+                "minecraft:wall_torch".to_string(),
+                state,
+            ));
+        }
+    }
+    out
+}
+
+/// Pick the placed part (or master) from the clicked face, the player
+/// facing and eye height. `eye_above` = eye is clearly above the target
+/// cell top (side clicks then land on the upper half — an approximation
+/// of the exact hit point MC uses).
+pub fn placement_pick(
+    master: &str,
+    face: Face,
+    facing: Facing,
+    eye_above: bool,
+) -> Option<String> {
+    let Some(base) = master.strip_prefix("minecraft:") else {
+        return None;
+    };
+    // Which half for slabs/stairs: underside clicks go top, top clicks go
+    // bottom, side clicks follow the eye heuristic.
+    let top_half = match face {
+        Face::Bottom => true,
+        Face::Top => false,
+        _ => eye_above,
+    };
+    if base.ends_with("_stairs") {
+        let f = match facing {
+            Facing::North => "north",
+            Facing::East => "east",
+            Facing::South => "south",
+            Facing::West => "west",
+        };
+        let h = if top_half { "top" } else { "bottom" };
+        return Some(format!(
+            "{master}__facing={f}__half={h}__shape=straight"
+        ));
+    }
+    if base.ends_with("_slab") {
+        let t = if top_half { "top" } else { "bottom" };
+        return Some(format!("{master}__type={t}"));
+    }
+    if base.ends_with("_log")
+        || base.ends_with("_stem")
+        || base.ends_with("_pillar")
+        || matches!(base, "hay_block" | "bone_block" | "basalt" | "polished_basalt")
+    {
+        let a = match face {
+            Face::Top | Face::Bottom => "y",
+            Face::Left | Face::Right => "x",
+            Face::Front | Face::Back => "z",
+        };
+        return Some(format!("{master}__axis={a}"));
+    }
+    if base == "torch" {
+        match face {
+            Face::Top => return None, // floor torch = master default
+            Face::Bottom => return None, // nothing hangs from ceilings v1
+            _ => {
+                // Wall torch facing = the clicked face direction.
+                let f = match face {
+                    Face::Left => "west",
+                    Face::Right => "east",
+                    Face::Front => "south",
+                    Face::Back => "north",
+                    _ => unreachable!(),
+                };
+                return Some(format!("minecraft:wall_torch__facing={f}"));
+            }
+        }
+    }
+    None
+}
+
 /// Air-family blocks render nothing; they stay out of creative even when
 /// placeable (barrier/light keep working through commands).
 pub fn is_air_like_name(name: &str) -> bool {
@@ -386,6 +554,35 @@ mod tests {
         assert_eq!(Facing::from_yaw(-PI / 2.0), Facing::East);
         assert_eq!(Facing::from_yaw(PI / 2.0), Facing::West);
         assert_eq!(Facing::from_yaw(PI), Facing::South);
+    }
+
+    #[test]
+    fn placement_pick_orients() {
+        use crate::Face;
+        // Stairs face the player, slabs follow the clicked face.
+        assert_eq!(
+            placement_pick("minecraft:oak_stairs", Face::Top, Facing::East, false),
+            Some("minecraft:oak_stairs__facing=east__half=bottom__shape=straight".to_string())
+        );
+        assert_eq!(
+            placement_pick("minecraft:oak_stairs", Face::Bottom, Facing::North, false),
+            Some("minecraft:oak_stairs__facing=north__half=top__shape=straight".to_string())
+        );
+        assert_eq!(
+            placement_pick("minecraft:stone_slab", Face::Bottom, Facing::North, false),
+            Some("minecraft:stone_slab__type=top".to_string())
+        );
+        // Pillars follow the face axis; torches go wall-mounted on sides.
+        assert_eq!(
+            placement_pick("minecraft:oak_log", Face::Left, Facing::North, false),
+            Some("minecraft:oak_log__axis=x".to_string())
+        );
+        assert_eq!(
+            placement_pick("minecraft:torch", Face::Front, Facing::North, false),
+            Some("minecraft:wall_torch__facing=south".to_string())
+        );
+        assert_eq!(placement_pick("minecraft:torch", Face::Top, Facing::North, false), None);
+        assert_eq!(placement_pick("minecraft:stone", Face::Top, Facing::North, false), None);
     }
 
     #[test]

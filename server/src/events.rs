@@ -271,11 +271,12 @@ pub fn dispatch_incoming(
                     radius: *radius,
                 });
             }
-            ClientMessage::PlaceBlock { pos, kind } => {
+            ClientMessage::PlaceBlock { pos, kind, face } => {
                 commands.write_message(PlaceBlockRequested {
                     player_id: client_id,
                     pos: *pos,
                     kind: kind.clone(),
+                    face: *face,
                 });
             }
             ClientMessage::BreakBlock { pos } => {

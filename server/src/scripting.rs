@@ -1041,6 +1041,8 @@ fn forward_place_block(
     runtime: NonSend<ScriptRuntime>,
     player_map: Res<crate::PlayerMap>,
     inventories: Query<&crate::Inventory>,
+    positions: Query<&crate::chunks::PlayerPosition>,
+    looks: Query<&crate::movement::PlayerLook>,
     blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
@@ -1051,9 +1053,22 @@ fn forward_place_block(
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
-        let block_id = blocks.id(&ev.kind).map(|id| id as i32).unwrap_or(-1);
+        // Name the concrete placed part (stairs facing, slab half…), not
+        // the client guess: same resolution as placement.
+        let placed = player_map
+            .playerid_to_entity
+            .get(&ev.player_id)
+            .and_then(|e| blocks.id(&ev.kind).map(|id| (e, id)))
+            .map(|(entity, master)| {
+                let yaw = looks.get(*entity).map(|l| l.yaw).unwrap_or(0.0);
+                let eye = positions.get(*entity).map(|p| p.0.y + 1.62).unwrap_or(0.0);
+                crate::interaction::resolve_placement(&blocks, master, ev.face, yaw, eye, ev.pos.y)
+            })
+            .and_then(|id| blocks.name(id).map(|s| s.to_string()))
+            .unwrap_or_else(|| ev.kind.clone());
+        let block_id = blocks.id(&placed).map(|id| id as i32).unwrap_or(-1);
         let _ = t.set("block_id", block_id);
-        let _ = t.set("block", ev.kind.clone());
+        let _ = t.set("block", placed);
         write_inv_snapshot(&runtime, ev.player_id, &player_map, &inventories, &blocks);
         runtime.dispatch("place_block", t);
     }

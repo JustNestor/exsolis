@@ -104,8 +104,23 @@ impl Plugin for BlocksPlugin {
                 }
             }
         }
-        if parts + items > 0 {
-            bevy_log::info!("ServerBlocks: +{parts} multiblock parts, +{items} items");
+        let known2: Vec<String> = registry.iter().map(|(_, d)| d.name.clone()).collect();
+        let mut oparts = 0;
+        for master in &known2 {
+            for (part, _, _) in exsolis_common::orientation_parts(master) {
+                if registry.id(&part).is_some() {
+                    continue;
+                }
+                let flags = registry
+                    .def(registry.id(master).unwrap_or(0))
+                    .map(|d| (d.solid, d.transparent))
+                    .unwrap_or((true, false));
+                registry.register_opart(part, master.clone(), flags.0, flags.1);
+                oparts += 1;
+            }
+        }
+        if parts + items + oparts > 0 {
+            bevy_log::info!("ServerBlocks: +{parts} multiblock parts, +{oparts} orientation parts, +{items} items");
         }
         app.insert_resource(ServerBlocks(registry));
     }

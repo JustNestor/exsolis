@@ -45,6 +45,10 @@ pub struct UiManager {
     roots: HashMap<String, Entity>,
     /// Screens whose root has `modal="true"`.
     modal: HashSet<String>,
+    /// Scroll offsets remembered per screen, so a re-mounted screen
+    /// (the inventory re-renders on every click) keeps its scroll instead
+    /// of jumping to the top. First scroll area per screen wins.
+    scroll_memory: HashMap<String, bevy_math::Vec2>,
 }
 
 impl UiManager {
@@ -227,6 +231,8 @@ impl Plugin for UiPlugin {
                         .before(handle_ui_packets),
                     hide_on_disconnect,
                     arrow_key_scroll,
+                    remember_scroll,
+                    restore_scroll,
                     events::update_hover_styles,
                     spawn::update_scrollbar_thumbs,
                     spawn::update_cursor_widgets,
@@ -271,6 +277,65 @@ fn arrow_key_scroll(
         let content = computed.content_size() * computed.inverse_scale_factor;
         let range = (content - visible).max(bevy_math::Vec2::ZERO);
         position.y = (position.y + step).clamp(0.0, range.y);
+    }
+}
+
+/// Remember scroll offsets per screen every frame, so re-mounted screens
+/// (inventory re-renders on each click) restore them instead of jumping.
+fn remember_scroll(
+    mut ui: ResMut<UiManager>,
+    roots: Query<(Entity, &spawn::UiRoot)>,
+    children: Query<&Children>,
+    areas: Query<&bevy_ui::ScrollPosition, With<spawn::UiScrollArea>>,
+) {
+    for (entity, root) in &roots {
+        let mut found = None;
+        let mut stack: Vec<Entity> = children
+            .get(entity)
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
+        while let Some(entity) = stack.pop() {
+            if let Ok(pos) = areas.get(entity) {
+                found = Some(bevy_math::Vec2::new(pos.x, pos.y));
+                break;
+            }
+            if let Ok(kids) = children.get(entity) {
+                for k in kids.iter() {
+                    stack.push(k);
+                }
+            }
+        }
+        if let Some(offset) = found {
+            ui.scroll_memory.insert(root.ui_id.clone(), offset);
+        }
+    }
+}
+
+/// Fresh scroll areas start at 0,0; restore the remembered offset for
+/// their screen (if any) on spawn.
+fn restore_scroll(
+    mut ui: ResMut<UiManager>,
+    mut areas: Query<(&mut bevy_ui::ScrollPosition, &ChildOf), Added<spawn::UiScrollArea>>,
+    parents: Query<&ChildOf>,
+    roots: Query<&spawn::UiRoot>,
+) {
+    for (mut pos, parent) in &mut areas {
+        let mut entity = parent.0;
+        let ui_id = loop {
+            if let Ok(root) = roots.get(entity) {
+                break Some(root.ui_id.clone());
+            }
+            let Ok(next) = parents.get(entity) else {
+                break None;
+            };
+            entity = next.0;
+        };
+        if let Some(id) = ui_id
+            && let Some(offset) = ui.scroll_memory.get(&id)
+        {
+            pos.x = offset.x;
+            pos.y = offset.y;
+        }
     }
 }
 

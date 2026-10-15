@@ -435,9 +435,25 @@ fn handle_place_input(
             .as_ref()
             .and_then(|b| b.0.def(item).map(|d| d.name.clone()))
             .unwrap_or_else(|| "exsolis:stone".to_string());
+        // Clicked face = placement cell minus the targeted solid cell.
+        let delta = target.place_pos - target.pos;
+        let face = if delta.y > 0 {
+            exsolis_common::Face::Top
+        } else if delta.y < 0 {
+            exsolis_common::Face::Bottom
+        } else if delta.x > 0 {
+            exsolis_common::Face::Right
+        } else if delta.x < 0 {
+            exsolis_common::Face::Left
+        } else if delta.z > 0 {
+            exsolis_common::Face::Front
+        } else {
+            exsolis_common::Face::Back
+        };
         outgoing.write(OutgoingPacket::reliable(ClientMessage::PlaceBlock {
             pos: BlockPos::new(target.place_pos.x, target.place_pos.y, target.place_pos.z),
             kind,
+            face,
         }));
     }
 }

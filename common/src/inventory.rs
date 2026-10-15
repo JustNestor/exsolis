@@ -219,6 +219,20 @@ impl Inventory {
         };
         self.add_item(held.item, held.amount)
     }
+
+    /// Creative grab: a full stack goes to the cursor. Whatever was held
+    /// returns to storage first (overflow drops with a count).
+    pub fn grab(&mut self, item: BlockId) -> u8 {
+        let mut dropped = 0u8;
+        if let Some(old) = self.held.take() {
+            dropped = self.add_item(old.item, old.amount);
+        }
+        self.held = Some(Slot {
+            item,
+            amount: MAX_STACK,
+        });
+        dropped
+    }
 }
 
 impl Default for Inventory {

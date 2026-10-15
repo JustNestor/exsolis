@@ -6,14 +6,14 @@ pub mod inventory;
 
 pub use blocks::{
     AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart,
-    is_air_like_name, mc_item_template,
+    is_air_like_name, mc_item_template, orientation_parts, placement_pick,
 };
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
 /// `EntityStateUpdate`). `EntityKind` gained variants, so an old client's
 /// decode of a new server's stream would desync rather than fail cleanly.
-pub const PROTOCOL_ID: u64 = 5;
+pub const PROTOCOL_ID: u64 = 6;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -170,6 +170,10 @@ pub enum ClientMessage {
     PlaceBlock {
         pos: BlockPos,
         kind: String,
+        /// Clicked face of the targeted block (placement cell minus target
+        /// cell), for view-dependent blocks (stairs facing, slab halves,
+        /// pillar axes, wall torches). Appended for wire compatibility.
+        face: Face,
     },
     BreakBlock {
         pos: BlockPos,

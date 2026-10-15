@@ -64,6 +64,7 @@ pub struct PlaceBlockRequested {
     pub player_id: PlayerId,
     pub pos: BlockPos,
     pub kind: String,
+    pub face: exsolis_common::Face,
 }
 
 #[derive(Message)]
@@ -284,14 +285,26 @@ pub(crate) fn handle_place_block(
 
         // Generic multiblock: the master cell plus every part cell (rotated
         // by placement facing) must be loaded air, or nothing is placed.
-        let facing = looks
+        // Orientation first: stairs/slabs/pillars/torches resolve to their
+        // view-dependent part (or the master when nothing applies).
+        let yaw = looks
             .get(entity)
-            .map(|look| exsolis_common::Facing::from_yaw(look.yaw))
-            .unwrap_or(exsolis_common::Facing::North);
-        let Some(cells) = multiblock_cells(ev.pos, resolved_id, facing, &world, &blocks) else {
+            .map(|look| look.yaw)
+            .unwrap_or(0.0);
+        let placed_id = resolve_placement(
+            &blocks,
+            resolved_id,
+            ev.face,
+            yaw,
+            player_pos.0.y + 1.62,
+            ev.pos.y,
+        );
+        let facing = exsolis_common::Facing::from_yaw(yaw);
+        let placed_name = blocks.name(placed_id).unwrap_or("exsolis:air");
+        let Some(cells) = multiblock_cells(ev.pos, placed_id, facing, &world, &blocks) else {
             warn!(
                 "[PlaceBlock] Multiblock footprint blocked for {:?} at {:?}",
-                server_kind, ev.pos
+                placed_name, ev.pos
             );
             continue;
         };
@@ -336,6 +349,25 @@ pub(crate) fn handle_place_block(
             );
         }
     }
+}
+
+/// Resolve the concrete placed id for a master: orientation parts win
+/// (stairs facing, slab half, pillar axis, wall torch), else the master.
+/// Shared by placement and the Lua forwarder so both name the same block.
+pub(crate) fn resolve_placement(
+    blocks: &ServerBlocks,
+    master: BlockId,
+    face: exsolis_common::Face,
+    yaw: f32,
+    eye_y: f32,
+    pos_y: i32,
+) -> BlockId {
+    let master_name = blocks.name(master).unwrap_or("exsolis:air");
+    let facing = exsolis_common::Facing::from_yaw(yaw);
+    let eye_above = eye_y > pos_y as f32 + 1.0;
+    exsolis_common::placement_pick(master_name, face, facing, eye_above)
+        .and_then(|part| blocks.id(&part))
+        .unwrap_or(master)
 }
 
 /// Read one cell, or `None` when its chunk is not loaded (treated as
@@ -565,8 +597,10 @@ pub(crate) fn handle_break_block(
         }
 
         // Generic multiblock: resolve the whole structure (master or part
-        // hit — facing is rediscovered by coverage, never stored).
-        let (drop_id, cells) = break_cells(ev.pos, broken, &world, &blocks);
+        // hit — facing is rediscovered by coverage, never stored). Drops
+        // resolve through orientation parts to their master.
+        let (resolved, cells) = break_cells(ev.pos, broken, &world, &blocks);
+        let drop_id = blocks.0.drop_for(resolved);
         let mut ok = true;
         for (pos, _) in &cells {
             let (coord, idx) = world_to_chunk(*pos);

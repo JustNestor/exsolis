@@ -250,8 +250,16 @@ impl Plugin for McAssetsPlugin {
                             baked.insert(format!("minecraft:{stem}"), model);
                             part_count += 1;
                         }
-                        if part_count > 0 {
-                            bevy_log::info!("McPack: +{part_count} multiblock parts");
+                        // Hidden orientation parts (stairs, slabs, pillars…).
+                        let mut oparts = 0;
+                        for (name, model) in pack.bake_orientation(&mut report) {
+                            baked.insert(name, model);
+                            oparts += 1;
+                        }
+                        if part_count + oparts > 0 {
+                            bevy_log::info!(
+                                "McPack: +{part_count} multiblock parts, +{oparts} orientation parts"
+                            );
                         }
                         bevy_log::info!(
                             "McPack: baked {}/{} blocks ({} stubs, {} animated; opaque={} cutout={} translucent={}) from {}",

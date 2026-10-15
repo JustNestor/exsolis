@@ -363,6 +363,33 @@ impl McPack {
         (out, report)
     }
 
+    /// Bake hidden orientation parts for view-dependent placement
+    /// (stairs facings/halves, slab halves, pillar axes, wall torches).
+    /// Returns `(full part name, model)`; see `orientation_parts` for the
+    /// naming rule registries and placement share.
+    pub fn bake_orientation(&self, report: &mut LoadReport) -> Vec<(String, BakedModel)> {
+        let mut out = Vec::new();
+        let mut bases: Vec<_> = self.blockstates.keys().cloned().collect();
+        bases.sort();
+        for base in bases {
+            let master = format!("{}:{base}", self.namespace);
+            for (part, bake_base, state) in exsolis_common::orientation_parts(&master) {
+                let Some(bake_stem) = bake_base.split(':').next_back() else {
+                    continue;
+                };
+                if !self.blockstates.contains_key(bake_stem) {
+                    continue;
+                }
+                let state: HashMap<String, String> = state.into_iter().collect();
+                match self.bake_with_state(bake_stem, &state, report) {
+                    Some(model) if !model.is_empty() => out.push((part, model)),
+                    _ => report.warn(format!("{part}: orientation bake failed")),
+                }
+            }
+        }
+        out
+    }
+
     /// Bake hidden multiblock parts (`<door>_top` with `half=upper`,
     /// `<bed>_head` with `part=head`). Returns `(part_stem, model)` pairs;
     /// callers register them as hidden part ids.

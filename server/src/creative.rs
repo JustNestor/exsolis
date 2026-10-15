@@ -80,6 +80,61 @@ pub(crate) fn send_inventory_sync(
         player_id,
         ServerMessage::InventorySync { slots, selected },
     ));
+    // Server-driven hotbar HUD: tiny non-modal screen, refreshed with
+    // every sync. Render failures only log (the wire sync above already
+    // went out; the HUD is redundant display).
+    send_hud(player_id, inventory, blocks, outgoing);
+}
+
+/// Render `assets/xml/hud.xml` for one player and mount it as the
+/// non-modal `hud` screen.
+fn send_hud(
+    player_id: PlayerId,
+    inventory: &Inventory,
+    blocks: &ServerBlocks,
+    outgoing: &mut MessageWriter<OutgoingPacket>,
+) {
+    use crate::ui_template::DataValue;
+    use std::collections::HashMap;
+    let selected = inventory.selected_index() as usize;
+    let mut cells = Vec::with_capacity(exsolis_common::HOTBAR_SIZE);
+    for (i, slot) in inventory.hotbar().iter().enumerate() {
+        let mut cell = HashMap::new();
+        let is_selected = i == selected;
+        cell.insert(
+            "bg".to_string(),
+            DataValue::Str(if is_selected { "#c8c8c8".into() } else { "#222222cc".into() }),
+        );
+        cell.insert(
+            "border".to_string(),
+            DataValue::Str(if is_selected { "#ffffff".into() } else { "#555555".into() }),
+        );
+        if let Some(s) = slot {
+            if let Some(def) = blocks.0.def(s.item) {
+                let prefix = if def.placeable { "block#" } else { "item#" };
+                cell.insert(
+                    "img".to_string(),
+                    DataValue::Str(format!("{prefix}{}", def.name)),
+                );
+                cell.insert("count".to_string(), DataValue::Int(s.amount as i64));
+            }
+        }
+        cells.push(DataValue::Map(cell));
+    }
+    let mut root = HashMap::new();
+    root.insert("slots".to_string(), DataValue::Array(cells));
+    match crate::ui_template::render_file("hud", &DataValue::Map(root)) {
+        Ok(xml) => {
+            outgoing.write(OutgoingPacket::to(
+                player_id,
+                ServerMessage::UiShow {
+                    id: "hud".to_string(),
+                    xml,
+                },
+            ));
+        }
+        Err(e) => warn!("[hud] render failed for player {player_id}: {e}"),
+    }
 }
 
 /// Sorted block names for `ServerMessage::BlockList`. Snapshot the
@@ -240,11 +295,13 @@ fn apply_inventory_clicks(
                     warn!("[InvClick] Refused creative {name:?}");
                     continue;
                 }
-                let overflow = give_stack(&mut inventory, block);
-                if overflow > 0 {
-                    warn!("[InvClick] {overflow} of {name:?} did not fit — dropped");
+                // Creative grab: full stack to the cursor (MC-like), not
+                // into storage. Whatever was held goes back first.
+                let dropped = inventory.grab(block);
+                if dropped > 0 {
+                    warn!("[InvClick] {dropped} held items did not fit — dropped");
                 }
-                info!("[InvClick] player {:?} creative {name:?}", ev.player_id);
+                info!("[InvClick] player {:?} grabbed {name:?}", ev.player_id);
                 let inv = inventory.clone();
                 send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
             }
