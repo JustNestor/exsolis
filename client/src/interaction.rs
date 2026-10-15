@@ -55,12 +55,14 @@ pub struct ClientInventory {
 }
 
 impl Default for ClientInventory {
+    // Starts empty on purpose: contents are server state (join
+    // InventorySync fills them). A seeded local default would show blocks
+    // the server never gave, including while offline.
     fn default() -> Self {
-        let mut slots = [None; HOTBAR_SIZE];
-        for (index, item) in [2u16, 1, 4, 6, 7].into_iter().enumerate() {
-            slots[index] = Some((item, 64));
+        Self {
+            slots: [None; HOTBAR_SIZE],
+            selected: 0,
         }
-        Self { slots, selected: 0 }
     }
 }
 

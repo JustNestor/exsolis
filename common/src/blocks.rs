@@ -122,6 +122,8 @@ impl BlockRegistry {
     }
 
     fn register(&mut self, name: &str, solid: bool, transparent: bool, block_entity: bool) -> BlockId {
+        // Air-family entries are never placeable and never listed.
+        let air_like = is_air_like_name(name);
         self.register_full(
             name,
             BlockDef {
@@ -129,8 +131,8 @@ impl BlockRegistry {
                 solid,
                 transparent,
                 block_entity,
-                placeable: true,
-                hidden: false,
+                placeable: !air_like,
+                hidden: air_like,
                 multiblock: None,
             },
         )
@@ -171,6 +173,7 @@ impl BlockRegistry {
         transparent: bool,
         block_entity: bool,
     ) -> BlockId {
+        let air_like = is_air_like_name(&name);
         self.register_full(
             &name.clone(),
             BlockDef {
@@ -178,8 +181,8 @@ impl BlockRegistry {
                 solid,
                 transparent,
                 block_entity,
-                placeable: true,
-                hidden: false,
+                placeable: !air_like,
+                hidden: air_like,
                 multiblock: None,
             },
         )
@@ -246,12 +249,12 @@ impl BlockRegistry {
         })
     }
 
-    /// Creative-visible names (parts hidden), sorted.
+    /// Creative-visible names: parts hidden, air-family out, sorted.
     pub fn creative_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .defs
             .iter()
-            .filter(|d| !d.hidden && d.name != "exsolis:air")
+            .filter(|d| !d.hidden && !is_air_like_name(&d.name))
             .map(|d| d.name.clone())
             .collect();
         names.sort();
@@ -319,6 +322,46 @@ impl Default for BlockRegistry {
     fn default() -> Self {
         Self::default_registry()
     }
+}
+
+/// Item model files that are not items: parents, templates, handheld
+/// poses and override states. They get no icon and register nothing.
+/// Shared by the client icon scan and the server item scan (same rule =>
+/// same ids).
+pub fn mc_item_template(stem: &str) -> bool {
+    if matches!(stem, "handheld" | "generated") {
+        return true;
+    }
+    if stem.starts_with("template_") || stem.ends_with("_in_hand") {
+        return true;
+    }
+    if stem.starts_with("clock_") {
+        return true;
+    }
+    matches!(
+        stem,
+        "bow_pulling_0"
+            | "bow_pulling_1"
+            | "bow_pulling_2"
+            | "crossbow_arrow"
+            | "crossbow_fireworks"
+            | "crossbow_standby"
+            | "shield_blocking"
+            | "trident_throwing"
+            | "brush_brushing_0"
+            | "brush_brushing_1"
+            | "brush_brushing_2"
+    )
+}
+
+/// Air-family blocks render nothing; they stay out of creative even when
+/// placeable (barrier/light keep working through commands).
+pub fn is_air_like_name(name: &str) -> bool {
+    let base = name.split(':').next_back().unwrap_or(name);
+    matches!(
+        base,
+        "air" | "cave_air" | "void_air" | "barrier" | "light"
+    )
 }
 
 #[cfg(test)]

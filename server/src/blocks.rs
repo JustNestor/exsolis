@@ -165,6 +165,10 @@ fn scan_item_names(pack_dir: &std::path::Path) -> Vec<String> {
             continue;
         }
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            // Same template rule as the client icon scan => same ids.
+            if exsolis_common::mc_item_template(stem) {
+                continue;
+            }
             names.push(format!("minecraft:{stem}"));
         }
     }

@@ -6,6 +6,7 @@ pub mod inventory;
 
 pub use blocks::{
     AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart,
+    is_air_like_name, mc_item_template,
 };
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 

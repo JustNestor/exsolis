@@ -187,7 +187,7 @@ fn apply_and_broadcast(
     true
 }
 
-fn handle_place_block(
+pub(crate) fn handle_place_block(
     mut events: MessageReader<PlaceBlockRequested>,
     player_map: Res<PlayerMap>,
     positions: Query<&PlayerPosition>,
@@ -508,7 +508,7 @@ fn block_entity_state(pos: exsolis_common::BlockPos) -> EntityState {    EntityS
     }
 }
 
-fn handle_break_block(
+pub(crate) fn handle_break_block(
     mut events: MessageReader<BreakBlockRequested>,
     player_map: Res<PlayerMap>,
     positions: Query<&PlayerPosition>,

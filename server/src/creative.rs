@@ -17,6 +17,7 @@ use crate::Inventory;
 use crate::PlayerMap;
 use crate::blocks::ServerBlocks;
 use crate::net::{self, OutgoingPacket};
+use crate::ui::UiActionRequested;
 
 pub struct CreativePlugin;
 
@@ -27,6 +28,16 @@ impl Plugin for CreativePlugin {
             (handle_creative_give, sync_new_inventories)
                 .chain()
                 .after(crate::events::dispatch_incoming)
+                .in_set(net::GameplaySet),
+        );
+        // Inventory clicks apply here in Rust (mechanics), strictly before
+        // the scripting forwarder renders Lua from the snapshot — one tick,
+        // no drift, no Lua-owned items.
+        app.add_systems(
+            Update,
+            apply_inventory_clicks
+                .after(crate::ui::dispatch_ui_packets)
+                .before(crate::scripting::forward_ui_action)
                 .in_set(net::GameplaySet),
         );
     }
@@ -40,9 +51,9 @@ pub struct CreativeGiveRequested {
     pub name: String,
 }
 
-/// Authoritative hotbar snapshot for one player: exactly HOTBAR_SIZE
-/// `(name, count)` slots plus the selected index. The client renders
-/// exactly this.
+/// Authoritative hotbar snapshot for one player: the first HOTBAR_SIZE
+/// slots as `(name, count)` plus the selected index. The client renders
+/// exactly this (HUD + hotbar row); the full 36 live in Lua snapshots.
 pub(crate) fn send_inventory_sync(
     player_id: PlayerId,
     inventory: &Inventory,
@@ -50,7 +61,7 @@ pub(crate) fn send_inventory_sync(
     outgoing: &mut MessageWriter<OutgoingPacket>,
 ) {
     let slots = inventory
-        .slots()
+        .hotbar()
         .iter()
         .map(|slot| {
             slot.and_then(|s| {
@@ -159,5 +170,85 @@ fn sync_new_inventories(
         };
         debug!("[InventorySync] initial sync for player {player_id}");
         send_inventory_sync(player_id, inventory, &blocks, &mut outgoing);
+    }
+}
+
+/// Parse click data (`"3"`, `"left 12"`, `"right 7"`) into slot + button.
+fn parse_click(data: Option<&str>) -> Option<(usize, bool)> {
+    let data = data?;
+    let mut index = None;
+    let mut right = false;
+    for token in data.split_whitespace() {
+        if token.eq_ignore_ascii_case("right") {
+            right = true;
+        } else if let Ok(i) = token.parse::<usize>() {
+            index = Some(i);
+        }
+    }
+    index.map(|i| (i, right))
+}
+
+/// MC click mechanics, applied server-side: slot clicks mutate the Rust
+/// inventory + cursor held stack, creative cells give. Runs before the
+/// scripting forwarder, so the Lua snapshot already includes the result.
+/// Unknown names/indices are warned and dropped (client is untrusted).
+fn apply_inventory_clicks(
+    mut events: MessageReader<crate::ui::UiActionRequested>,
+    player_map: Res<PlayerMap>,
+    mut inventories: Query<&mut Inventory>,
+    blocks: Res<ServerBlocks>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
+) {
+    for ev in events.read() {
+        if ev.ui_id != "inv" {
+            continue;
+        }
+        let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            continue;
+        };
+        let Ok(mut inventory) = inventories.get_mut(entity) else {
+            warn!("[InvClick] Entity {:?} missing Inventory", entity);
+            continue;
+        };
+        match ev.action.as_str() {
+            "inventory:click" => {
+                let Some((index, right)) = parse_click(ev.data.as_deref()) else {
+                    warn!("[InvClick] Bad click data {:?}", ev.data);
+                    continue;
+                };
+                if index >= exsolis_common::inventory::INVENTORY_SIZE {
+                    warn!("[InvClick] Slot {index} out of range");
+                    continue;
+                }
+                if inventory.click(index, right) {
+                    let inv = inventory.clone();
+                    send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
+                }
+            }
+            "inventory:creative" => {
+                let Some(name) = ev.data.as_deref() else {
+                    continue;
+                };
+                let Some(block) = blocks.id(name) else {
+                    warn!("[InvClick] Unknown creative block {name:?}");
+                    continue;
+                };
+                // Air and hidden parts are not giveable; items are.
+                if blocks.is_air(block)
+                    || blocks.0.def(block).is_some_and(|d| d.hidden)
+                {
+                    warn!("[InvClick] Refused creative {name:?}");
+                    continue;
+                }
+                let overflow = give_stack(&mut inventory, block);
+                if overflow > 0 {
+                    warn!("[InvClick] {overflow} of {name:?} did not fit — dropped");
+                }
+                info!("[InvClick] player {:?} creative {name:?}", ev.player_id);
+                let inv = inventory.clone();
+                send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
+            }
+            _ => {}
+        }
     }
 }

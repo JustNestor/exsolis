@@ -31,8 +31,20 @@ fn sync_hotbar_hud(
     mut ui: ResMut<UiManager>,
     inventory: Res<ClientInventory>,
     blocks: Option<Res<ClientBlocks>>,
+    connected: Option<Res<crate::net::NetConnected>>,
     mut mounted: Local<bool>,
 ) {
+    // No server, no hotbar: the display is purely server state (join sync
+    // fills it). Showing the local default offline is what confused offline
+    // players.
+    let online = connected.as_ref().is_some_and(|c| c.get());
+    if !online {
+        if *mounted {
+            ui.hide(&mut commands, HUD_ID);
+            *mounted = false;
+        }
+        return;
+    }
     if !*mounted || inventory.is_changed() {
         let mut cells = String::with_capacity(2048);
         for i in 0..HOTBAR_SIZE {

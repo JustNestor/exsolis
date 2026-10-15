@@ -248,7 +248,10 @@ impl McPack {
     }
 
     /// Item icons: `models/item/<name>.json` -> layer0 texture key
-    /// (`minecraft/item/stick`). Parents are irrelevant for flat icons.
+    /// (`minecraft/item/stick`). `layer0` resolves through the parent chain
+    /// (up to 4 levels), then falls back to `textures/item/<stem>.png` /
+    /// `textures/block/<stem>.png`. Templates (`mc_item_template`) resolve
+    /// to nothing.
     pub fn item_icons(&self) -> HashMap<String, String> {
         let mut out = HashMap::new();
         let dir = self.root.join("assets").join(&self.namespace).join("models").join("item");
@@ -263,34 +266,63 @@ impl McPack {
             let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
+            if exsolis_common::mc_item_template(stem) {
+                continue;
+            }
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
             let Ok(json) = serde_json::from_str::<Value>(&text) else {
                 continue;
             };
-            // Textures may live on the item itself or be inherited; only
-            // layer0 matters, resolved one `#ref` level.
-            let mut layer = json
-                .get("textures")
-                .and_then(|t| t.get("layer0"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if let Some(l) = layer.as_ref().filter(|s| s.starts_with('#')) {
-                layer = json
-                    .get("textures")
-                    .and_then(|t| t.get(l.trim_start_matches('#')))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            }
-            if let Some(l) = layer {
+            if let Some(layer) = self.resolve_layer0(&json, &dir, 0) {
                 out.insert(
                     format!("{}:{stem}", self.namespace),
-                    normalize_texture_key(&l, &self.namespace),
+                    normalize_texture_key(&layer, &self.namespace),
                 );
+            } else if let Some(key) = self.fallback_icon(stem) {
+                out.insert(format!("{}:{stem}", self.namespace), key);
             }
         }
         out
+    }
+
+    fn resolve_layer0(&self, json: &Value, dir: &Path, depth: u8) -> Option<String> {
+        if depth > 4 {
+            return None;
+        }
+        let textures = json.get("textures")?;
+        if let Some(layer) = textures.get("layer0").and_then(|v| v.as_str()) {
+            if layer.starts_with('#') {
+                return textures
+                    .get(layer.trim_start_matches('#'))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            return Some(layer.to_string());
+        }
+        // Inherit from the parent model file.
+        let parent = json.get("parent").and_then(|v| v.as_str())?;
+        let rel = parent.split(':').next_back().unwrap_or(parent);
+        let file = rel.split('/').next_back().unwrap_or(rel);
+        let text = std::fs::read_to_string(dir.join(format!("{file}.json"))).ok()?;
+        let parent_json = serde_json::from_str::<Value>(&text).ok()?;
+        self.resolve_layer0(&parent_json, dir, depth + 1)
+    }
+
+    /// Direct texture-file fallback for items whose JSON names no layer0.
+    fn fallback_icon(&self, stem: &str) -> Option<String> {
+        let tex_base = self
+            .root
+            .join("assets")
+            .join(&self.namespace)
+            .join("textures");
+        for folder in ["item", "block"] {
+            if tex_base.join(folder).join(format!("{stem}.png")).is_file() {
+                return Some(format!("{}/{folder}/{stem}", self.namespace));
+            }
+        }
+        None
     }
 
     pub fn anim(&self, key: &str) -> Option<&AnimInfo> {
@@ -807,13 +839,16 @@ fn short_model_name(model: &str, namespace: &str) -> Option<String> {
 }
 
 fn normalize_texture_key(raw: &str, namespace: &str) -> String {
-    if raw.contains(':') {
-        // Already `ns:path` — the path includes `block/...`, so join as-is.
-        let (ns, path) = raw.split_once(':').unwrap();
+    // Already `ns:path` — join as-is (`block/stone`, `item/stick`).
+    if let Some((ns, path)) = raw.split_once(':') {
         return format!("{ns}/{path}");
     }
-    let path = raw.strip_prefix("block/").unwrap_or(raw);
-    format!("{namespace}/block/{path}")
+    // Has a folder (`item/bow`, `block/stone`) — keep it.
+    if raw.contains('/') {
+        return format!("{namespace}/{raw}");
+    }
+    // Bare names default to block textures.
+    format!("{namespace}/block/{raw}")
 }
 
 fn face_normal(face: &str) -> Option<[f32; 3]> {
