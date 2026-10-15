@@ -50,6 +50,16 @@
       </div>
     </div>
 
+    <label font-size="14" color="#404040">Creative (scroll)</label>
+    <div layout="column" gap="2" padding="4" bg="#8b8b8b"
+         border="2" border-color="#373737" overflow="scroll" height="320">
+      <div v-for="r in creative" layout="row" gap="2">
+        <div v-for="c in r.cells" on-click="inventory:creative"
+             data="{{c.name}}" width="44" height="44">
+          <img src="{{c.img}}" alt="?" width="40" height="40"/>
+        </div>
+      </div>
+    </div>
   </div>
   <cursor v-if="held_item" width="40" height="40" layout="column"
           bg="{{held_item.color}}" border="2" border-color="#ffffff"

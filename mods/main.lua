@@ -45,18 +45,8 @@ local function inv_data(player_id)
             selected_bg = selected == i and "#b5b5b5" or "#777777",
         }
     end
-    return {
-        title = "Inventory",
-        slots = slots,
-        slots2 = slots2,
-        selected = selected,
-        held_item = item_view(inv.held),
-    }
-end
-
--- Static creative grid: built once per session (registry barely changes),
--- NOT on every click. Rows of 9 inside a scrollable column.
-local function creative_data()
+    -- Creative grid, rows of 9 inside one scrollable column (flex
+    -- grids do not report overflow, so the wheel had nowhere to go).
     local creative = {}
     for _, name in ipairs(api.blocks()) do
         local last = creative[#creative]
@@ -68,17 +58,17 @@ local function creative_data()
         if not api.is_placeable(name) then prefix = "item#" end
         last.cells[#last.cells + 1] = { name = name, img = prefix .. name }
     end
-    return { title = "Creative", creative = creative }
+    return {
+        title = "Inventory",
+        slots = slots,
+        slots2 = slots2,
+        selected = selected,
+        held_item = item_view(inv.held),
+        creative = creative,
+    }
 end
 
-CreativeSent = CreativeSent or {}
-
 local function show_inv(player_id)
-    if not CreativeSent[player_id] then
-        local cxml = api.render_xml("creative", creative_data())
-        api.send(player_id, "ui_show", "creative", cxml)
-        CreativeSent[player_id] = true
-    end
     local xml = api.render_xml("inventory", inv_data(player_id))
     api.send(player_id, "ui_show", "inv", xml)
     IsInvOpen[player_id] = true
@@ -86,7 +76,6 @@ end
 
 local function hide_inv(player_id)
     api.send(player_id, "ui_hide", "inv")
-    api.send(player_id, "ui_hide", "creative")
     IsInvOpen[player_id] = false
 end
 
@@ -118,7 +107,6 @@ end)
 
 api.on("player_leave", function(ev)
     IsInvOpen[ev.player_id] = nil
-    CreativeSent[ev.player_id] = nil
 end)
 
 
