@@ -1,0 +1,24 @@
+<div id="creative" modal="true" layout="column" anchor="right"
+     bg="#0008" padding="12" gap="8">
+  <div layout="column" bg="#c6c6c6" border="3" border-color="#373737"
+       padding="8" gap="8">
+    <div layout="row" align="center" justify="between" width="100%">
+      <label font-size="20" color="#404040">{{title}}</label>
+      <button id="close" on-click="inventory:close" bg="#777777"
+              hover-bg="#999999" pressed-bg="#555555" border="2"
+              border-color="#303030" padding="2 8" radius="0">
+        <label font-size="16" color="#ffffff">X</label>
+      </button>
+    </div>
+
+    <div layout="column" gap="2" padding="4" bg="#8b8b8b"
+         border="2" border-color="#373737" overflow="scroll" height="420">
+      <div v-for="r in creative" layout="row" gap="2">
+        <div v-for="c in r.cells" on-click="inventory:creative"
+             data="{{c.name}}" width="44" height="44">
+          <img src="{{c.img}}" alt="?" width="40" height="40"/>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
