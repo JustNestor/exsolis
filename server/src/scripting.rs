@@ -684,20 +684,23 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
     // --- api.set_block(x, y, z, name) : queue a world edit ---------
     {
         let outbox = outbox.clone();
-        // Resolved against the frozen M0 registry at install time; the
-        // drain step re-validates the id against the live registry.
-        let registry = exsolis_common::BlockRegistry::default_registry();
+        // Resolved against the live `__block_ids` global (NOT the frozen
+        // registry: keybind/ui handlers run outside the tick scope and the
+        // registry holds 1200+ names). The drain re-validates the id.
         api.set(
             "set_block",
-            lua.create_function(move |_, (x, y, z, name): (i32, i32, i32, String)| {
-                let Some(block) = registry.id(&name) else {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "set_block: unknown block '{name}'"
-                    )));
-                };
+            lua.create_function(move |lua, (x, y, z, name): (i32, i32, i32, String)| {
+                let block: i32 = lua
+                    .globals()
+                    .get::<Table>("__block_ids")
+                    .ok()
+                    .and_then(|map| map.get(name.clone()).ok())
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!("set_block: unknown block '{name}'"))
+                    })?;
                 outbox.borrow_mut().push(ScriptRequest::SetBlock {
                     pos: BlockPos::new(x, y, z),
-                    block,
+                    block: block as u16,
                 });
                 Ok(())
             })?,
@@ -707,23 +710,27 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
     // --- api.give_block(player_id, name, count?) : queue a creative give --
     {
         let outbox = outbox.clone();
-        // Same frozen-registry caveat as `set_block` above.
-        let registry = exsolis_common::BlockRegistry::default_registry();
+        // Same live-global resolution as `set_block` above.
         api.set(
             "give_block",
             lua.create_function(
-                move |_, (player_id, name, count): (Value, String, Option<i64>)| {
+                move |lua, (player_id, name, count): (Value, String, Option<i64>)| {
                     let player_id =
                         pop_player_id(&mut std::iter::once(player_id))?;
-                    let Some(block) = registry.id(&name) else {
-                        return Err(mlua::Error::RuntimeError(format!(
-                            "give_block: unknown block '{name}'"
-                        )));
-                    };
+                    let block: i32 = lua
+                        .globals()
+                        .get::<Table>("__block_ids")
+                        .ok()
+                        .and_then(|map| map.get(name.clone()).ok())
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "give_block: unknown block '{name}'"
+                            ))
+                        })?;
                     let amount = count.unwrap_or(64).clamp(1, 64 * 9) as u16;
                     outbox.borrow_mut().push(ScriptRequest::GiveBlock {
                         player_id,
-                        block,
+                        block: block as u16,
                         amount,
                     });
                     Ok(())

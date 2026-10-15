@@ -75,12 +75,18 @@ local function inv_data(player_id)
     end
     -- Creative grid: every registered block, wheel-scrollable, no paging
     -- buttons. Click gives a full stack (Rust authority + Lua mirror).
-    -- Items render flat, blocks isometric.
+    -- Items render flat, blocks isometric. Chunked into rows of 9: flex
+    -- columns scroll reliably, grids do not report overflow correctly.
     local creative = {}
     for _, name in ipairs(api.blocks()) do
+        local last = creative[#creative]
+        if not last or #last.cells >= 9 then
+            last = { cells = {} }
+            creative[#creative + 1] = last
+        end
         local prefix = "block#"
         if not api.is_placeable(name) then prefix = "item#" end
-        creative[#creative + 1] = { name = name, img = prefix .. name }
+        last.cells[#last.cells + 1] = { name = name, img = prefix .. name }
     end
     return {
         title = "Inventory",

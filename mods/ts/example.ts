@@ -39,9 +39,8 @@ export function on_place_block(
   z: i32,
   block: i32,
 ): void {
-  // Reflect the placement one block higher, so the world visibly changes.
-  if (get_block(x, y + 1, z) == 0) {
-    set_block(x, y + 1, z, stone());
-  }
+  // Demo note: this used to mirror the placement one block higher to show
+  // the world changing. That demo now lives in git history — placement must
+  // not surprise the player with extra blocks.
   log(y as f64);
 }
