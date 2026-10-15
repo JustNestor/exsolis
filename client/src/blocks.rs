@@ -95,6 +95,36 @@ impl Plugin for BlocksPlugin {
             }
             bevy_log::info!("ClientBlocks: +{added} thaumcraft props from {}", tc.display());
         }
+        // Generic multiblock parts + layouts (doors, beds) and items.
+        // Same generation rule as the server => same ids.
+        let known: Vec<String> = registry.iter().map(|(_, d)| d.name.clone()).collect();
+        let mut parts = 0;
+        for (master, part, offset) in crate::loader::multiblock_parts(&known) {
+            let flags = registry
+                .def(registry.id(&master).unwrap_or(0))
+                .map(|d| (d.solid, d.transparent))
+                .unwrap_or((true, false));
+            registry.register_part(part.clone(), flags.0, flags.1);
+            registry.set_multiblock(
+                &master,
+                exsolis_common::MultiblockLayout {
+                    parts: vec![exsolis_common::MultiblockPart { offset, part }],
+                },
+            );
+            parts += 1;
+        }
+        let mut items = 0;
+        if let Some(dir) = crate::loader::mc_pack_dir() {
+            for name in crate::loader::scan_item_names(&dir) {
+                if registry.id(&name).is_none() {
+                    registry.register_item(name);
+                    items += 1;
+                }
+            }
+        }
+        if parts + items > 0 {
+            bevy_log::info!("ClientBlocks: +{parts} multiblock parts, +{items} items");
+        }
         app.insert_resource(ClientBlocks(registry));
     }
 }

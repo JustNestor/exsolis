@@ -83,6 +83,49 @@ pub fn scan_tc_block_names(pack_dir: &std::path::Path) -> Vec<String> {
     names.sort();
     names
 }
+
+/// Item names from `<pack>/assets/minecraft/models/item/*.json`, sorted.
+/// Unknown ones register as items (unified id space, unplaceable).
+pub fn scan_item_names(pack_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let dir = pack_dir
+        .join("assets")
+        .join("minecraft")
+        .join("models")
+        .join("item");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(format!("minecraft:{stem}"));
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Generic multiblock masters present in `names`: doors (upper half above)
+/// and beds (head north of foot). Returns `(master, part, north-offset)`.
+/// MUST stay in sync with `McPack::bake_parts` part stems.
+pub fn multiblock_parts(names: &[String]) -> Vec<(String, String, [i32; 3])> {
+    let mut out = Vec::new();
+    for name in names {
+        let Some(base) = name.strip_prefix("minecraft:") else {
+            continue;
+        };
+        if base.ends_with("_door") {
+            out.push((name.clone(), format!("{name}_top"), [0, 1, 0]));
+        } else if base.ends_with("_bed") {
+            out.push((name.clone(), format!("{name}_head"), [0, 0, -1]));
+        }
+    }
+    out
+}
 #[derive(Resource, Clone, Default)]
 pub struct McAssets {
     pub baked: Arc<HashMap<String, BakedModel>>,
@@ -99,6 +142,9 @@ pub struct McAssets {
     /// Embedded bbmodel textures (`thaumcraft/<model>/<tex>` -> pixels),
     /// uploaded by `setup_textures` and served to `block#` previews.
     pub embedded: Arc<HashMap<String, (u32, u32, Vec<u8>)>>,
+    /// Item icons (`minecraft:stick` -> `minecraft/item/stick` texture key).
+    /// Served to `item#` previews as flat blits.
+    pub item_icons: Arc<HashMap<String, String>>,
 }
 
 /// Plains biome tint (MC grass colormap): #91BD59.
@@ -188,7 +234,22 @@ impl Plugin for McAssetsPlugin {
             Some(dir) => {
                 match McPack::load(&dir, "minecraft") {
                     Ok(pack) => {
-                        let (models, report) = pack.bake_all();
+                        let (models, mut report) = pack.bake_all();
+                        // `bake_all` keys are bare stems; the mesher looks up
+                        // full `namespace:name` ids.
+                        let mut baked: HashMap<String, BakedModel> = models
+                            .into_iter()
+                            .map(|(k, v)| (format!("minecraft:{k}"), v))
+                            .collect();
+                        // Hidden multiblock parts (door tops, bed heads).
+                        let mut part_count = 0;
+                        for (stem, model) in pack.bake_parts(&mut report) {
+                            baked.insert(format!("minecraft:{stem}"), model);
+                            part_count += 1;
+                        }
+                        if part_count > 0 {
+                            bevy_log::info!("McPack: +{part_count} multiblock parts");
+                        }
                         bevy_log::info!(
                             "McPack: baked {}/{} blocks ({} stubs, {} animated; opaque={} cutout={} translucent={}) from {}",
                             report.blocks_baked,
@@ -224,7 +285,7 @@ impl Plugin for McAssetsPlugin {
                             "exsolis:chest",
                         ] {
                             let mc = legacy_mc_name(legacy).unwrap();
-                            if !assets.baked.contains_key(mc) {
+                            if !baked.contains_key(mc) {
                                 bevy_log::warn!(
                                     "McPack: legacy {legacy} has no baked {mc}"
                                 );
@@ -234,7 +295,7 @@ impl Plugin for McAssetsPlugin {
                         assets.anims = pack.anim_textures().cloned().collect();
                         // Tinted texture set: any key behind a tintindex quad.
                         let mut tinted = HashSet::new();
-                        for model in models.values() {
+                        for model in baked.values() {
                             for q in &model.quads {
                                 if q.tinted {
                                     tinted.insert(q.texture.clone());
@@ -263,8 +324,9 @@ impl Plugin for McAssetsPlugin {
                                 match load_bbmodel(&path) {
                                     Ok((mut model, report)) => {
                                         let key = format!("thaumcraft:{stem}");
-                                        let baked = std::mem::take(&mut model.baked);
-                                        let baked = retarget_bb_textures(baked, &stem);
+                                        let baked_model = std::mem::take(&mut model.baked);
+                                        let baked_model =
+                                            retarget_bb_textures(baked_model, &stem);
                                         for img in &model.textures {
                                             let tkey =
                                                 format!("thaumcraft/{stem}/{}", img.name);
@@ -275,9 +337,7 @@ impl Plugin for McAssetsPlugin {
                                                     (img.width, img.height, img.rgba.clone()),
                                                 );
                                         }
-                                        Arc::get_mut(&mut assets.baked)
-                                            .expect("sole owner at startup")
-                                            .insert(key, baked);
+                                        baked.insert(key, baked_model);
                                         count += 1;
                                         bevy_log::info!(
                                             "TcPack: {stem}: {} quads, {} tris, {} embedded tex, {} anims",
@@ -299,15 +359,15 @@ impl Plugin for McAssetsPlugin {
                                 bevy_log::info!("TcPack: {count} prop models from {}", tc.display());
                             }
                         }
-                        // `bake_all` keys are bare stems; the mesher looks up
-                        // full `namespace:name` ids.
-                        assets.baked = Arc::new(
-                            models
-                                .into_iter()
-                                .map(|(k, v)| (format!("minecraft:{k}"), v))
-                                .collect(),
-                        );
-                        assets.pack_dir = Some(dir);
+                        assets.baked = Arc::new(baked);
+                        assets.pack_dir = Some(dir.clone());
+                        assets.item_icons = Arc::new(pack.item_icons());
+                        if !assets.item_icons.is_empty() {
+                            bevy_log::info!(
+                                "McPack: {} item icons",
+                                assets.item_icons.len()
+                            );
+                        }
                     }
                     Err(e) => {
                         bevy_log::warn!("McPack: load failed ({e}); vanilla cubes only");

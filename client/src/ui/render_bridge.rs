@@ -426,6 +426,44 @@ fn sync_ui_images(
             continue;
         }
 
+        // `item#` icons never touch disk either: flat layer0 blits.
+        if let Some(name) = src.strip_prefix("item#") {
+            let Some(m) = mc.as_ref() else {
+                bevy_log::warn!("ui img `{src}`: no MC pack for item icon");
+                registry.failed.insert(src.clone());
+                continue;
+            };
+            let Some(pack_dir) = m.pack_dir.as_ref() else {
+                bevy_log::warn!("ui img `{src}`: no MC pack for item icon");
+                registry.failed.insert(src.clone());
+                continue;
+            };
+            let decoded = match img_assets::decode_item(name, pack_dir, &m.item_icons) {
+                Ok(d) => d,
+                Err(e) => {
+                    bevy_log::warn!("ui img `{src}`: {e}");
+                    registry.failed.insert(src.clone());
+                    continue;
+                }
+            };
+            match upload_pixels(&vk, decoded.width, decoded.height, format, &decoded.rgba) {
+                Some(bindless_id) => {
+                    registry.entries.insert(
+                        src.clone(),
+                        UiImageEntry {
+                            bindless_id,
+                            tex_id: sampled_image_index(bindless_id),
+                        },
+                    );
+                }
+                None => {
+                    bevy_log::warn!("ui img `{src}`: GPU upload failed");
+                    registry.failed.insert(src.clone());
+                }
+            }
+            continue;
+        }
+
         let decoded = match img_assets::decode(src) {
             Ok(d) => d,
             Err(e) => {

@@ -72,11 +72,10 @@ pub(crate) fn send_inventory_sync(
 }
 
 /// Sorted block names for `ServerMessage::BlockList`. Snapshot the
-/// registry so the join path owns a plain `Vec<String>`.
+/// registry so the join path owns a plain `Vec<String>`. Hidden
+/// multiblock parts stay out (placed through their master).
 pub(crate) fn sorted_block_names(blocks: &ServerBlocks) -> Vec<String> {
-    let mut names: Vec<String> = blocks.0.iter().map(|(_, def)| def.name.clone()).collect();
-    names.sort();
-    names
+    blocks.0.creative_names()
 }
 
 /// Add one stack (`MAX_STACK`) of `block` to `inventory`, returning

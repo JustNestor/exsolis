@@ -247,6 +247,52 @@ impl McPack {
         self.texture_files.get(key).map(|p| p.as_path())
     }
 
+    /// Item icons: `models/item/<name>.json` -> layer0 texture key
+    /// (`minecraft/item/stick`). Parents are irrelevant for flat icons.
+    pub fn item_icons(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        let dir = self.root.join("assets").join(&self.namespace).join("models").join("item");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return out;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let Ok(json) = serde_json::from_str::<Value>(&text) else {
+                continue;
+            };
+            // Textures may live on the item itself or be inherited; only
+            // layer0 matters, resolved one `#ref` level.
+            let mut layer = json
+                .get("textures")
+                .and_then(|t| t.get("layer0"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            if let Some(l) = layer.as_ref().filter(|s| s.starts_with('#')) {
+                layer = json
+                    .get("textures")
+                    .and_then(|t| t.get(l.trim_start_matches('#')))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            if let Some(l) = layer {
+                out.insert(
+                    format!("{}:{stem}", self.namespace),
+                    normalize_texture_key(&l, &self.namespace),
+                );
+            }
+        }
+        out
+    }
+
     pub fn anim(&self, key: &str) -> Option<&AnimInfo> {
         self.mcmeta.get(key)
     }
@@ -283,6 +329,80 @@ impl McPack {
             }
         }
         (out, report)
+    }
+
+    /// Bake hidden multiblock parts (`<door>_top` with `half=upper`,
+    /// `<bed>_head` with `part=head`). Returns `(part_stem, model)` pairs;
+    /// callers register them as hidden part ids.
+    pub fn bake_parts(&self, report: &mut LoadReport) -> Vec<(String, BakedModel)> {
+        let mut out = Vec::new();
+        let mut bases: Vec<_> = self.blockstates.keys().cloned().collect();
+        bases.sort();
+        for base in bases {
+            let part = if base.ends_with("_door") {
+                Some((format!("{base}_top"), vec![("half".to_string(), "upper".to_string())]))
+            } else if base.ends_with("_bed") {
+                Some((
+                    format!("{base}_head"),
+                    vec![("part".to_string(), "head".to_string())],
+                ))
+            } else {
+                None
+            };
+            let Some((stem, state)) = part else {
+                continue;
+            };
+            let state: HashMap<String, String> = state.into_iter().collect();
+            match self.bake_with_state(&base, &state, report) {
+                Some(model) if !model.is_empty() => out.push((stem, model)),
+                _ => report.warn(format!("{stem}: part bake failed")),
+            }
+        }
+        out
+    }
+
+    /// Bake `block` in an explicit state: the variant whose conditions all
+    /// hold (most conditions wins, ties broken alphabetically) is used.
+    /// Falls back to the default when nothing matches.
+    pub fn bake_with_state(
+        &self,
+        block: &str,
+        state: &HashMap<String, String>,
+        report: &mut LoadReport,
+    ) -> Option<BakedModel> {
+        let bs = self.blockstates.get(block)?;
+        if let Some(variants) = bs.get("variants").and_then(|v| v.as_object()) {
+            // Empty state keeps the legacy default ("" key, else first).
+            if state.is_empty() {
+                let entry = variants.get("").or_else(|| variants.values().next())?;
+                let model_ref = pick_model_ref(entry)?;
+                return self
+                    .bake_model_ref(block, &model_ref, report)
+                    .or_else(|| Some(self.stub_cube(block)));
+            }
+            // Partial state: keep variants consistent with it (every stated
+            // pair present), most conditions wins, ties alphabetical.
+            let mut best: Option<(&String, &Value, usize)> = None;
+            for (key, entry) in variants {
+                let conds = parse_variant_key(key);
+                if state
+                    .iter()
+                    .all(|(k, v)| conds.iter().any(|(ck, cv)| ck == k && cv == v))
+                {
+                    let score = conds.len();
+                    if best.is_none_or(|(_, _, s)| score > s) {
+                        best = Some((key, entry, score));
+                    }
+                }
+            }
+            if let Some((_, entry, _)) = best {
+                let model_ref = pick_model_ref(entry)?;
+                return self
+                    .bake_model_ref(block, &model_ref, report)
+                    .or_else(|| Some(self.stub_cube(block)));
+            }
+        }
+        self.bake_default(block, report)
     }
 
     fn bake_default(&self, block: &str, report: &mut LoadReport) -> Option<BakedModel> {
@@ -553,7 +673,8 @@ impl BlockPack for McPack {
         block: &str,
         _state: &HashMap<String, String>,
     ) -> Option<BakedModel> {
-        // M1: chunk storage is id-only, so every state bakes the default.
+        // Chunk storage is id-only, so the mesher only ever asks for the
+        // default; explicit states are used for multiblock part pre-bakes.
         let mut report = LoadReport::default();
         self.bake_default(block, &mut report)
     }
@@ -573,6 +694,20 @@ fn pick_model_ref(entry: &Value) -> Option<ModelRef> {
     } else {
         parse_model_ref(entry)
     }
+}
+
+/// Split a variant key (`"facing=east,half=lower"`) into conditions.
+/// The empty key (default variant) yields no conditions.
+fn parse_variant_key(key: &str) -> Vec<(String, String)> {
+    if key.is_empty() {
+        return Vec::new();
+    }
+    key.split(',')
+        .filter_map(|pair| {
+            let (k, v) = pair.split_once('=')?;
+            Some((k.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 fn parse_model_ref(v: &Value) -> Option<ModelRef> {
@@ -892,6 +1027,65 @@ mod tests {
         assert!(!stairs.quads.is_empty());
         let fence = pack.bake("oak_fence", &HashMap::new()).expect("fence bakes");
         assert!(!fence.quads.is_empty());
+    }
+
+    #[test]
+    fn door_halves_bake_distinctly() {
+        let root = pack_root();
+        if !root.exists() {
+            eprintln!("SKIPPED: temp/minecraft absent");
+            return;
+        }
+        let pack = McPack::load(&root, "minecraft").expect("pack loads");
+        let mut report = LoadReport::default();
+        let bottom = pack
+            .bake_with_state(
+                "oak_door",
+                &HashMap::from([("half".to_string(), "lower".to_string())]),
+                &mut report,
+            )
+            .expect("door bottom bakes");
+        let top = pack
+            .bake_with_state(
+                "oak_door",
+                &HashMap::from([("half".to_string(), "upper".to_string())]),
+                &mut report,
+            )
+            .expect("door top bakes");
+        assert!(!bottom.quads.is_empty() && !top.quads.is_empty());
+        // State selection works: the halves resolve to different models
+        // (bottom vs top textures), not the same default.
+        let texs = |m: &BakedModel| {
+            m.quads.iter().map(|q| q.texture.clone()).collect::<Vec<_>>()
+        };
+        let (bt, tt) = (texs(&bottom), texs(&top));
+        assert!(
+            bt.iter().any(|t| t.contains("bottom")),
+            "bottom bake missing bottom texture: {bt:?}"
+        );
+        assert!(
+            tt.iter().any(|t| t.contains("top")),
+            "top state fell back to default: {tt:?}"
+        );
+    }
+
+    #[test]
+    fn multiblock_parts_bake() {
+        let root = pack_root();
+        if !root.exists() {
+            eprintln!("SKIPPED: temp/minecraft absent");
+            return;
+        }
+        let pack = McPack::load(&root, "minecraft").expect("pack loads");
+        let mut report = LoadReport::default();
+        let parts = pack.bake_parts(&mut report);
+        // 21 doors + 16 beds in this pack version.
+        assert!(
+            parts.len() >= 37,
+            "expected 37+ parts, got {}",
+            parts.len()
+        );
+        assert!(parts.iter().all(|(_, m)| !m.is_empty()));
     }
 
     #[test]

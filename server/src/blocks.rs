@@ -77,6 +77,36 @@ impl Plugin for BlocksPlugin {
             }
             bevy_log::info!("ServerBlocks: +{added} thaumcraft props from {}", tc.display());
         }
+        // Generic multiblock parts + layouts and items. Same generation
+        // rule and same order as the client => same ids.
+        let known: Vec<String> = registry.iter().map(|(_, d)| d.name.clone()).collect();
+        let mut parts = 0;
+        for (master, part, offset) in multiblock_parts(&known) {
+            let flags = registry
+                .def(registry.id(&master).unwrap_or(0))
+                .map(|d| (d.solid, d.transparent))
+                .unwrap_or((true, false));
+            registry.register_part(part.clone(), flags.0, flags.1);
+            registry.set_multiblock(
+                &master,
+                exsolis_common::MultiblockLayout {
+                    parts: vec![exsolis_common::MultiblockPart { offset, part }],
+                },
+            );
+            parts += 1;
+        }
+        let mut items = 0;
+        if let Some(dir) = mc_pack_dir() {
+            for name in scan_item_names(&dir) {
+                if registry.id(&name).is_none() {
+                    registry.register_item(name);
+                    items += 1;
+                }
+            }
+        }
+        if parts + items > 0 {
+            bevy_log::info!("ServerBlocks: +{parts} multiblock parts, +{items} items");
+        }
         app.insert_resource(ServerBlocks(registry));
     }
 }
@@ -117,6 +147,44 @@ fn scan_tc_block_names(pack_dir: &std::path::Path) -> Vec<String> {
     }
     names.sort();
     names
+}
+
+fn scan_item_names(pack_dir: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    let dir = pack_dir
+        .join("assets")
+        .join("minecraft")
+        .join("models")
+        .join("item");
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return names;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+            names.push(format!("minecraft:{stem}"));
+        }
+    }
+    names.sort();
+    names
+}
+
+fn multiblock_parts(names: &[String]) -> Vec<(String, String, [i32; 3])> {
+    let mut out = Vec::new();
+    for name in names {
+        let Some(base) = name.strip_prefix("minecraft:") else {
+            continue;
+        };
+        if base.ends_with("_door") {
+            out.push((name.clone(), format!("{name}_top"), [0, 1, 0]));
+        } else if base.ends_with("_bed") {
+            out.push((name.clone(), format!("{name}_head"), [0, 0, -1]));
+        }
+    }
+    out
 }
 
 fn scan_mc_block_names(pack_dir: &std::path::Path) -> Vec<String> {

@@ -29,9 +29,11 @@ pub fn path_for(src: &str) -> PathBuf {
 }
 
 /// Header-only read: cheap enough to call while spawning a screen.
-/// `block#` previews are a fixed 48x48 and never touch disk.
+/// `block#` / `item#` previews are a fixed 48x48 and never touch disk.
 pub fn probe_size(src: &str) -> Option<(u32, u32)> {
-    if crate::ui::parse::is_block_preview_src(src) {
+    if crate::ui::parse::is_block_preview_src(src)
+        || crate::ui::parse::is_item_preview_src(src)
+    {
         return Some((
             crate::ui::block_preview::PREVIEW_SIZE,
             crate::ui::block_preview::PREVIEW_SIZE,
@@ -64,4 +66,13 @@ pub fn decode_block(
     embedded: &HashMap<String, (u32, u32, Vec<u8>)>,
 ) -> Result<DecodedImage, String> {
     super::block_preview::decode_block(name, baked, pack_dir, embedded)
+}
+
+/// Flat item icon for `item#namespace:name`.
+pub fn decode_item(
+    name: &str,
+    pack_dir: &Path,
+    item_icons: &HashMap<String, String>,
+) -> Result<DecodedImage, String> {
+    super::block_preview::decode_item(name, pack_dir, item_icons)
 }

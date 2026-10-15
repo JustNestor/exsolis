@@ -495,6 +495,18 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         })?,
     )?;
 
+    // --- api.is_placeable(name) : false for items and parts ------------
+    api.set(
+        "is_placeable",
+        lua.create_function(|lua, name: String| {
+            let globals = lua.globals();
+            let Ok(set) = globals.get::<Table>("__block_unplaceable") else {
+                return Ok(true);
+            };
+            Ok(!set.contains_key(name).unwrap_or(false))
+        })?,
+    )?;
+
     // --- api.send(player_id, kind, ...) : queue a message to one player
     {
         let outbox = outbox.clone();
@@ -1702,8 +1714,15 @@ fn publish_blocks_to_lua(
     *last_len = blocks.0.len();
     let result = (|| -> mlua::Result<()> {
         let lua = &runtime.lua;
-        let mut names: Vec<&str> =
-            blocks.0.iter().map(|(_, d)| d.name.as_str()).collect();
+        // Creative-visible only: hidden multiblock parts stay out (placed
+        // through their master). `__block_ids` keeps every id (Lua mirrors
+        // parts too when they break).
+        let mut names: Vec<&str> = blocks
+            .0
+            .iter()
+            .filter(|(_, d)| !d.hidden)
+            .map(|(_, d)| d.name.as_str())
+            .collect();
         names.sort();
         let list = lua.create_table()?;
         let ids = lua.create_table()?;
@@ -1715,6 +1734,15 @@ fn publish_blocks_to_lua(
         }
         lua.globals().set("__block_list", list)?;
         lua.globals().set("__block_ids", ids)?;
+        // Unplaceable set (items + parts) for icon selection (`item#`).
+        let unplaceable = lua.create_table()?;
+        for (id, def) in blocks.0.iter() {
+            if !def.placeable {
+                unplaceable.set(def.name.clone(), true)?;
+                let _ = id;
+            }
+        }
+        lua.globals().set("__block_unplaceable", unplaceable)?;
         Ok(())
     })();
     match result {

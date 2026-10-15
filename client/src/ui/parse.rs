@@ -306,7 +306,17 @@ fn convert(
 /// at 160. These sources never touch disk — `probe_size` reports 48x48 and
 /// `render_bridge` uploads the rasterized pixels like any other `<img>`.
 pub fn is_block_preview_src(src: &str) -> bool {
-    let Some(name) = src.strip_prefix("block#") else {
+    is_synthetic_img_src(src, "block#")
+}
+
+/// `item#namespace:name` renders a flat 48x48 item icon (layer0 texture).
+/// Same charset rules as `block#`.
+pub fn is_item_preview_src(src: &str) -> bool {
+    is_synthetic_img_src(src, "item#")
+}
+
+fn is_synthetic_img_src(src: &str, prefix: &str) -> bool {
+    let Some(name) = src.strip_prefix(prefix) else {
         return false;
     };
     if name.is_empty() || name.len() > 160 {
@@ -326,7 +336,7 @@ pub fn is_block_preview_src(src: &str) -> bool {
 }
 
 pub fn is_valid_img_src(src: &str) -> bool {
-    if is_block_preview_src(src) {
+    if is_block_preview_src(src) || is_item_preview_src(src) {
         return true;
     }
     if src.is_empty() || src.len() > 128 {

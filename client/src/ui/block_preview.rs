@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use bevy_log::debug;
+use image::GenericImageView;
 
 use crate::loader::McAssets;
 use crate::loader::baked::{BakedModel, BakedQuad, BakedTri};
@@ -57,7 +58,42 @@ pub fn texture_path_for(pack_dir: &Path, key: &str) -> Option<PathBuf> {
     None
 }
 
-/// Rasterize `name`'s baked model to a 48x48 RGBA preview.
+/// Flat item icon for `<img src="item#namespace:name">`: the `layer0`
+/// texture blitted 1:1 (nearest) into 48x48, no isometric projection.
+pub fn decode_item(
+    name: &str,
+    pack_dir: &Path,
+    item_icons: &HashMap<String, String>,
+) -> Result<DecodedImage, String> {
+    let tex_key = item_icons
+        .get(name)
+        .ok_or_else(|| format!("no item icon for `{name}`"))?;
+    let path = texture_path_for(pack_dir, tex_key)
+        .ok_or_else(|| format!("no texture path for `{tex_key}`"))?;
+    let img = image::open(path)
+        .map_err(|e| format!("item texture open failed: {e}"))?
+        .into_rgba8();
+    let (w, h) = (img.width().max(1), img.height().max(1));
+    let size = PREVIEW_SIZE as usize;
+    let mut rgba = vec![0u8; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let sx = (x as u32 * w / size as u32).min(w - 1);
+            let sy = (y as u32 * h / size as u32).min(h - 1);
+            let p = img.get_pixel(sx, sy).0;
+            let o = (y * size + x) * 4;
+            rgba[o..o + 4].copy_from_slice(&p);
+        }
+    }
+    if rgba.chunks_exact(4).all(|p| p[3] == 0) {
+        return Err(format!("item icon `{name}` is fully transparent"));
+    }
+    Ok(DecodedImage {
+        width: PREVIEW_SIZE,
+        height: PREVIEW_SIZE,
+        rgba,
+    })
+}
 ///
 /// `baked` is the full baked-model map (legacy `exsolis:*` names fall back
 /// to their MC look-alikes, same as the mesher). Errors when the model is

@@ -44,10 +44,14 @@ fn sync_hotbar_hud(
                  width=\"44\" height=\"44\" align=\"center\" justify=\"center\">"
             ));
             if let Some((item, count)) = inventory.slots[i] {
+                let prefix = match blocks.as_ref().and_then(|b| b.0.def(item)) {
+                    Some(def) if !def.placeable => "item#",
+                    _ => "block#",
+                };
                 let img = blocks
                     .as_ref()
                     .and_then(|b| b.name(item))
-                    .map(|n| format!("<img src=\"block#{n}\" alt=\"?\" width=\"36\" height=\"36\"/>"))
+                    .map(|n| format!("<img src=\"{prefix}{n}\" alt=\"?\" width=\"36\" height=\"36\"/>"))
                     .unwrap_or_default();
                 cells.push_str(&img);
                 cells.push_str(&format!(

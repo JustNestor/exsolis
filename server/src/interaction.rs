@@ -191,6 +191,7 @@ fn handle_place_block(
     mut events: MessageReader<PlaceBlockRequested>,
     player_map: Res<PlayerMap>,
     positions: Query<&PlayerPosition>,
+    looks: Query<&crate::movement::PlayerLook>,
     mut inventories: Query<&mut Inventory>,
     mut world: ResMut<ChunkWorld>,
     mut outgoing: MessageWriter<OutgoingPacket>,
@@ -244,6 +245,15 @@ fn handle_place_block(
             );
             continue;
         };
+        // Items and multiblock parts are not placeable directly.
+        if !blocks.0.is_placeable(resolved_id) {
+            warn!(
+                "[PlaceBlock] {:?} is not placeable for PlayerId {:?}",
+                blocks.name(resolved_id),
+                ev.player_id
+            );
+            continue;
+        };
         let server_kind = blocks.name(resolved_id).unwrap_or("exsolis:air");
         if server_kind != ev.kind {
             debug!(
@@ -272,21 +282,33 @@ fn handle_place_block(
             continue;
         }
 
-        if !apply_and_broadcast(
-            coord,
-            idx,
-            resolved_id,
-            ev.pos,
-            &mut world,
-            &mut outgoing,
-            &loaded_by,
-            &blocks,
-        ) {
+        // Generic multiblock: the master cell plus every part cell (rotated
+        // by placement facing) must be loaded air, or nothing is placed.
+        let facing = looks
+            .get(entity)
+            .map(|look| exsolis_common::Facing::from_yaw(look.yaw))
+            .unwrap_or(exsolis_common::Facing::North);
+        let Some(cells) = multiblock_cells(ev.pos, resolved_id, facing, &world, &blocks) else {
             warn!(
-                "[PlaceBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
-                coord, ev.pos
+                "[PlaceBlock] Multiblock footprint blocked for {:?} at {:?}",
+                server_kind, ev.pos
             );
-        } else {
+            continue;
+        };
+
+        let mut ok = true;
+        for (pos, id) in &cells {
+            let (coord, idx) = world_to_chunk(*pos);
+            if !apply_and_broadcast(coord, idx, *id, *pos, &mut world, &mut outgoing, &loaded_by, &blocks) {
+                warn!("[PlaceBlock] apply failed for multiblock cell {pos:?}");
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        {
             let selected_index = inventory.selected_index();
             inventory.remove_one(selected_index, resolved_id);
             let inv = inventory.clone();
@@ -306,15 +328,178 @@ fn handle_place_block(
                     player_token: None,
                 });
             }
+            bevy_log::info!(
+                "[PlaceBlock] {:?} placed {} cell(s) at {:?}",
+                server_kind,
+                cells.len(),
+                ev.pos
+            );
         }
     }
+}
+
+/// Read one cell, or `None` when its chunk is not loaded (treated as
+/// "not air" by every multiblock check: never half-place into the void).
+fn read_cell(world: &ChunkWorld, pos: BlockPos) -> Option<BlockId> {
+    let (coord, idx) = world_to_chunk(pos);
+    world
+        .ready
+        .get(&coord)
+        .and_then(|c| c.unpack())
+        .and_then(|u| u.get(idx).copied())
+}
+
+/// Master + part cells for placing `master` at `pos`, or `None` when any
+/// footprint cell is not loaded air. Single blocks yield one cell.
+fn multiblock_cells(
+    pos: BlockPos,
+    master: BlockId,
+    facing: exsolis_common::Facing,
+    world: &ChunkWorld,
+    blocks: &ServerBlocks,
+) -> Option<Vec<(BlockPos, BlockId)>> {
+    let mut cells = vec![(pos, master)];
+    let layout = blocks
+        .0
+        .def(master)
+        .and_then(|d| d.multiblock.clone());
+    let Some(layout) = layout else {
+        return match read_cell(world, pos) {
+            Some(id) if id == AIR_ID => Some(cells),
+            _ => None,
+        };
+    };
+    for part in &layout.parts {
+        let Some(part_id) = blocks.id(&part.part) else {
+            return None;
+        };
+        let o = facing.rotate_offset(part.offset);
+        let cell = BlockPos::new(pos.x + o[0], pos.y + o[1], pos.z + o[2]);
+        cells.push((cell, part_id));
+    }
+    // Master first, then parts: every cell must be loaded air.
+    for (cell, _) in &cells {
+        if read_cell(world, *cell) != Some(AIR_ID) {
+            return None;
+        }
+    }
+    Some(cells)
+}
+
+/// Cells to clear when `hit` (master or part) breaks. Facing is not stored,
+/// so every facing is tried: the one whose part cells actually hold the
+/// expected part ids wins. Degenerate hits (edited world, missing parts)
+/// degrade to the single cell.
+fn break_cells(
+    hit: BlockPos,
+    hit_id: BlockId,
+    world: &ChunkWorld,
+    blocks: &ServerBlocks,
+) -> (BlockId, Vec<(BlockPos, BlockId)>) {
+    // Case 1: a master was hit. Try each facing for full coverage.
+    if let Some(layout) = blocks.0.def(hit_id).and_then(|d| d.multiblock.clone()) {
+        for facing in [
+            exsolis_common::Facing::North,
+            exsolis_common::Facing::East,
+            exsolis_common::Facing::South,
+            exsolis_common::Facing::West,
+        ] {
+            let mut cells = vec![(hit, hit_id)];
+            let mut ok = true;
+            for part in &layout.parts {
+                let Some(part_id) = blocks.id(&part.part) else {
+                    ok = false;
+                    break;
+                };
+                let o = facing.rotate_offset(part.offset);
+                let cell = BlockPos::new(hit.x + o[0], hit.y + o[1], hit.z + o[2]);
+                if read_cell(world, cell) != Some(part_id) {
+                    ok = false;
+                    break;
+                }
+                cells.push((cell, part_id));
+            }
+            if ok {
+                return (hit_id, cells);
+            }
+        }
+        return (hit_id, vec![(hit, hit_id)]);
+    }
+    // Case 2: a part was hit. Find the master cell covering it: for each
+    // facing, the master sits at hit - rotated_offset holding the master id.
+    if let Some(master_name) = blocks
+        .0
+        .def(hit_id)
+        .and_then(|_| {
+            blocks
+                .0
+                .iter()
+                .find(|(_, d)| {
+                    d.multiblock.as_ref().is_some_and(|layout| {
+                        layout.parts.iter().any(|p| {
+                            blocks.id(&p.part).is_some_and(|id| id == hit_id)
+                        })
+                    })
+                })
+                .map(|(_, d)| d.name.clone())
+        })
+    {
+        let Some(master_id) = blocks.id(&master_name) else {
+            return (hit_id, vec![(hit, hit_id)]);
+        };
+        let layout = blocks
+            .0
+            .def(master_id)
+            .and_then(|d| d.multiblock.clone());
+        if let Some(layout) = layout {
+            for facing in [
+                exsolis_common::Facing::North,
+                exsolis_common::Facing::East,
+                exsolis_common::Facing::South,
+                exsolis_common::Facing::West,
+            ] {
+                for part in &layout.parts {
+                    if blocks.id(&part.part) != Some(hit_id) {
+                        continue;
+                    }
+                    let o = facing.rotate_offset(part.offset);
+                    let master_pos =
+                        BlockPos::new(hit.x - o[0], hit.y - o[1], hit.z - o[2]);
+                    if read_cell(world, master_pos) != Some(master_id) {
+                        continue;
+                    }
+                    // Found the master; clear whatever of the structure
+                    // is actually present (tolerates partial edits).
+                    let mut cells = vec![(master_pos, master_id), (hit, hit_id)];
+                    for p2 in &layout.parts {
+                        let Some(pid) = blocks.id(&p2.part) else {
+                            continue;
+                        };
+                        if pid == hit_id {
+                            continue;
+                        }
+                        let o2 = facing.rotate_offset(p2.offset);
+                        let cell = BlockPos::new(
+                            master_pos.x + o2[0],
+                            master_pos.y + o2[1],
+                            master_pos.z + o2[2],
+                        );
+                        if read_cell(world, cell) == Some(pid) {
+                            cells.push((cell, pid));
+                        }
+                    }
+                    return (master_id, cells);
+                }
+            }
+        }
+    }
+    (hit_id, vec![(hit, hit_id)])
 }
 
 /// A block entity's transform is the block's own position. Yaw is derived
 /// from the position hash so a chest consistently faces one of four
 /// directions instead of every chest pointing the same way.
-fn block_entity_state(pos: exsolis_common::BlockPos) -> EntityState {
-    EntityState {
+fn block_entity_state(pos: exsolis_common::BlockPos) -> EntityState {    EntityState {
         x: pos.x as f32 + 0.5,
         y: pos.y as f32,
         z: pos.z as f32 + 0.5,
@@ -379,25 +564,28 @@ fn handle_break_block(
             continue;
         }
 
-        if !apply_and_broadcast(
-            coord,
-            idx,
-            AIR_ID,
-            ev.pos,
-            &mut world,
-            &mut outgoing,
-            &loaded_by,
-            &blocks,
-        ) {
-            warn!(
-                "[BreakBlock] apply_and_broadcast failed for chunk {:?}, pos {:?}",
-                coord, ev.pos
-            );
-        } else {
+        // Generic multiblock: resolve the whole structure (master or part
+        // hit — facing is rediscovered by coverage, never stored).
+        let (drop_id, cells) = break_cells(ev.pos, broken, &world, &blocks);
+        let mut ok = true;
+        for (pos, _) in &cells {
+            let (coord, idx) = world_to_chunk(*pos);
+            if !apply_and_broadcast(
+                coord, idx, AIR_ID, *pos, &mut world, &mut outgoing, &loaded_by, &blocks,
+            ) {
+                warn!("[BreakBlock] apply failed for multiblock cell {pos:?}");
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        {
             // Breaking a container block tears down its block entity. The
             // contents are handed to the breaker rather than dropped, so a
             // chest can never be destroyed to destroy its loot.
-            if crate::entities::is_block_entity(broken, &blocks.0)
+            if crate::entities::is_block_entity(drop_id, &blocks.0)
                 && let Some(block_entity_id) = registry.at_block(ev.pos)
             {
                 if let Some(be) = registry.entity_of(block_entity_id) {
@@ -416,15 +604,20 @@ fn handle_break_block(
                 despawns.write(crate::entities::DespawnEntityRequest(block_entity_id));
             }
             if let Ok(mut inventory) = inventories.get_mut(entity) {
-                inventory.add_item(broken, 1);
+                inventory.add_item(drop_id, 1);
                 let inv = inventory.clone();
                 send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
             }
             applied.write(BreakBlockApplied {
                 player_id: ev.player_id,
                 pos: ev.pos,
-                block: broken,
+                block: drop_id,
             });
+            bevy_log::info!(
+                "[BreakBlock] cleared {} cell(s), dropped {:?}",
+                cells.len(),
+                blocks.name(drop_id)
+            );
         }
     }
 }

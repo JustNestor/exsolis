@@ -22,12 +22,15 @@ local function item_view(item, names)
     local short_names = { wood = "W", stone = "S" }
     local colors = { wood = "#8a5a32", stone = "#777777" }
     local name = names and names[item.id] or nil
+    -- Items render flat (`item#`), blocks isometric (`block#`).
+    local prefix = "block#"
+    if name and not api.is_placeable(name) then prefix = "item#" end
     return {
         id = item.id,
         count = item.count,
         short = short_names[item.id] or string.upper(string.sub(tostring(item.id), 1, 1)),
         color = colors[item.id] or "#6f8f55",
-        img = name and ("block#" .. name) or nil,
+        img = name and (prefix .. name) or nil,
     }
 end
 
@@ -72,9 +75,12 @@ local function inv_data(player_id)
     end
     -- Creative grid: every registered block, wheel-scrollable, no paging
     -- buttons. Click gives a full stack (Rust authority + Lua mirror).
+    -- Items render flat, blocks isometric.
     local creative = {}
     for _, name in ipairs(api.blocks()) do
-        creative[#creative + 1] = { name = name, img = "block#" .. name }
+        local prefix = "block#"
+        if not api.is_placeable(name) then prefix = "item#" end
+        creative[#creative + 1] = { name = name, img = prefix .. name }
     end
     return {
         title = "Inventory",

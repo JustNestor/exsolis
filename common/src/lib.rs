@@ -4,7 +4,7 @@ mod chunk_blocks;
 pub mod blocks;
 pub mod inventory;
 
-pub use blocks::{AIR_ID, BlockDef, BlockId, BlockRegistry};
+pub use blocks::{AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart};
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
