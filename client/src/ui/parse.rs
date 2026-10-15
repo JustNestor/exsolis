@@ -35,7 +35,7 @@ pub const MAX_DEPTH: usize = 32;
 /// Lua creative tab (~1200 cells x ~10 nodes). The extractor walks the
 /// mounted tree every frame, so a virtualized grid replaces this brute
 /// force once the catalog grows further.
-pub const MAX_XML_NODES: u32 = 16384;
+pub const MAX_XML_NODES: u32 = 32768;
 
 pub type Attrs = HashMap<String, String>;
 

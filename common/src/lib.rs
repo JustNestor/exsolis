@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-mod chunk_blocks;
 pub mod blocks;
+mod chunk_blocks;
 pub mod inventory;
 
-pub use blocks::{AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart};
+pub use blocks::{
+    AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart,
+};
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
@@ -368,8 +370,8 @@ pub const HOTBAR_SIZE: usize = 9;
 // ---- SDUI limits, shared so server-side validation matches the client ----
 
 /// Max size of one `UiShow.xml` payload. Sized for the Lua creative tab
-/// (~1200 `block#` cells); reliable-ordered, sent on open only.
-pub const UI_MAX_XML_BYTES: usize = 256 * 1024;
+/// (~1200 `block#` cells in rows); reliable-ordered, sent on open only.
+pub const UI_MAX_XML_BYTES: usize = 512 * 1024;
 /// Max length of `ui_id` / `element_id`.
 pub const UI_MAX_ID_LEN: usize = 64;
 /// Max length of `UiAction.action` and `UiAction.data`.
