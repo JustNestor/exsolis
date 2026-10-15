@@ -17,6 +17,10 @@ use glam::{EulerRot, Quat, Vec3};
 
 use crate::anim::Animator;
 use crate::gltf::GltfModelInstance;
+
+/// Hide third-person player avatars while viewmodel/inventory work is in
+/// progress. Flip back when avatars should render again.
+const HIDE_PLAYER_MODELS: bool = true;
 use crate::net::{GameplaySet, IncomingPacket};
 use crate::player::ServerTarget;
 use crate::streaming::LocalPlayerId;
@@ -163,9 +167,14 @@ fn receive_entity_messages(
                 // staring at the inside of their own skull. Their avatar is
                 // the first-person viewmodel instance created at startup,
                 // which draws the arms only.
+                // Player avatars are hidden for now (see HIDE_PLAYER_MODELS):
+                // remote bodies add visual noise while the viewmodel and
+                // inventory work is in progress, and the local player
+                // deliberately gets no body mesh anyway (see below).
                 let is_local_player = player_id.is_some() && *player_id == local_player.0;
                 if let Some(path) = model
                     && !is_local_player
+                    && !(*kind == EntityKind::Player && HIDE_PLAYER_MODELS)
                 {
                     commands.entity(entity).insert((
                         GltfModelInstance::new(path.clone()).with_scale(*scale),
