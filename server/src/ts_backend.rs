@@ -1869,3 +1869,18 @@ mod component_access_compile_test {
         }
     }
 }
+
+#[cfg(test)]
+mod typed_rows_compile_test {
+    use super::*;
+    #[test]
+    fn typed_rows_compiles() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap();
+        let p = root.join("mods").join("ts").join("typed_rows.ts");
+        match compile_mod(&p) {
+            Ok(_) => {}
+            Err(es) => panic!("typed_rows.ts failed: {:#?}", es),
+        }
+    }
+}

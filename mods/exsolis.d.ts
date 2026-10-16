@@ -136,3 +136,10 @@ export function on_break_block(
 
 /** A player selected a hotbar slot. */
 export function on_select_hotbar(id: string, index: i32): void {}
+
+
+/** Opaque 64-bit world handle (TS-visible raw token). */
+declare function world_token(): i64;
+
+/** Registered component kind (numeric bevy id). */
+declare function component_access_id(name: string): i64;
