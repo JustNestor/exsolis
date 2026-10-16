@@ -109,6 +109,7 @@ struct PullCtx {
     /// Packed query rows for `query_*` — a *view* of the buffer the tick system
     /// owns, so mods read and write the very memory the write-back applies.
     rows: RowsView,
+    components: HashMap<String, u64>,
 }
 
 /// A view of one tick's row buffer.
@@ -238,6 +239,7 @@ impl Clone for PullCtx {
             positions: self.positions.clone(),
             world: self.world,
             rows: self.rows.clone(),
+            components: self.components.clone(),
         }
     }
 }
@@ -336,12 +338,6 @@ fn host_fns() -> Vec<HostFn> {
             vec![],
             Ty::I64,
             host_world_token as *const u8,
-        ),
-        HostFn::new(
-            "player_component_id",
-            vec![],
-            Ty::I64,
-            host_player_component_id as *const u8,
         ),
         HostFn::new(
             "player_count",
@@ -454,8 +450,21 @@ extern "C" fn host_log(x: f64) {
 extern "C" fn host_world_token() -> i64 {
     with_pull(|ctx| ctx.world as i64).unwrap_or(0)
 }
+#[allow(dead_code)]
 extern "C" fn host_player_component_id() -> i64 {
     with_pull(|ctx| ctx.world as usize as i64).unwrap_or(0)
+}
+extern "C" fn host_component_access_id(name: i64) -> i64 {
+    let name = unsafe { ts_str(name) };
+    with_pull(|ctx| *ctx.components.get(&name).unwrap_or(&0)).unwrap_or(0) as i64
+}
+
+fn build_component_registry(_world: *const ChunkWorld) -> HashMap<String, u64> {
+    // Bootstrap data; real registration will push a type-name -> ComponentId
+    // (as a u64) mapping from every Bevy Component used by a mod at app
+    // build time. Right now the set is empty, so callers get 0 (the safe
+    // "not registered" sentinel).
+    HashMap::new()
 }
 
 
@@ -1121,6 +1130,7 @@ pub fn ts_tick_system(world: &mut World) {
         positions: positions.clone(),
         world: world_ptr,
         rows: RowsView::default(),
+        components: build_component_registry(world_ptr),
     }
     .install();
     runtime.tick(&positions, world_ptr, &rows.players);
@@ -1474,6 +1484,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1587,6 +1598,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime_ctx.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1635,6 +1647,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1669,6 +1682,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1731,6 +1745,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1762,6 +1777,7 @@ mod tests {
             positions: positions(),
             world: std::ptr::null(),
             rows: RowsView::default(),
+        components: HashMap::new(),
         }
         .install();
         runtime.dispatch(
