@@ -89,6 +89,14 @@ pub struct UiImageSrc {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct UiScrollArea;
 
+/// Marker for scroll areas that should window their children (virtual list).
+/// Pass 2: populated by renderer; component currently inert.
+#[derive(Component, Copy, Clone, Default)]
+pub struct UiVirtualList {
+    pub item_height: f32,
+    pub overscan: usize,
+}
+
 #[derive(Component, Debug, Clone, Copy)]
 pub struct UiCursorWidget;
 
