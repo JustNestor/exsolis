@@ -1,9 +1,11 @@
-<div anchor="bottom" layout="column" align="center" gap="2" padding="0 0 8">
-  <div layout="row" gap="4" padding="4" bg="#00000088" border="2" border-color="#333333">
-    <div v-for="s in slots" bg="{{s.bg}}" border="2" border-color="{{s.border}}"
-         width="44" height="44" align="center" justify="center">
+<div anchor="bottom" layout="column" align="center" gap="4" padding="0 0 10">
+  <div layout="row" gap="6" padding="6" bg="#0f1220cc" border="1"
+       border-color="#4a5a8a55" radius="12">
+    <div v-for="s in slots" bg="{{s.bg}}" border="1" border-color="{{s.border}}"
+         width="46" height="46" align="center" justify="center" radius="10">
       <img v-if="s.img" src="{{s.img}}" alt="?" width="36" height="36"/>
-      <label v-if="s.img" position="absolute" right="2" bottom="0" font-size="11" color="#ffffff">{{s.count}}</label>
+      <label v-if="s.img" position="absolute" right="3" bottom="1"
+             font-size="11" color="#ffffff">{{s.count}}</label>
     </div>
   </div>
 </div>
