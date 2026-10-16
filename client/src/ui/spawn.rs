@@ -138,7 +138,9 @@ pub fn update_scrollbar_thumbs(
         if rail.is_some() {
             // The parent scroll offset moves every child; offset the rail by
             // the same amount so it stays pinned to the viewport edge.
-            node.left = Val::Px(position.x);
+            if node.right == Val::Auto {
+                node.left = Val::Px(position.x);
+            }
             node.top = Val::Px(position.y);
             continue;
         }
@@ -194,7 +196,7 @@ fn spawn_scrollbar(
         Node {
             position_type: PositionType::Absolute,
             top: Val::Px(0.0),
-            left: Val::Px(0.0),
+            right: Val::Px(0.0),
             width: Val::Px(6.0),
             height: Val::Percent(100.0),
             ..Default::default()
