@@ -334,6 +334,12 @@ fn host_fns() -> Vec<HostFn> {
             host_get_block as *const u8,
         ),
         HostFn::new(
+            "component_access_id",
+            vec![Ty::Str],
+            Ty::I64,
+            host_component_access_id as *const u8,
+        ),
+        HostFn::new(
             "world_token",
             vec![],
             Ty::I64,
@@ -459,12 +465,14 @@ extern "C" fn host_component_access_id(name: i64) -> i64 {
     with_pull(|ctx| *ctx.components.get(&name).unwrap_or(&0)).unwrap_or(0) as i64
 }
 
-fn build_component_registry(_world: *const ChunkWorld) -> HashMap<String, u64> {
-    // Bootstrap data; real registration will push a type-name -> ComponentId
-    // (as a u64) mapping from every Bevy Component used by a mod at app
-    // build time. Right now the set is empty, so callers get 0 (the safe
-    // "not registered" sentinel).
-    HashMap::new()
+fn build_component_registry(world: &mut World) -> HashMap<String, u64> {
+    // Bootstrap set of component kinds that mods can refer to by stable
+    // name. IDs are Bevy's runtime ids, resolved fresh each tick.
+    let mut out = HashMap::new();
+    if let Some(id) = world.component_id::<crate::Player>() {
+        out.insert("Player".to_string(), id.index() as u64);
+    }
+    out
 }
 
 
@@ -1130,7 +1138,7 @@ pub fn ts_tick_system(world: &mut World) {
         positions: positions.clone(),
         world: world_ptr,
         rows: RowsView::default(),
-        components: build_component_registry(world_ptr),
+        components: build_component_registry(world),
     }
     .install();
     runtime.tick(&positions, world_ptr, &rows.players);
@@ -1843,6 +1851,21 @@ mod phase2_smoke_compile_test {
         match compile_mod(&p) {
             Ok(_) => {}
             Err(es) => panic!("phase2_smoke.ts failed: {:#?}", es),
+        }
+    }
+}
+
+#[cfg(test)]
+mod component_access_compile_test {
+    use super::*;
+    #[test]
+    fn component_access_compiles() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap();
+        let p = root.join("mods").join("ts").join("component_access.ts");
+        match compile_mod(&p) {
+            Ok(_) => {}
+            Err(es) => panic!("component_access.ts failed: {:#?}", es),
         }
     }
 }
