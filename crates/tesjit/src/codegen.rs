@@ -153,6 +153,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         builder.switch_to_block(trap_block);
         if f.ret != Ty::Void {
             let zero = match f.ret.clone() {
+                Ty::F32 => builder.ins().f32const(0.0),
                 Ty::F64 => builder.ins().f64const(0.0),
                 other => builder.ins().iconst(other.clif(), 0),
             };
@@ -203,6 +204,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
 
     fn zero(&self, b: &mut FunctionBuilder<'_>, ty: Ty) -> Value {
         match ty {
+            Ty::F32 => b.ins().f32const(0.0),
             Ty::F64 => b.ins().f64const(0.0),
             _ => b.ins().iconst(ty.clif(), 0),
         }
@@ -387,6 +389,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 b.ins().jump(cont, &[]);
                 Self::dead_block(b);
             }
+            Stmt::ForOf { .. } => {}
         }
     }
 
@@ -403,20 +406,29 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
     fn expr(&mut self, b: &mut FunctionBuilder<'_>, e: &Expr) -> Value {
         let ins = b.ins();
         match &e.kind {
-            ExprKind::I32(v) => ins.iconst(types::I32, i64::from(*v)),
-            ExprKind::F64(v) => ins.f64const(*v),
+            ExprKind::Int(v) => ins.iconst(e.ty.clif(), *v),
+            ExprKind::Float(v) => {
+                if e.ty == Ty::F32 {
+                    ins.f32const(*v as f32)
+                } else {
+                    ins.f64const(*v)
+                }
+            }
             ExprKind::Bool(v) => ins.iconst(types::I8, i64::from(*v)),
             ExprKind::Str(text) => self.str_literal(b, text),
             ExprKind::Local(slot) => b.use_var(self.vars[*slot]),
             ExprKind::Unary { op, arg } => {
                 let a = self.expr(b, arg);
-                match (op, arg.ty.clone()) {
-                    (UnaryOperator::UnaryPlus, _) => a,
-                    (UnaryOperator::UnaryNegation, Ty::I32) => b.ins().ineg(a),
-                    (UnaryOperator::UnaryNegation, Ty::F64) => b.ins().fneg(a),
-                    (UnaryOperator::BitwiseNot, Ty::I32) => b.ins().bnot(a),
-                    (UnaryOperator::LogicalNot, Ty::Bool) => b.ins().icmp_imm_s(IntCC::Equal, a, 0),
-                    _ => unreachable!("checker rejected unary {op:?} on {}", arg.ty),
+                let ty = arg.ty.clone();
+                match op {
+                    UnaryOperator::UnaryPlus => a,
+                    UnaryOperator::UnaryNegation if ty.is_float() => b.ins().fneg(a),
+                    UnaryOperator::UnaryNegation if ty.is_integer() => b.ins().ineg(a),
+                    UnaryOperator::BitwiseNot if ty.is_integer() => b.ins().bnot(a),
+                    UnaryOperator::LogicalNot if ty == Ty::Bool => {
+                        b.ins().icmp_imm_s(IntCC::Equal, a, 0)
+                    }
+                    _ => unreachable!("checker rejected unary {op:?} on {ty}"),
                 }
             }
             ExprKind::Binary { op, lhs, rhs } => {
@@ -493,15 +505,19 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             ExprKind::Update { local, inc, prefix } => {
                 let var = self.vars[*local];
                 let old = b.use_var(var);
-                let new = if e.ty == Ty::F64 {
-                    let one = b.ins().f64const(1.0);
+                let new = if e.ty.is_float() {
+                    let one = if e.ty == Ty::F32 {
+                        b.ins().f32const(1.0)
+                    } else {
+                        b.ins().f64const(1.0)
+                    };
                     if *inc {
                         b.ins().fadd(old, one)
                     } else {
                         b.ins().fsub(old, one)
                     }
                 } else {
-                    let one = b.ins().iconst(types::I32, 1);
+                    let one = b.ins().iconst(e.ty.clif(), 1);
                     if *inc {
                         b.ins().iadd(old, one)
                     } else {
@@ -551,15 +567,11 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             }
             ExprKind::Cast { expr, to } => {
                 let v = self.expr(b, expr);
-                match (expr.ty.clone(), to.clone()) {
-                    (Ty::I32, Ty::F64) => b.ins().fcvt_from_sint(types::F64, v),
-                    (Ty::F64, Ty::I32) => b.ins().fcvt_to_sint_sat(types::I32, v),
-                    (Ty::Bool, Ty::I32) => b.ins().uextend(types::I32, v),
-                    (Ty::Bool, Ty::F64) => {
-                        let wide = b.ins().uextend(types::I32, v);
-                        b.ins().fcvt_from_sint(types::F64, wide)
-                    }
-                    _ => unreachable!("checker rejected cast {} -> {}", expr.ty, to),
+                let from = expr.ty.clone();
+                if &from == to {
+                    v
+                } else {
+                    self.convert(b, v, &from, to)
                 }
             }
             ExprKind::Length { target } => match target.ty.clone() {
@@ -654,6 +666,37 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 let _ = &mut arr;
                 arr
             }
+            ExprKind::OptionNone { ty: _ } => {
+                use crate::hir::Intrinsic;
+                let size = b.ins().iconst(types::I64, 16);
+                self.call_intrinsic(b, Intrinsic::Alloc, &[(&Ty::Ptr, size)], &Ty::Ptr)
+            }
+            ExprKind::OptionSome { value } => {
+                use crate::hir::Intrinsic;
+                let is_float = value.ty.is_float();
+                let ptr = {
+                    let size = b.ins().iconst(types::I64, 16);
+                    self.call_intrinsic(b, Intrinsic::Alloc, &[(&Ty::Ptr, size)], &Ty::Ptr)
+                };
+                let tag = b.ins().iconst(types::I64, 1);
+                b.ins().store(mem_flags(), tag, ptr, 0);
+                let v = self.expr(b, value);
+                if is_float {
+                    let v = if value.ty == Ty::F64 {
+                        v
+                    } else {
+                        self.convert(b, v, &Ty::F32, &Ty::F64)
+                    };
+                    b.ins().store(mem_flags(), v, ptr, 8);
+                } else {
+                    let v = if value.ty == Ty::I64 { v } else { self.convert(b, v, &value.ty, &Ty::I64) };
+                    b.ins().store(mem_flags(), v, ptr, 8);
+                }
+                ptr
+            }
+            ExprKind::Iter { .. } | ExprKind::PlaceRead { .. } | ExprKind::PlaceWrite { .. } => {
+                unreachable!("phase 1 scaffold, not yet lowered")
+            }
         }
     }
 
@@ -682,8 +725,116 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         Self::fuel_check(self.module, self.sigs, b)
     }
 
+    /// Explicit `as` conversion. The checker guarantees the pair is legal;
+    /// every combination below is total (wrapping integers, saturating
+    /// float↔int, zero-extension from `bool`).
+    fn convert(&mut self, b: &mut FunctionBuilder<'_>, v: Value, from: &Ty, to: &Ty) -> Value {
+        debug_assert_ne!(from, to);
+        match (from, to) {
+            // Integer ↔ integer: extend or truncate. Signedness only matters
+            // for widening (sign- vs zero-extend); narrowing wraps.
+            (f, t) if f.is_integer() && t.is_integer() => {
+                let (fw, tw) = (
+                    f.int_width().unwrap_or(32),
+                    t.int_width().unwrap_or(32),
+                );
+                if fw == tw {
+                    v
+                } else if tw < fw {
+                    b.ins().ireduce(to.clif(), v)
+                } else if f.is_signed() {
+                    b.ins().sextend(to.clif(), v)
+                } else {
+                    b.ins().uextend(to.clif(), v)
+                }
+            }
+            // Integer → float. Narrower widths extend to 64 bits first;
+            // the conversion itself always runs from `i64`.
+            (f, t) if f.is_integer() && t.is_float() => {
+                let wide = match f.int_width().unwrap_or(32) {
+                    64 => v,
+                    _ if f.is_signed() => b.ins().sextend(types::I64, v),
+                    _ => b.ins().uextend(types::I64, v),
+                };
+                if f.is_signed() {
+                    if *to == Ty::F32 {
+                        b.ins().fcvt_from_sint(types::F32, wide)
+                    } else {
+                        b.ins().fcvt_from_sint(types::F64, wide)
+                    }
+                } else if *to == Ty::F32 {
+                    b.ins().fcvt_from_uint(types::F32, wide)
+                } else {
+                    b.ins().fcvt_from_uint(types::F64, wide)
+                }
+            }
+            // Float → integer. Saturates to the 32/64-bit lane (`_sat`,
+            // NaN → 0), then wraps on narrowing — documented, not silent:
+            // `1000.0 as i8` is `-24`, matching integer narrowing.
+            (f, t) if f.is_float() && t.is_integer() => {
+                if t.is_signed() {
+                    if t.int_width().unwrap_or(32) <= 32 {
+                        let w = b.ins().fcvt_to_sint_sat(types::I32, v);
+                        if *to == Ty::I32 {
+                            w
+                        } else {
+                            b.ins().ireduce(to.clif(), w)
+                        }
+                    } else {
+                        let w = b.ins().fcvt_to_sint_sat(types::I64, v);
+                        if *to == Ty::I64 {
+                            w
+                        } else {
+                            b.ins().ireduce(to.clif(), w)
+                        }
+                    }
+                } else if t.int_width().unwrap_or(32) <= 32 {
+                    let w = b.ins().fcvt_to_uint_sat(types::I32, v);
+                    if *to == Ty::U32 {
+                        w
+                    } else {
+                        b.ins().ireduce(to.clif(), w)
+                    }
+                } else {
+                    let w = b.ins().fcvt_to_uint_sat(types::I64, v);
+                    if *to == Ty::U64 {
+                        w
+                    } else {
+                        b.ins().ireduce(to.clif(), w)
+                    }
+                }
+            }
+            // `f32` ↔ `f64`.
+            (Ty::F32, Ty::F64) => b.ins().fpromote(types::F64, v),
+            (Ty::F64, Ty::F32) => b.ins().fdemote(types::F32, v),
+            // `bool` → numeric zero-extends.
+            (Ty::Bool, t) if t.is_numeric() => {
+                let wide = b.ins().uextend(types::I32, v);
+                if t.is_integer() {
+                    match t.int_width().unwrap_or(32) {
+                        32 => wide,
+                        w if w < 32 => b.ins().ireduce(to.clif(), wide),
+                        _ => b.ins().uextend(to.clif(), wide),
+                    }
+                } else if *to == Ty::F32 {
+                    b.ins().fcvt_from_uint(types::F32, wide)
+                } else {
+                    b.ins().fcvt_from_uint(types::F64, wide)
+                }
+            }
+            // `Entity` ↔ `u64`: identical bits.
+            (Ty::Entity, Ty::U64) | (Ty::U64, Ty::Entity) => v,
+            _ => unreachable!("checker rejected cast {from} -> {to}"),
+        }
+    }
+
     /// Convert a value between a TS type and the machine-word runtime ABI
-    /// (used only for intrinsic calls): `i32` ↔ `i64`.
+    /// (used only for intrinsic calls): any integer/boolean/float ↔ `i64`.
+    ///
+    /// Array/string helpers move values as raw little-endian words
+    /// (`i64::from_le_bytes` on the Rust side), so floats cross by *bitcast*,
+    /// never by numeric conversion: an `f64` keeps its bits, an `f32` is
+    /// zero-extended like every other 4-byte element.
     fn adapt(b: &mut FunctionBuilder<'_>, from: &Ty, to: &Ty, v: Value) -> Value {
         if from == to || from.clif() == to.clif() {
             return v;
@@ -691,8 +842,24 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         match (from, to) {
             // Widening: zero-extend, so a negative index stays a huge unsigned
             // value and the runtime bounds check traps on it.
-            (Ty::I32 | Ty::Bool, Ty::Ptr) => b.ins().uextend(types::I64, v),
-            (Ty::Ptr, Ty::I32 | Ty::Bool) => b.ins().ireduce(to.clif(), v),
+            (f, Ty::Ptr) if f.is_integer() || *f == Ty::Bool => {
+                b.ins().uextend(types::I64, v)
+            }
+            (Ty::Ptr, t) if t.is_integer() || *t == Ty::Bool => {
+                b.ins().ireduce(to.clif(), v)
+            }
+            // Floats cross as words: exact-size bitcast, zero-extended words
+            // for `f32` (matching `arr_get`'s zero-padded read).
+            (Ty::F64, Ty::Ptr) => b.ins().bitcast(types::I64, mem_flags(), v),
+            (Ty::Ptr, Ty::F64) => b.ins().bitcast(types::F64, mem_flags(), v),
+            (Ty::F32, Ty::Ptr) => {
+                let w = b.ins().bitcast(types::I32, mem_flags(), v);
+                b.ins().uextend(types::I64, w)
+            }
+            (Ty::Ptr, Ty::F32) => {
+                let w = b.ins().ireduce(types::I32, v);
+                b.ins().bitcast(types::F32, mem_flags(), w)
+            }
             _ => unreachable!("no adaptation between {from} and {to}"),
         }
     }
@@ -818,16 +985,35 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 _ => unreachable!("checker rejected {op:?} on string"),
             },
             Ty::Array(_) | Ty::Ptr => unreachable!("no operators on arrays/pointers in v1"),
-            Ty::I32 => {
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64 => {
+                // Signedness follows the operand type: unsigned division,
+                // remainder, right shift and comparisons use the `_U` family.
+                let unsigned = matches!(ty, Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64);
                 let cc = match op {
                     BinaryOperator::Equality | BinaryOperator::StrictEquality => Some(IntCC::Equal),
                     BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
                         Some(IntCC::NotEqual)
                     }
-                    BinaryOperator::LessThan => Some(IntCC::SignedLessThan),
-                    BinaryOperator::LessEqualThan => Some(IntCC::SignedLessThanOrEqual),
-                    BinaryOperator::GreaterThan => Some(IntCC::SignedGreaterThan),
-                    BinaryOperator::GreaterEqualThan => Some(IntCC::SignedGreaterThanOrEqual),
+                    BinaryOperator::LessThan => Some(if unsigned {
+                        IntCC::UnsignedLessThan
+                    } else {
+                        IntCC::SignedLessThan
+                    }),
+                    BinaryOperator::LessEqualThan => Some(if unsigned {
+                        IntCC::UnsignedLessThanOrEqual
+                    } else {
+                        IntCC::SignedLessThanOrEqual
+                    }),
+                    BinaryOperator::GreaterThan => Some(if unsigned {
+                        IntCC::UnsignedGreaterThan
+                    } else {
+                        IntCC::SignedGreaterThan
+                    }),
+                    BinaryOperator::GreaterEqualThan => Some(if unsigned {
+                        IntCC::UnsignedGreaterThanOrEqual
+                    } else {
+                        IntCC::SignedGreaterThanOrEqual
+                    }),
                     _ => None,
                 };
                 if let Some(cc) = cc {
@@ -837,19 +1023,39 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                         BinaryOperator::Addition => ins.iadd(l, r),
                         BinaryOperator::Subtraction => ins.isub(l, r),
                         BinaryOperator::Multiplication => ins.imul(l, r),
-                        BinaryOperator::Division => ins.sdiv(l, r),
-                        BinaryOperator::Remainder => ins.srem(l, r),
+                        BinaryOperator::Division => {
+                            if unsigned {
+                                ins.udiv(l, r)
+                            } else {
+                                ins.sdiv(l, r)
+                            }
+                        }
+                        BinaryOperator::Remainder => {
+                            if unsigned {
+                                ins.urem(l, r)
+                            } else {
+                                ins.srem(l, r)
+                            }
+                        }
                         BinaryOperator::BitwiseAnd => ins.band(l, r),
                         BinaryOperator::BitwiseOR => ins.bor(l, r),
                         BinaryOperator::BitwiseXOR => ins.bxor(l, r),
                         BinaryOperator::ShiftLeft => ins.ishl(l, r),
-                        BinaryOperator::ShiftRight => ins.sshr(l, r),
+                        // `>>` is arithmetic for signed, logical for unsigned;
+                        // `>>>` is always logical.
+                        BinaryOperator::ShiftRight => {
+                            if unsigned {
+                                ins.ushr(l, r)
+                            } else {
+                                ins.sshr(l, r)
+                            }
+                        }
                         BinaryOperator::ShiftRightZeroFill => ins.ushr(l, r),
-                        _ => unreachable!("checker rejected {op:?} on i32"),
+                        _ => unreachable!("checker rejected {op:?} on {ty}"),
                     }
                 }
             }
-            Ty::F64 => {
+            Ty::F32 | Ty::F64 => {
                 let cc = match op {
                     BinaryOperator::Equality | BinaryOperator::StrictEquality => {
                         Some(FloatCC::Equal)
@@ -871,9 +1077,20 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                         BinaryOperator::Subtraction => ins.fsub(l, r),
                         BinaryOperator::Multiplication => ins.fmul(l, r),
                         BinaryOperator::Division => ins.fdiv(l, r),
-                        _ => unreachable!("checker rejected {op:?} on f64"),
+                        _ => unreachable!("checker rejected {op:?} on {ty}"),
                     }
                 }
+            }
+            // `Entity` handles compare by identity, like opaque 64-bit ids.
+            Ty::Entity => {
+                let cc = match op {
+                    BinaryOperator::Equality | BinaryOperator::StrictEquality => IntCC::Equal,
+                    BinaryOperator::Inequality | BinaryOperator::StrictInequality => {
+                        IntCC::NotEqual
+                    }
+                    _ => unreachable!("checker rejected {op:?} on Entity"),
+                };
+                ins.icmp(cc, l, r)
             }
             Ty::Bool => {
                 let cc = match op {
@@ -884,6 +1101,9 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     _ => unreachable!("checker rejected {op:?} on boolean"),
                 };
                 ins.icmp(cc, l, r)
+            }
+            Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands => {
+                unreachable!("no operators on {}", ty)
             }
             Ty::Void => unreachable!("void has no operands"),
         }

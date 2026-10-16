@@ -96,6 +96,12 @@ pub enum Stmt {
     Break { span: Span },
     /// `continue` — target is the innermost loop.
     Continue { span: Span },
+    ForOf {
+        binding: usize,
+        iter: Expr,
+        body: Vec<Stmt>,
+        span: Span,
+    },
 }
 
 /// A typed expression. `ty` is always the checker-computed type of the node.
@@ -135,6 +141,8 @@ pub enum Intrinsic {
     StrByte,
     /// `(cap, elem_size) -> array`
     ArrNew,
+    /// arena alloc: `(size) -> ptr`
+    Alloc,
     ArrLen,
     /// `(array, elem_size, value) -> array`
     ArrPush,
@@ -160,6 +168,16 @@ pub enum Intrinsic {
     ArrSet,
     /// `(string) -> i32` — resolve a region name to its id.
     RegionId,
+    /// Option<T> isSome: `(ptr) -> i64`.
+    OptIsSome,
+    /// Option<T> unwrap (integer-ish): `(ptr) -> i64`.
+    OptUnwrap,
+    /// Option<T> unwrap (float): `(ptr) -> f64`.
+    OptUnwrapF64,
+    /// Option<T> unwrapOr (integer-ish): `(ptr, default) -> i64`.
+    OptUnwrapOr,
+    /// Option<T> unwrapOr (float): `(ptr, default) -> f64`.
+    OptUnwrapOrF64,
 }
 
 /// Builtins callable straight from TS (they are runtime symbols, not host
@@ -190,6 +208,7 @@ impl Intrinsic {
             Intrinsic::StrEq => "__tesjit_str_eq",
             Intrinsic::StrByte => "__tesjit_str_byte",
             Intrinsic::ArrNew => "__tesjit_arr_new",
+            Intrinsic::Alloc => "__tesjit_alloc",
             Intrinsic::ArrLen => "__tesjit_arr_len",
             Intrinsic::ArrPush => "__tesjit_arr_push",
             Intrinsic::LoadF64 => "__tesjit_load_f64",
@@ -203,6 +222,11 @@ impl Intrinsic {
             Intrinsic::RegionId => "__tesjit_region_id",
             Intrinsic::ArrGet => "__tesjit_arr_get",
             Intrinsic::ArrSet => "__tesjit_arr_set",
+            Intrinsic::OptIsSome => "__tesjit_opt_is_some",
+            Intrinsic::OptUnwrap => "__tesjit_opt_unwrap_i64",
+            Intrinsic::OptUnwrapF64 => "__tesjit_opt_unwrap_f64",
+            Intrinsic::OptUnwrapOr => "__tesjit_opt_unwrap_or_i64",
+            Intrinsic::OptUnwrapOrF64 => "__tesjit_opt_unwrap_or_f64",
         }
     }
 }
@@ -210,9 +234,9 @@ impl Intrinsic {
 #[derive(Clone, Debug)]
 pub enum ExprKind {
     /// An integer literal, already narrowed to the expected type.
-    I32(i32),
+    Int(i64),
     /// A float literal.
-    F64(f64),
+    Float(f64),
     /// `true` / `false`.
     Bool(bool),
     /// A local slot (parameter or `let`).
@@ -281,4 +305,20 @@ pub enum ExprKind {
         elems: Vec<Expr>,
         elem_ty: Ty,
     },
+    PlaceRead { place: PlaceExpr },
+    PlaceWrite {
+        place: PlaceExpr,
+        op: Option<BinaryOperator>,
+        value: Box<Expr>,
+    },
+    Iter { query: Box<Expr> },
+    OptionSome { value: Box<Expr> },
+    OptionNone { ty: Ty },
+}
+
+#[derive(Clone, Debug)]
+pub enum PlaceExpr {
+    Slot(usize),
+    Field { base: usize, name: String },
+    Index { base: usize, index: usize },
 }

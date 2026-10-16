@@ -1,0 +1,10 @@
+[package]
+name = "lua-bench-luau"
+version = "0.1.0"
+edition = "2021"
+description = "Isolated bench runner: mlua/Luau. Standalone workspace, see lua-bench-luajit."
+
+[workspace]
+
+[dependencies]
+mlua = { version = "0.11", features = ["luau", "vendored"] }

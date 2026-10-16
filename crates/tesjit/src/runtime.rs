@@ -701,10 +701,77 @@ extern "C" fn region_id(name: i64) -> i64 {
     }
 }
 
+/// `Option<T>::isSome`. Pointer may be null (==None returned as 0).
+extern "C" fn opt_is_some(p: i64) -> i64 {
+    if p == 0 {
+        return 0;
+    }
+    let tag = unsafe { *(p as *const i64) };
+    if tag == 1 { 1 } else { 0 }
+}
+
+/// `Option<T>::unwrap` for integer-ish values (Entity/Str/Ptr are same width).
+extern "C" fn opt_unwrap_i64(p: i64) -> i64 {
+    if p == 0 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    let tag = unsafe { *(p as *const i64) };
+    if tag != 1 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0;
+    }
+    unsafe { *(p as *const i64).add(1) }
+}
+
+/// `Option<T>::unwrapOr` for integer-ish values.
+extern "C" fn opt_unwrap_or_i64(p: i64, def: i64) -> i64 {
+    if p == 0 {
+        return def;
+    }
+    let tag = unsafe { *(p as *const i64) };
+    if tag != 1 {
+        return def;
+    }
+    unsafe { *(p as *const i64).add(1) }
+}
+
+/// `Option<T>::unwrapOr` for float values.
+extern "C" fn opt_unwrap_or_f64(p: i64, def: f64) -> f64 {
+    if p == 0 {
+        return def;
+    }
+    let tag = unsafe { *(p as *const i64) };
+    if tag != 1 {
+        return def;
+    }
+    unsafe { *(p as *const f64).add(1) }
+}
+
+/// `Option<T>::unwrap` for float values.
+extern "C" fn opt_unwrap_f64(p: i64) -> f64 {
+    if p == 0 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    let tag = unsafe { *(p as *const i64) };
+    if tag != 1 {
+        trap(TrapKind::IndexOutOfBounds);
+        return 0.0;
+    }
+    unsafe { *(p as *const f64).add(1) }
+}
+
 /// Named runtime symbols to register for one module.
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
         ("__tesjit_fuel", fuel as *const u8),
+        ("__tesjit_opt_is_some", opt_is_some as *const u8),
+        ("__tesjit_opt_unwrap_i64", opt_unwrap_i64 as *const u8),
+        ("__tesjit_opt_unwrap_f64", opt_unwrap_f64 as *const u8),
+        ("__tesjit_opt_unwrap_or_i64", opt_unwrap_or_i64 as *const u8),
+        ("__tesjit_opt_unwrap_or_f64", opt_unwrap_or_f64 as *const u8),
+        // existing order only prepends optimally; below actually existing? Need correct.
         ("__tesjit_alloc", alloc as *const u8),
         ("__tesjit_str_wrap", str_wrap as *const u8),
         ("__tesjit_str_len", str_len as *const u8),

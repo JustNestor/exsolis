@@ -716,3 +716,311 @@ fn a_stale_dts_signature_does_not_block_the_module() {
         "{diags:?}"
     );
 }
+
+#[test]
+fn sized_integers_wrap_and_compare() {
+    let c = build(
+        r#"
+        function add_u8(a: u8, b: u8): u8 { return a + b; }
+        function neg_i8(a: i8): i8 { return -a; }
+        function add_i64(a: i64, b: i64): i64 { return a + b; }
+        function shr_u32(a: u32): u32 { return a >> 1; }
+        function shr_i32(a: i32): i32 { return a >> 1; }
+        function ult(a: u32, b: u32): boolean { return a < b; }
+        function ilt(a: i32, b: i32): boolean { return a < b; }
+        function and_u16(a: u16, b: u16): u16 { return a & b; }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let add_u8: extern "C" fn(u8, u8) -> u8 = c.get("add_u8").unwrap();
+        let neg_i8: extern "C" fn(i8) -> i8 = c.get("neg_i8").unwrap();
+        let add_i64: extern "C" fn(i64, i64) -> i64 = c.get("add_i64").unwrap();
+        let shr_u32: extern "C" fn(u32) -> u32 = c.get("shr_u32").unwrap();
+        let shr_i32: extern "C" fn(i32) -> i32 = c.get("shr_i32").unwrap();
+        let ult: extern "C" fn(u32, u32) -> bool = c.get("ult").unwrap();
+        let ilt: extern "C" fn(i32, i32) -> bool = c.get("ilt").unwrap();
+        let and_u16: extern "C" fn(u16, u16) -> u16 = c.get("and_u16").unwrap();
+        assert_eq!(add_u8(200, 100), 44, "u8 wraps");
+        assert_eq!(neg_i8(5), -5);
+        assert_eq!(add_i64(1 << 40, 1 << 40), 1 << 41);
+        assert_eq!(shr_u32(0x8000_0000), 0x4000_0000, "u32 >> is logical");
+        assert_eq!(shr_i32(-2), -1, "i32 >> is arithmetic");
+        assert!(ult(1, 0xFFFF_FFFF), "u32 comparison is unsigned");
+        assert!(!ult(0xFFFF_FFFF, 1));
+        assert!(ilt(-1, 1), "i32 comparison is signed");
+        assert!(!ilt(1, -1));
+        assert_eq!(and_u16(0xFF00, 0x0FF0), 0x0F00);
+    }
+    drop(guard);
+}
+
+#[test]
+fn float_widths_and_casts() {
+    let c = build(
+        r#"
+        function half(x: f32): f32 { return x / 2; }
+        function widen(x: f32): f64 { return x as f64; }
+        function narrow(x: f64): f32 { return x as f32; }
+        function i2f(x: i32): f32 { return x as f32; }
+        function f2i(x: f64): i32 { return x as i32; }
+        function u2f(x: u32): f64 { return x as f64; }
+        function f2u(x: f64): u32 { return x as u32; }
+        function b2u(b: boolean): u32 { return b as u32; }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let half: extern "C" fn(f32) -> f32 = c.get("half").unwrap();
+        let widen: extern "C" fn(f32) -> f64 = c.get("widen").unwrap();
+        let narrow: extern "C" fn(f64) -> f32 = c.get("narrow").unwrap();
+        let i2f: extern "C" fn(i32) -> f32 = c.get("i2f").unwrap();
+        let f2i: extern "C" fn(f64) -> i32 = c.get("f2i").unwrap();
+        let u2f: extern "C" fn(u32) -> f64 = c.get("u2f").unwrap();
+        let f2u: extern "C" fn(f64) -> u32 = c.get("f2u").unwrap();
+        let b2u: extern "C" fn(bool) -> u32 = c.get("b2u").unwrap();
+        assert_eq!(half(5.0), 2.5);
+        assert_eq!(widen(1.5), 1.5);
+        assert_eq!(narrow(1.5), 1.5);
+        assert_eq!(i2f(-3), -3.0);
+        assert_eq!(f2i(1.9), 1, "float->int truncates toward zero");
+        assert_eq!(f2i(-1.9), -1);
+        assert_eq!(u2f(0xFFFF_FFFF), 4294967295.0);
+        assert_eq!(f2u(1.9), 1);
+        assert_eq!(b2u(true), 1);
+        assert_eq!(b2u(false), 0);
+    }
+    drop(guard);
+}
+
+#[test]
+fn int_width_casts_extend_and_wrap() {
+    let c = build(
+        r#"
+        function s_extend(x: i8): i64 { return x as i64; }
+        function z_extend(x: u8): i64 { return x as i64; }
+        function wrap(x: i64): i8 { return x as i8; }
+        function u32_to_i64(x: u32): i64 { return x as i64; }
+        function i32_to_u64(x: i32): u64 { return (x as i64) as u64; }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let s_extend: extern "C" fn(i8) -> i64 = c.get("s_extend").unwrap();
+        let z_extend: extern "C" fn(u8) -> i64 = c.get("z_extend").unwrap();
+        let wrap: extern "C" fn(i64) -> i8 = c.get("wrap").unwrap();
+        let u32_to_i64: extern "C" fn(u32) -> i64 = c.get("u32_to_i64").unwrap();
+        let i32_to_u64: extern "C" fn(i32) -> u64 = c.get("i32_to_u64").unwrap();
+        assert_eq!(s_extend(-1), -1, "signed widening sign-extends");
+        assert_eq!(z_extend(255), 255, "unsigned widening zero-extends");
+        assert_eq!(wrap(0x1FF), -1, "narrowing wraps");
+        assert_eq!(u32_to_i64(0xFFFF_FFFF), 4294967295);
+        assert_eq!(i32_to_u64(-1), u64::MAX, "bit-preserving round trip");
+    }
+    drop(guard);
+}
+
+#[test]
+fn entity_handles_compare_and_cast() {
+    let c = build(
+        r#"
+        function same(a: Entity, b: Entity): boolean { return a == b; }
+        function to_bits(e: Entity): u64 { return e as u64; }
+        function from_bits(b: u64): Entity { return b as Entity; }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let same: extern "C" fn(u64, u64) -> bool = c.get("same").unwrap();
+        let to_bits: extern "C" fn(u64) -> u64 = c.get("to_bits").unwrap();
+        let from_bits: extern "C" fn(u64) -> u64 = c.get("from_bits").unwrap();
+        assert!(same(7, 7));
+        assert!(!same(7, 8));
+        assert_eq!(to_bits(u64::MAX), u64::MAX);
+        assert_eq!(from_bits(42), 42);
+    }
+    drop(guard);
+    // No arithmetic on entities, and no casts to numbers.
+    for src in [
+        "function f(a: Entity, b: Entity): Entity { return a + b; }",
+        "function f(a: Entity): i32 { return a as i32; }",
+    ] {
+        errors(src);
+    }
+}
+
+#[test]
+fn float_arrays_push_index_and_sum() {
+    // Regression: float array elements cross the runtime ABI as raw words;
+    // the adapter used to only know int/bool <-> word and refused to compile.
+    let c = build(
+        r#"
+        function run(n: i32): f64 {
+            let a: f64[] = [0.5];
+            for (let i: i32 = 1; i < n; i++) { a.push(i as f64 * 0.25); }
+            let s: f64 = 0;
+            for (let j: i32 = 0; j < a.length; j++) { s += a[j]; }
+            return s;
+        }
+        "#,
+    );
+    let guard = c.enter();
+    unsafe {
+        let run: extern "C" fn(i32) -> f64 = c.get("run").unwrap();
+        let n = 100;
+        let mut want = 0.5;
+        for i in 1..n {
+            want += f64::from(i) * 0.25;
+        }
+        let got = run(n);
+        assert!((got - want).abs() < 1e-9, "got {got}, want {want}");
+    }
+    drop(guard);
+}
+
+#[test]
+fn mixed_widths_need_an_explicit_cast() {
+    let diags = errors("function f(a: i32, b: i64): i64 { return a + b; }");
+    assert!(
+        diags
+            .iter()
+            .any(|d| format!("{d:?}").contains("operand types differ")),
+        "{diags:?}"
+    );
+}
+
+#[test]
+fn integer_literals_are_range_checked() {
+    for (ty, bad) in [
+        ("u8", "256"),
+        ("i8", "128"),
+        ("u16", "65536"),
+        ("i16", "-32769"),
+        ("u32", "4294967296"),
+    ] {
+        let src = format!("function f(): {ty} {{ return {bad}; }}");
+        let diags = errors(&src);
+        assert!(
+            diags
+                .iter()
+                .any(|d| format!("{d:?}").contains("does not fit")),
+            "expected range error for {src}: {diags:?}"
+        );
+    }
+    // In-range extremes compile.
+    let c = build("function lo(): i8 { return -128; }\nfunction hi(): u8 { return 255; }");
+    let guard = c.enter();
+    unsafe {
+        let lo: extern "C" fn() -> i8 = c.get("lo").unwrap();
+        let hi: extern "C" fn() -> u8 = c.get("hi").unwrap();
+        assert_eq!(lo(), -128);
+        assert_eq!(hi(), 255);
+    }
+    drop(guard);
+}
+
+#[test]
+fn phase1_types_parse_compile_clean() {
+    let _c = build(
+        r#"
+        export function noop(x: Option<i32>, q: Query<i32>, r: Res<i32>, c: Commands): void { }
+        "#,
+    );
+}
+
+#[test]
+fn option_roundtrip() {
+    let src = r#"
+        function wrap(x: i64): Option<i64> { return some(x); }
+        function unwrapOrZero(x: Option<i64>): i64 { if (x.isSome()) { return x.unwrap(); } return 0; }
+        function empty(): Option<i64> { return none(); }
+    "#;
+    let c = build(src);
+    let guard = c.enter();
+    unsafe {
+        let wrap: extern "C" fn(i64) -> i64 = c.get("wrap").unwrap();
+        let unwrapOrZero: extern "C" fn(i64) -> i64 = c.get("unwrapOrZero").unwrap();
+        let empty: extern "C" fn() -> i64 = c.get("empty").unwrap();
+        let p = wrap(42);
+        assert_eq!(unwrapOrZero(p), 42);
+        let p = empty();
+        assert_eq!(unwrapOrZero(p), 0);
+    }
+    drop(guard);
+}
+
+#[test]
+fn option_unwrapor() {
+    let src = r#"
+        function check(): i64 {
+            let v: Option<i64> = none();
+            return v.unwrapOr(7);
+        }
+    "#;
+    let c = build(src);
+    let guard = c.enter();
+    unsafe {
+        let check: extern "C" fn() -> i64 = c.get("check").unwrap();
+        assert_eq!(check(), 7);
+    }
+    drop(guard);
+}
+
+
+#[test]
+fn for_of_arrays_sum() {
+    let src = r#"
+        function make(n: i32): i64[] {
+            let a: i64[] = [0];
+            let i: i32 = 0;
+            while (i < n) { a.push(i as i64); i += 1; }
+            return a;
+        }
+        function sum(a: i64[]): i64 {
+            let s: i64 = 0;
+            for (let v of a) { s += v; }
+            return s;
+        }
+    "#;
+    let c = build(src);
+    let guard = c.enter();
+    unsafe {
+        let make: extern "C" fn(i32) -> i64 = c.get("make").unwrap();
+        let sum: extern "C" fn(i64) -> i64 = c.get("sum").unwrap();
+        let arr = make(5);
+        assert_eq!(sum(arr), 0 + 1 + 2 + 3 + 4);
+    }
+    drop(guard);
+}
+
+#[test]
+fn for_of_arrays_mutate() {
+    let src = r#"
+        function make(n: i32): i64[] {
+            let a: i64[] = [0];
+            let i: i32 = 0;
+            while (i < n) { a.push(i as i64); i += 1; }
+            return a;
+        }
+        function bump(a: i64[]): void {
+            for (let v of a) { v += 10; }
+        }
+        function total(a: i64[]): i64 {
+            let s: i64 = 0;
+            for (let v of a) { s += v; }
+            return s;
+        }
+    "#;
+    let c = build(src);
+    let guard = c.enter();
+    unsafe {
+        let make: extern "C" fn(i32) -> i64 = c.get("make").unwrap();
+        let bump: extern "C" fn(i64) -> () = c.get("bump").unwrap();
+        let total: extern "C" fn(i64) -> i64 = c.get("total").unwrap();
+        let arr = make(3);
+        bump(arr);
+        // 0+1+2 + 10*3 = 33
+        assert_eq!(total(arr), 43);
+    }
+    drop(guard);
+}

@@ -1,0 +1,25 @@
+[package]
+name = "bms-bench"
+version = "0.1.0"
+edition = "2021"
+description = "Focused bench: native-speed ECS query vs bevy_mod_scripting-driven queries. One workload (10k rows, x += v*dt) across backends selected by cargo feature (one Lua backend per build — mlua-sys `links = \"lua\"` forbids two in one graph). Standalone workspace so its mlua 0.11 never shares a cargo graph with the workspace mlua 0.12. Run via `just bench-scripting`."
+
+[workspace]
+
+[features]
+default = ["bms-luajit"]
+bms-luajit = ["bevy_mod_scripting/luajit", "bevy_mod_scripting/bevy_ecs_bindings", "bevy_mod_scripting/core_functions"]
+bms-luau = ["bevy_mod_scripting/luau", "bevy_mod_scripting/bevy_ecs_bindings", "bevy_mod_scripting/core_functions"]
+bms-lua54 = ["bevy_mod_scripting/lua54", "bevy_mod_scripting/bevy_ecs_bindings", "bevy_mod_scripting/core_functions"]
+
+[dependencies]
+bevy_app = "0.19"
+bevy_asset = "0.19"
+bevy_diagnostic = "0.19"
+bevy_ecs = "0.19"
+bevy_log = "0.19"
+bevy_mod_scripting_world = "0.21"
+bevy_reflect = "0.19"
+bevy_time = "0.19"
+# 0.21.x tracks bevy 0.19. Backend + ecs bindings come from features above.
+bevy_mod_scripting = { version = "=0.21.0", default-features = false }

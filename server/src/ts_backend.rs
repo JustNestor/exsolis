@@ -1779,3 +1779,19 @@ fn host_field_offset_str(
         .find(|f| f.name == field)
         .map(|f| f.offset as u32)
 }
+
+#[cfg(test)]
+mod ts_mod_compile_tests {
+    use super::*;
+
+    #[test]
+    fn demo_option_compiles() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap(); // /home/nestor/prj/exsolis
+        let p = root.join("mods").join("ts").join("demo_option.ts");
+        match compile_mod(&p) {
+            Ok(_) => {}
+            Err(es) => panic!("demo_option.ts failed: {:#?}", es),
+        }
+    }
+}
