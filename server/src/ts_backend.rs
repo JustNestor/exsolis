@@ -106,6 +106,10 @@ struct PullCtx {
     /// Live chunk storage. Valid only while the tick's system holds the world;
     /// the pointer never escapes the system that installed it.
     world: *const ChunkWorld,
+    /// Underlying Bevy world, installed for the whole tick so generic host
+    /// functions can run cacheable `Query`s by *registered name* rather than
+    /// through the specialised PlayerRow path.
+    bevy_world: *const bevy_ecs::prelude::World,
     /// Packed query rows for `query_*` — a *view* of the buffer the tick system
     /// owns, so mods read and write the very memory the write-back applies.
     rows: RowsView,
@@ -238,6 +242,7 @@ impl Clone for PullCtx {
         Self {
             positions: self.positions.clone(),
             world: self.world,
+            bevy_world: self.bevy_world,
             rows: self.rows.clone(),
             components: self.components.clone(),
         }
@@ -1137,6 +1142,7 @@ pub fn ts_tick_system(world: &mut World) {
     PullCtx {
         positions: positions.clone(),
         world: world_ptr,
+        bevy_world: world as *const bevy_ecs::prelude::World,
         rows: RowsView::default(),
         components: build_component_registry(world),
     }
