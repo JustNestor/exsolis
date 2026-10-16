@@ -1,69 +1,73 @@
+<!-- Modern inventory (glass + dark) -->
 <div id="inv" modal="true" layout="column" anchor="center"
-     bg="#0008" padding="12" gap="8">
-  <div layout="column" bg="#c6c6c6" border="3" border-color="#373737"
-       padding="8" gap="8">
+     bg="#0f1220cc" padding="16" gap="10" radius="14" border="1"
+     border-color="#4a5a8a55">
+  <div layout="column" bg="#1a1f33ee" border="1" border-color="#6b7aa855"
+       padding="12" gap="10" radius="12">
     <div layout="row" align="center" justify="between" width="100%">
-      <label font-size="20" color="#404040">{{title}}</label>
-      <button id="close" on-click="inventory:close" bg="#777777"
-              hover-bg="#999999" pressed-bg="#555555" border="2"
-              border-color="#303030" padding="2 8" radius="0">
-        <label font-size="16" color="#ffffff">X</label>
+      <label font-size="20" color="#e6ecff" font-weight="bold">{{title}}</label>
+      <button id="close" on-click="inventory:close" bg="#ff4d6d"
+              hover-bg="#ff6b87" pressed-bg="#d93b59" border="0"
+              padding="4 12" radius="8">
+        <label font-size="16" color="#ffffff">✕</label>
       </button>
     </div>
 
-    <div layout="grid" cols="9" gap="4" padding="6" bg="#8b8b8b"
-         border="2" border-color="#373737">
+    <div layout="grid" cols="9" gap="6" padding="10" bg="#0f1426"
+         border="1" border-color="#4a5a8a55" radius="10">
       <div v-for="s in slots" id="slot_{{s.index}}"
            on-click="inventory:click" on-secondary-click="inventory:click"
            data="{{s.index}}"
-           bg="#555555" border="2" border-color="#373737"
-           width="40" height="40" align="center" justify="center">
+           bg="#1e2440" border="1" border-color="#3a4670"
+           width="44" height="44" align="center" justify="center" radius="8">
         <div v-if="s.item" id="item_{{s.index}}"
              on-click="inventory:click" on-secondary-click="inventory:click"
              data="{{s.index}}" z-index="10"
-             bg="{{s.item.color}}" border="2" border-color="#eeeeee"
-             width="34" height="34" align="center" justify="center">
+             bg="{{s.item.color}}" border="1" border-color="#b8c4ff88"
+             width="38" height="38" align="center" justify="center" radius="6">
           <img v-if="s.item.img" src="{{s.item.img}}" alt="?" width="30" height="30"/>
           <label font-size="11" color="#ffffff">{{s.item.short}}</label>
-          <label position="absolute" right="1" bottom="0" font-size="10" color="#ffffff">{{s.item.count}}</label>
+          <label position="absolute" right="3" bottom="1" font-size="10" color="#ffffff">{{s.item.count}}</label>
         </div>
       </div>
     </div>
 
-    <label font-size="14" color="#404040">Hotbar</label>
-    <div layout="row" gap="4" padding="6" bg="#8b8b8b"
-         border="2" border-color="#373737">
+    <label font-size="13" color="#a8b4e0">Hotbar</label>
+    <div layout="row" gap="6" padding="8" bg="#0f1426"
+         border="1" border-color="#4a5a8a55" radius="10">
       <div v-for="s in slots2" id="slot_{{s.index}}"
            on-click="inventory:click" on-secondary-click="inventory:click"
            data="{{s.index}}"
-           bg="{{s.selected_bg}}" border="2" border-color="#373737"
-           width="40" height="40" align="center" justify="center">
+           bg="{{s.selected_bg}}" border="1" border-color="#4a5a8a55"
+           width="44" height="44" align="center" justify="center" radius="8">
         <div v-if="s.item" id="item_{{s.index}}"
              on-click="inventory:click" on-secondary-click="inventory:click"
              data="{{s.index}}"
-             bg="{{s.item.color}}" border="2" border-color="#eeeeee"
-             width="34" height="34" align="center" justify="center">
+             bg="{{s.item.color}}" border="1" border-color="#b8c4ff88"
+             width="38" height="38" align="center" justify="center" radius="6">
           <img v-if="s.item.img" src="{{s.item.img}}" alt="?" width="30" height="30"/>
           <label font-size="11" color="#ffffff">{{s.item.short}}</label>
-          <label position="absolute" right="1" bottom="0" font-size="10" color="#ffffff">{{s.item.count}}</label>
+          <label position="absolute" right="3" bottom="1" font-size="10" color="#ffffff">{{s.item.count}}</label>
         </div>
       </div>
     </div>
 
-    <label font-size="14" color="#404040">Creative (scroll)</label>
-    <div layout="column" gap="2" padding="4" bg="#8b8b8b"
-         border="2" border-color="#373737" overflow="scroll" height="320">
-      <div v-for="r in creative" layout="row" gap="2">
+    <label font-size="13" color="#a8b4e0">Creative (scroll)</label>
+    <div layout="column" gap="4" padding="6" bg="#0f1426"
+         border="1" border-color="#4a5a8a55" radius="10" overflow="scroll" height="320">
+      <div v-for="r in creative" layout="row" gap="4">
         <div v-for="c in r.cells" on-click="inventory:creative"
-             data="{{c.name}}" width="44" height="44">
+             data="{{c.name}}" width="48" height="48" radius="8"
+             bg="#1e2440" align="center" justify="center">
           <img src="{{c.img}}" alt="?" width="40" height="40"/>
         </div>
       </div>
     </div>
   </div>
-  <cursor v-if="held_item" width="40" height="40" layout="column"
-          bg="{{held_item.color}}" border="2" border-color="#ffffff"
-          padding="2" align="center" justify="center">
+
+  <cursor v-if="held_item" width="44" height="44" layout="column"
+          bg="{{held_item.color}}" border="1" border-color="#ffffff"
+          padding="4" align="center" justify="center" radius="8">
     <img v-if="held_item.img" src="{{held_item.img}}" alt="?" width="34" height="34"/>
     <label font-size="11" color="#ffffff">{{held_item.short}}</label>
     <label font-size="9" color="#ffffff">{{held_item.count}}</label>
