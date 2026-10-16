@@ -47,7 +47,7 @@ use bevy_ecs::prelude::*;
 use bevy_log::{debug, error, info, warn};
 use mlua::{Lua, MultiValue, Table, Value};
 
-use exsolis_common::{BlockPos, BlockType, ClientMessage, KeybindState, PlayerId, ServerMessage};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, KeybindState, PlayerId, ServerMessage};
 use fastpack;
 
 use crate::Player;
@@ -75,6 +75,7 @@ impl Plugin for ScriptingPlugin {
                 Update,
                 (
                     reload_mods_system,
+                    publish_blocks_to_lua,
                     forward_place_block,
                     forward_break_block,
                     forward_select_hotbar,
@@ -96,6 +97,8 @@ impl Plugin for ScriptingPlugin {
                     // tuple by that alone) — pin directly to it instead.
                     .after(crate::events::dispatch_incoming)
                     .after(crate::ui::dispatch_ui_packets)
+                    .after(crate::interaction::handle_place_block)
+                    .after(crate::interaction::handle_break_block)
                     .before(run_on_tick),
             )
             .add_systems(
@@ -175,7 +178,22 @@ pub(crate) enum ScriptRequest {
     },
     SetBlock {
         pos: BlockPos,
-        block: BlockType,
+        block: BlockId,
+    },
+    /// `api.give_block(player_id, name, count)` — creative give from a
+    /// mod. The name is resolved against the frozen M0 registry at call
+    /// time (same as `set_block`); the drain step re-validates the id
+    /// against the live registry. `amount` is clamped 1..=576 (9 stacks)
+    /// at call time; whatever does not fit is dropped with a warning.
+    GiveBlock {
+        player_id: PlayerId,
+        block: BlockId,
+        amount: u16,
+    },
+    /// Stash the cursor-held stack back into the inventory (inventory
+    /// close). Dropped overflow is warned, never duplicated.
+    StashHeld {
+        player_id: PlayerId,
     },
     RegisterKeybind {
         id: String,
@@ -448,6 +466,91 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         })?,
     )?;
 
+    // --- api.blocks() : full registered block-name list ----------------
+    // Persistent (NOT tick-scoped): keybind/ui handlers run outside
+    // run_on_tick's scope, where scoped callbacks are destructed. Reads
+    // the `__block_list` global published by `publish_blocks_to_lua`.
+    api.set(
+        "blocks",
+        lua.create_function(|lua, ()| {
+            let t = lua.create_table()?;
+            let globals = lua.globals();
+            let Ok(list) = globals.get::<Table>("__block_list") else {
+                return Ok(t);
+            };
+            let mut i = 1;
+            for name in list.sequence_values::<String>().flatten() {
+                t.raw_set(i, name)?;
+                i += 1;
+            }
+            Ok(t)
+        })?,
+    )?;
+
+    // --- api.block_id(name) : numeric id or nil (via `__block_ids`) ----
+    api.set(
+        "block_id",
+        lua.create_function(|lua, name: String| {
+            let globals = lua.globals();
+            let Ok(map) = globals.get::<Table>("__block_ids") else {
+                return Ok(Value::Nil);
+            };
+            match map.get::<i32>(name) {
+                Ok(id) => Ok(Value::Integer(id as i64)),
+                Err(_) => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    // --- api.is_placeable(name) : false for items and parts ------------
+    api.set(
+        "is_placeable",
+        lua.create_function(|lua, name: String| {
+            let globals = lua.globals();
+            let Ok(set) = globals.get::<Table>("__block_unplaceable") else {
+                return Ok(true);
+            };
+            Ok(!set.contains_key(name).unwrap_or(false))
+        })?,
+    )?;
+
+    // --- api.get_inventory() : Rust-authoritative snapshot -----------------
+    // `{ slots = {{id, count, name?}...} (36, Lua 1-based), selected
+    // (0-based), held = {...}|nil }`. Written by the ui_action/select
+    // forwarders before Lua renders, so the E-screen can never drift from
+    // the HUD or placement.
+    api.set(
+        "get_inventory",
+        lua.create_function(|lua, player_id: Value| {
+            let id = match player_id {
+                Value::String(s) => s.to_str().map(|b| b.to_string()).unwrap_or_default(),
+                Value::Integer(i) => i.to_string(),
+                _ => String::new(),
+            };
+            let globals = lua.globals();
+            let Ok(cache) = globals.get::<Table>("__inv") else {
+                return Ok(Value::Nil);
+            };
+            match cache.get::<Value>(id) {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(Value::Nil),
+            }
+        })?,
+    )?;
+
+    // --- api.stash_held(player_id) : cursor stack back to storage --------
+    {
+        let outbox = outbox.clone();
+        api.set(
+            "stash_held",
+            lua.create_function(move |_, player_id: Value| {
+                let player_id = pop_player_id(&mut std::iter::once(player_id))?;
+                outbox.borrow_mut().push(ScriptRequest::StashHeld { player_id });
+                Ok(())
+            })?,
+        )?;
+    };
+
     // --- api.send(player_id, kind, ...) : queue a message to one player
     {
         let outbox = outbox.clone();
@@ -622,23 +725,61 @@ fn install_api(lua: &Lua, outbox: Rc<RefCell<Vec<ScriptRequest>>>) -> mlua::Resu
         )?;
     }
 
-    // --- api.set_block(x, y, z, block_id) : queue a world edit ---------
+    // --- api.set_block(x, y, z, name) : queue a world edit ---------
     {
         let outbox = outbox.clone();
+        // Resolved against the live `__block_ids` global (NOT the frozen
+        // registry: keybind/ui handlers run outside the tick scope and the
+        // registry holds 1200+ names). The drain re-validates the id.
         api.set(
             "set_block",
-            lua.create_function(move |_, (x, y, z, block_id): (i32, i32, i32, u8)| {
-                let Some(block) = BlockType::from_u8(block_id) else {
-                    return Err(mlua::Error::RuntimeError(format!(
-                        "set_block: invalid block id {block_id}"
-                    )));
-                };
+            lua.create_function(move |lua, (x, y, z, name): (i32, i32, i32, String)| {
+                let block: i32 = lua
+                    .globals()
+                    .get::<Table>("__block_ids")
+                    .ok()
+                    .and_then(|map| map.get(name.clone()).ok())
+                    .ok_or_else(|| {
+                        mlua::Error::RuntimeError(format!("set_block: unknown block '{name}'"))
+                    })?;
                 outbox.borrow_mut().push(ScriptRequest::SetBlock {
                     pos: BlockPos::new(x, y, z),
-                    block,
+                    block: block as u16,
                 });
                 Ok(())
             })?,
+        )?;
+    }
+
+    // --- api.give_block(player_id, name, count?) : queue a creative give --
+    {
+        let outbox = outbox.clone();
+        // Same live-global resolution as `set_block` above.
+        api.set(
+            "give_block",
+            lua.create_function(
+                move |lua, (player_id, name, count): (Value, String, Option<i64>)| {
+                    let player_id =
+                        pop_player_id(&mut std::iter::once(player_id))?;
+                    let block: i32 = lua
+                        .globals()
+                        .get::<Table>("__block_ids")
+                        .ok()
+                        .and_then(|map| map.get(name.clone()).ok())
+                        .ok_or_else(|| {
+                            mlua::Error::RuntimeError(format!(
+                                "give_block: unknown block '{name}'"
+                            ))
+                        })?;
+                    let amount = count.unwrap_or(64).clamp(1, 64 * 9) as u16;
+                    outbox.borrow_mut().push(ScriptRequest::GiveBlock {
+                        player_id,
+                        block: block as u16,
+                        amount,
+                    });
+                    Ok(())
+                },
+            )?,
         )?;
     }
 
@@ -898,6 +1039,11 @@ pub(crate) fn world_to_chunk_index(pos: BlockPos) -> (exsolis_common::ChunkCoord
 fn forward_place_block(
     mut events: MessageReader<PlaceBlockRequested>,
     runtime: NonSend<ScriptRuntime>,
+    player_map: Res<crate::PlayerMap>,
+    inventories: Query<&crate::Inventory>,
+    positions: Query<&crate::chunks::PlayerPosition>,
+    looks: Query<&crate::movement::PlayerLook>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -907,14 +1053,33 @@ fn forward_place_block(
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
-        let _ = t.set("block_id", ev.kind as u8);
+        // Name the concrete placed part (stairs facing, slab half…), not
+        // the client guess: same resolution as placement.
+        let placed = player_map
+            .playerid_to_entity
+            .get(&ev.player_id)
+            .and_then(|e| blocks.id(&ev.kind).map(|id| (e, id)))
+            .map(|(entity, master)| {
+                let yaw = looks.get(*entity).map(|l| l.yaw).unwrap_or(0.0);
+                let eye = positions.get(*entity).map(|p| p.0.y + 1.62).unwrap_or(0.0);
+                crate::interaction::resolve_placement(&blocks, master, ev.face, yaw, eye, ev.pos.y)
+            })
+            .and_then(|id| blocks.name(id).map(|s| s.to_string()))
+            .unwrap_or_else(|| ev.kind.clone());
+        let block_id = blocks.id(&placed).map(|id| id as i32).unwrap_or(-1);
+        let _ = t.set("block_id", block_id);
+        let _ = t.set("block", placed);
+        write_inv_snapshot(&runtime, ev.player_id, &player_map, &inventories, &blocks);
         runtime.dispatch("place_block", t);
     }
 }
 
 fn forward_break_block(
-    mut events: MessageReader<BreakBlockRequested>,
+    mut events: MessageReader<crate::interaction::BreakBlockApplied>,
     runtime: NonSend<ScriptRuntime>,
+    player_map: Res<crate::PlayerMap>,
+    inventories: Query<&crate::Inventory>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -924,6 +1089,14 @@ fn forward_break_block(
         let _ = t.set("x", ev.pos.x);
         let _ = t.set("y", ev.pos.y);
         let _ = t.set("z", ev.pos.z);
+        // Enriched at the break site (the request only carries pos, and by
+        // the time any forwarder runs the cell is already air).
+        let _ = t.set("block_id", ev.block as i32);
+        let _ = t.set(
+            "block",
+            blocks.name(ev.block).unwrap_or("exsolis:air").to_string(),
+        );
+        write_inv_snapshot(&runtime, ev.player_id, &player_map, &inventories, &blocks);
         runtime.dispatch("break_block", t);
     }
 }
@@ -931,6 +1104,9 @@ fn forward_break_block(
 fn forward_select_hotbar(
     mut events: MessageReader<SelectHotbarRequested>,
     runtime: NonSend<ScriptRuntime>,
+    player_map: Res<crate::PlayerMap>,
+    inventories: Query<&crate::Inventory>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -938,6 +1114,7 @@ fn forward_select_hotbar(
         };
         let _ = t.set("player_id", player_id_to_lua(ev.player_id));
         let _ = t.set("index", ev.index);
+        write_inv_snapshot(&runtime, ev.player_id, &player_map, &inventories, &blocks);
         runtime.dispatch("select_hotbar", t);
     }
 }
@@ -948,9 +1125,12 @@ fn forward_select_hotbar(
 /// `ev.data` is `nil` when the widget had no `data` attribute — Lua's
 /// natural way to spell "absent", so no separate `has_data` flag is
 /// needed the way a fixed-shape wire struct might want one.
-fn forward_ui_action(
+pub(crate) fn forward_ui_action(
     mut events: MessageReader<UiActionRequested>,
     runtime: NonSend<ScriptRuntime>,
+    player_map: Res<crate::PlayerMap>,
+    inventories: Query<&crate::Inventory>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
         let Ok(t) = runtime.lua.create_table() else {
@@ -961,7 +1141,70 @@ fn forward_ui_action(
         let _ = t.set("element_id", ev.element_id.as_str());
         let _ = t.set("action", ev.action.as_str());
         let _ = t.set("data", ev.data.as_deref());
+        // The Lua inventory screen renders Rust state: refresh the snapshot
+        // first so clicks applied this tick (apply_inventory_clicks runs
+        // before this) are already visible.
+        if ev.ui_id == "inv" {
+            write_inv_snapshot(&runtime, ev.player_id, &player_map, &inventories, &blocks);
+        }
         runtime.dispatch("ui_action", t);
+    }
+}
+
+/// Snapshot one player's full inventory into `__inv[player_id]` for
+/// `api.get_inventory()`: 36 `{id, count}` slots (Lua 1-based), selected
+/// index (0-based, matching existing Lua code) and the cursor-held stack.
+pub(crate) fn write_inv_snapshot(
+    runtime: &ScriptRuntime,
+    player_id: PlayerId,
+    player_map: &crate::PlayerMap,
+    inventories: &Query<&crate::Inventory>,
+    blocks: &crate::blocks::ServerBlocks,
+) {
+    let snapshot = (|| -> mlua::Result<mlua::Table> {
+        let lua = &runtime.lua;
+        let t = lua.create_table()?;
+        let slots = lua.create_table()?;
+        let mut selected = 0;
+        if let Some(&entity) = player_map.playerid_to_entity.get(&player_id)
+            && let Ok(inv) = inventories.get(entity)
+        {
+            for (i, slot) in inv.0.slots().iter().enumerate() {
+                if let Some(s) = slot {
+                    let entry = lua.create_table()?;
+                    entry.set("id", s.item as i32)?;
+                    entry.set("count", s.amount as i32)?;
+                    if let Some(def) = blocks.0.def(s.item) {
+                        entry.set("name", def.name.clone())?;
+                    }
+                    slots.raw_set(i + 1, entry)?;
+                }
+            }
+            selected = inv.0.selected_index() as i32;
+            if let Some(held) = inv.0.held() {
+                let h = lua.create_table()?;
+                h.set("id", held.item as i32)?;
+                h.set("count", held.amount as i32)?;
+                if let Some(def) = blocks.0.def(held.item) {
+                    h.set("name", def.name.clone())?;
+                }
+                t.set("held", h)?;
+            }
+        }
+        t.set("slots", slots)?;
+        t.set("selected", selected)?;
+        Ok(t)
+    })();
+    match snapshot {
+        Ok(t) => {
+            let globals = runtime.lua.globals();
+            let cache: mlua::Table = globals
+                .get("__inv")
+                .unwrap_or_else(|_| runtime.lua.create_table().expect("fresh table"));
+            let _ = cache.set(player_id_to_lua(player_id), t);
+            let _ = globals.set("__inv", cache);
+        }
+        Err(e) => warn!("scripting: inventory snapshot failed: {e}"),
     }
 }
 
@@ -1039,6 +1282,7 @@ fn run_on_tick(
     positions: Query<(&Player, &PlayerPosition)>,
     world: Res<ChunkWorld>,
     registry: Res<crate::entities::EntityRegistry>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     let positions: HashMap<PlayerId, (f32, f32, f32)> = positions
         .iter()
@@ -1084,10 +1328,13 @@ fn run_on_tick(
                 .get(&coord)
                 .and_then(|c| c.unpack())
                 .and_then(|u| u.get(idx).copied())
-                .unwrap_or(BlockType::Air);
-            Ok(block as u8)
+                .unwrap_or(AIR_ID);
+            Ok(blocks.name(block).unwrap_or("exsolis:air").to_string())
         })?;
         api.set("get_block", get_block)?;
+
+        // NOTE: no api.blocks here — the persistent versions live in
+        // install_api (keybind/ui handlers run outside this scope).
 
         // The entity id of the block entity at a position, or nil. Same
         // string-id caveat as every other id crossing into Lua.
@@ -1150,6 +1397,9 @@ pub(crate) fn drain_script_requests(
     despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: Res<crate::blocks::ServerBlocks>,
+    player_map: Res<crate::PlayerMap>,
+    mut inventories: Query<&mut crate::Inventory>,
 ) {
     apply_script_requests(
         runtime.take_requests(),
@@ -1160,6 +1410,9 @@ pub(crate) fn drain_script_requests(
         despawns,
         outgoing,
         loaded_by,
+        &blocks,
+        &player_map,
+        &mut inventories,
     );
 }
 
@@ -1178,6 +1431,9 @@ pub(crate) fn apply_script_requests(
     mut despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     loaded_by: Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: &crate::blocks::ServerBlocks,
+    player_map: &crate::PlayerMap,
+    inventories: &mut Query<&mut crate::Inventory>,
 ) {
     for req in requests {
         match req {
@@ -1228,7 +1484,59 @@ pub(crate) fn apply_script_requests(
                 }));
             }
             ScriptRequest::SetBlock { pos, block } => {
-                set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by);
+                if blocks.0.def(block).is_none() {
+                    warn!("scripting: api.set_block: unknown block id {block}");
+                    continue;
+                }
+                set_block_and_broadcast(pos, block, &mut world, &mut outgoing, &loaded_by, blocks);
+            }
+            ScriptRequest::GiveBlock {
+                player_id,
+                block,
+                amount,
+            } => {
+                if blocks.0.def(block).is_none() {
+                    warn!("scripting: api.give_block: unknown block id {block}");
+                    continue;
+                }
+                let Some(&entity) = player_map.playerid_to_entity.get(&player_id) else {
+                    warn!("scripting: api.give_block: unknown player {player_id}");
+                    continue;
+                };
+                let Ok(mut inventory) = inventories.get_mut(entity) else {
+                    warn!("scripting: api.give_block: player {player_id} has no inventory");
+                    continue;
+                };
+                let mut remaining = amount;
+                while remaining > 0 {
+                    let chunk =
+                        remaining.min(exsolis_common::inventory::MAX_STACK as u16) as u8;
+                    let fitted = chunk - inventory.add_item(block, chunk);
+                    remaining -= fitted as u16;
+                    if fitted < chunk {
+                        warn!(
+                            "scripting: api.give_block: {remaining} of block {block} did not fit in player {player_id} inventory — dropped"
+                        );
+                        break;
+                    }
+                }
+                info!("scripting: api.give_block: player {player_id} given block {block} x{amount}");
+                let inv = inventory.clone();
+                crate::creative::send_inventory_sync(player_id, &inv, blocks, &mut outgoing);
+            }
+            ScriptRequest::StashHeld { player_id } => {
+                let Some(&entity) = player_map.playerid_to_entity.get(&player_id) else {
+                    continue;
+                };
+                let Ok(mut inventory) = inventories.get_mut(entity) else {
+                    continue;
+                };
+                let dropped = inventory.stash_held();
+                if dropped > 0 {
+                    warn!("scripting: stash_held: {dropped} items did not fit, dropped");
+                }
+                let inv = inventory.clone();
+                crate::creative::send_inventory_sync(player_id, &inv, blocks, &mut outgoing);
             }
             ScriptRequest::SpawnEntity {
                 kind,
@@ -1256,10 +1564,13 @@ pub(crate) fn apply_script_requests(
                 let mut extra = crate::entities::SpawnExtra::None;
                 let mut block_pos = None;
                 if kind == exsolis_common::EntityKind::Block {
+                    let chest = blocks
+                        .id("exsolis:chest")
+                        .unwrap_or(exsolis_common::legacy_ids::CHEST as BlockId);
                     let block = block_pos_from_state(kind, x, y, z)
                         .map(|p| block_at(&world, p))
-                        .unwrap_or(BlockType::Chest);
-                    if !crate::entities::is_block_entity(block) {
+                        .unwrap_or(chest);
+                    if !crate::entities::is_block_entity(block, &blocks.0) {
                         warn!(
                             "scripting: api.spawn_entity: {:?} is not a block entity",
                             block
@@ -1367,15 +1678,15 @@ fn block_pos_from_state(
         .then(|| BlockPos::new(x.floor() as i32, y.floor() as i32, z.floor() as i32))
 }
 
-/// The block currently at `pos`, or `Air`.
-fn block_at(world: &ChunkWorld, pos: BlockPos) -> BlockType {
+/// The block currently at `pos`, or air.
+fn block_at(world: &ChunkWorld, pos: BlockPos) -> BlockId {
     let (coord, idx) = world_to_chunk_index(pos);
     world
         .ready
         .get(&coord)
         .and_then(|c| c.unpack())
         .map(|blocks| blocks[idx])
-        .unwrap_or(BlockType::Air)
+        .unwrap_or(AIR_ID)
 }
 
 const MOD_ACTION_MAX_DEPTH: usize = 8;
@@ -1511,10 +1822,11 @@ fn build_server_message(kind: &str, args: &[LuaScalar]) -> Result<ServerMessage,
 /// threading unused params through one side or the other.
 fn set_block_and_broadcast(
     pos: BlockPos,
-    block: BlockType,
+    block: BlockId,
     world: &mut ChunkWorld,
     outgoing: &mut MessageWriter<OutgoingPacket>,
     loaded_by: &Query<(&Player, &crate::chunks::ChunkRenderState)>,
+    blocks: &crate::blocks::ServerBlocks,
 ) {
     let (coord, idx) = world_to_chunk_index(pos);
 
@@ -1528,11 +1840,12 @@ fn set_block_and_broadcast(
     };
     world.ready.insert(coord, updated);
 
+    let kind = blocks.name(block).unwrap_or("exsolis:air").to_string();
     for (player, state) in loaded_by {
         if state.loaded.contains(&coord) {
             outgoing.write(OutgoingPacket::to(
                 player.0,
-                ServerMessage::BlockUpdate { pos, kind: block },
+                ServerMessage::BlockUpdate { pos, kind: kind.clone() },
             ));
         }
     }
@@ -1540,6 +1853,61 @@ fn set_block_and_broadcast(
 
 fn reload_mods_system(runtime: NonSend<ScriptRuntime>) {
     runtime.check_and_reload_mods();
+}
+
+/// Publish the block registry into Lua globals (`__block_list` array +
+/// `__block_ids` name->id map) that the persistent `api.blocks()` /
+/// `api.block_id()` read. Republished only when the registry size changes
+/// (startup + mod reloads that register blocks).
+fn publish_blocks_to_lua(
+    runtime: NonSend<ScriptRuntime>,
+    blocks: Res<crate::blocks::ServerBlocks>,
+    mut last_len: Local<usize>,
+) {
+    if *last_len == blocks.0.len() {
+        return;
+    }
+    *last_len = blocks.0.len();
+    let result = (|| -> mlua::Result<()> {
+        let lua = &runtime.lua;
+        // Creative-visible only: hidden multiblock parts stay out (placed
+        // through their master). `__block_ids` keeps every id (Lua mirrors
+        // parts too when they break).
+        let mut names: Vec<&str> = blocks
+            .0
+            .iter()
+            .filter(|(_, d)| !d.hidden)
+            .map(|(_, d)| d.name.as_str())
+            .collect();
+        names.sort();
+        let list = lua.create_table()?;
+        let ids = lua.create_table()?;
+        for (i, name) in names.iter().enumerate() {
+            list.raw_set(i + 1, *name)?;
+            if let Some(id) = blocks.id(name) {
+                ids.raw_set(*name, id as i32)?;
+            }
+        }
+        lua.globals().set("__block_list", list)?;
+        lua.globals().set("__block_ids", ids)?;
+        // Unplaceable set (items + parts) for icon selection (`item#`).
+        let unplaceable = lua.create_table()?;
+        for (id, def) in blocks.0.iter() {
+            if !def.placeable {
+                unplaceable.set(def.name.clone(), true)?;
+                let _ = id;
+            }
+        }
+        lua.globals().set("__block_unplaceable", unplaceable)?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => info!(
+            "scripting: published {} blocks to Lua globals",
+            blocks.0.len()
+        ),
+        Err(e) => warn!("scripting: block publish failed: {e}"),
+    }
 }
 
 #[cfg(test)]

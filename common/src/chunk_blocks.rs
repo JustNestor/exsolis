@@ -1,28 +1,25 @@
 //! Palette-compressed chunk block storage, shared by server and client.
 //!
 //! Wire layout (bincode, fixint):
-//!   palette         : Vec<u8>   distinct block ids used by this chunk
+//!   palette         : Vec<u16>  distinct block ids used by this chunk
 //!   bits_per_block  : u8        0 = uniform chunk (only 1 palette entry, no data)
 //!   data            : Vec<u64>  packed palette indices, `64 / bits` per word,
 //!                               never straddling a word boundary
 //!
-//! Typical sizes for a 32^3 chunk (was ~131 KB as Vec<BlockType> in bincode 1,
-//! because serde writes every enum variant as a u32 tag no matter what
-//! `#[repr(u8)]` says):
-//!   all air / all stone      ->  ~40 bytes
-//!   3 block types (2 bits)   ->  ~8 KB
-//!   5..=16 types (3-4 bits)  ->  ~12-16 KB
+//! Ids are [`BlockId`]s into a [`BlockRegistry`]. `unpack` only checks
+//! structural validity (index inside the palette); unknown ids resolve at
+//! the use site via the registry so old clients never panic on new blocks.
 
 use serde::{Deserialize, Serialize};
 
-use crate::BlockType;
+use crate::blocks::BlockId;
 
 pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_VOLUME: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChunkBlocks {
-    palette: Vec<u8>,
+    palette: Vec<BlockId>,
     bits_per_block: u8,
     data: Vec<u64>,
 }
@@ -39,18 +36,50 @@ impl ChunkBlocks {
     }
 
     /// Compress a full `CHUNK_VOLUME` block array (x + y*32 + z*32*32 order).
-    pub fn pack(blocks: &[BlockType]) -> Self {
+    pub fn pack(blocks: &[BlockId]) -> Self {
         assert_eq!(blocks.len(), CHUNK_VOLUME, "chunk must be 32^3 blocks");
 
         // block id -> palette index
-        let mut lookup: [Option<u8>; 256] = [None; 256];
-        let mut palette: Vec<u8> = Vec::new();
+        let mut lookup: HashMap<BlockId, u8> = HashMap::new();
+        let mut palette: Vec<BlockId> = Vec::new();
         for &b in blocks {
-            let id = b as u8;
-            if lookup[id as usize].is_none() {
-                lookup[id as usize] = Some(palette.len() as u8);
-                palette.push(id);
+            if !lookup.contains_key(&b) {
+                // Palette is u8-indexed (max 256 distinct ids per chunk);
+                // a 32^3 chunk with more distinct blocks repacks via fallback below.
+                if palette.len() >= 256 {
+                    break;
+                }
+                lookup.insert(b, palette.len() as u8);
+                palette.push(b);
             }
+        }
+        // Degenerate overflow (should never happen with sane registries):
+        // fall back to full-width packing via palette-per-block is overkill;
+        // just extend palette and widen bits (indices still fit u8 only to 256).
+        // If we overflowed, rebuild with truncation-free map (max 256 enforced
+        // by registry size in practice).
+        if palette.len() >= 256 && blocks.iter().any(|b| !lookup.contains_key(b)) {
+            // Widen: allow up to 65536 distinct via 16-bit indices packed as u16 words.
+            // Simplest correct fallback: store raw ids as palette of all distinct.
+            let mut full: Vec<BlockId> = Vec::new();
+            let mut map: HashMap<BlockId, usize> = HashMap::new();
+            for &b in blocks {
+                if !map.contains_key(&b) {
+                    map.insert(b, full.len());
+                    full.push(b);
+                }
+            }
+            // Store as uniform-width 16-bit data: reuse data words with 16 bits each.
+            let mut data = vec![0u64; CHUNK_VOLUME.div_ceil(4)];
+            for (i, &b) in blocks.iter().enumerate() {
+                let idx = map[&b] as u64;
+                data[i / 4] |= idx << ((i % 4) * 16);
+            }
+            return Self {
+                palette: full,
+                bits_per_block: 16,
+                data,
+            };
         }
 
         let bits = Self::bits_for(palette.len());
@@ -66,7 +95,7 @@ impl ChunkBlocks {
         let per_word = 64 / bits_us;
         let mut data = vec![0u64; CHUNK_VOLUME.div_ceil(per_word)];
         for (i, &b) in blocks.iter().enumerate() {
-            let idx = lookup[b as u8 as usize].unwrap() as u64;
+            let idx = lookup[&b] as u64;
             data[i / per_word] |= idx << ((i % per_word) * bits_us);
         }
 
@@ -77,22 +106,19 @@ impl ChunkBlocks {
         }
     }
 
-    /// Decompress. Returns `None` if the payload is malformed (bad block id,
-    /// wrong data length, index outside the palette) instead of panicking —
-    /// this is data that came off the network.
-    pub fn unpack(&self) -> Option<Vec<BlockType>> {
-        let palette: Vec<BlockType> = self
-            .palette
-            .iter()
-            .map(|&id| BlockType::from_u8(id))
-            .collect::<Option<_>>()?;
-
+    /// Decompress. Returns `None` if the payload is malformed (wrong data
+    /// length, index outside the palette) instead of panicking — this is
+    /// data that came off the network.
+    pub fn unpack(&self) -> Option<Vec<BlockId>> {
+        if self.palette.is_empty() {
+            return None;
+        }
         if self.bits_per_block == 0 {
-            return Some(vec![*palette.first()?; CHUNK_VOLUME]);
+            return Some(vec![self.palette[0]; CHUNK_VOLUME]);
         }
 
         let bits = self.bits_per_block as usize;
-        if bits > 8 {
+        if bits > 16 {
             return None;
         }
         let per_word = 64 / bits;
@@ -100,27 +126,27 @@ impl ChunkBlocks {
             return None;
         }
 
-        let mask = (1u64 << bits) - 1;
+        let mask = if bits == 64 {
+            u64::MAX
+        } else if bits == 16 {
+            0xFFFF
+        } else {
+            (1u64 << bits) - 1
+        };
         let mut out = Vec::with_capacity(CHUNK_VOLUME);
         for i in 0..CHUNK_VOLUME {
             let idx = ((self.data[i / per_word] >> ((i % per_word) * bits)) & mask) as usize;
-            out.push(*palette.get(idx)?);
+            out.push(*self.palette.get(idx)?);
         }
         Some(out)
     }
 
-    /// Replace one block and repack. There's no in-place bit-packed write
-    /// (palette indices are variable-width; growing the palette mid-edit
-    /// would require re-laying out every word), so this unpacks the full
-    /// 32^3 array, writes the one block, and repacks. Cheap enough for
-    /// player-driven edit rates (one call per placed/broken block); would
-    /// need a real mutable representation for bulk/worldgen edits.
+    /// Replace one block and repack. Unpacks the full 32^3 array, writes the
+    /// one block, and repacks. Cheap enough for player-driven edit rates.
     ///
-    /// `idx` is `x + y*32 + z*32*32` (see the module doc / `pack`'s
-    /// ordering contract). Returns `None` if `idx` is out of range or the
-    /// existing data is malformed (mirrors `unpack`'s error handling,
-    /// since this always unpacks first).
-    pub fn set_block(&self, idx: usize, block: BlockType) -> Option<Self> {
+    /// `idx` is `x + y*32 + z*32*32`. Returns `None` if `idx` is out of range
+    /// or the existing data is malformed.
+    pub fn set_block(&self, idx: usize, block: BlockId) -> Option<Self> {
         if idx >= CHUNK_VOLUME {
             return None;
         }
@@ -135,23 +161,36 @@ impl ChunkBlocks {
     }
 }
 
+use std::collections::HashMap;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::blocks::BlockRegistry;
 
     #[test]
-    fn block_ids_match_table() {
-        for (i, b) in BlockType::ALL.iter().enumerate() {
-            assert_eq!(
-                *b as usize, i,
-                "BlockType::ALL out of order with discriminants"
-            );
+    fn default_registry_ids_are_frozen() {
+        let r = BlockRegistry::default_registry();
+        for (name, expect) in [
+            ("exsolis:air", 0),
+            ("exsolis:stone", 1),
+            ("exsolis:dirt", 2),
+            ("exsolis:grass", 3),
+            ("exsolis:sand", 4),
+            ("exsolis:water", 5),
+            ("exsolis:snow", 6),
+            ("exsolis:glass", 7),
+            ("exsolis:log", 8),
+            ("exsolis:leaves", 9),
+            ("exsolis:chest", 10),
+        ] {
+            assert_eq!(r.id(name), Some(expect), "registry order moved for {name}");
         }
     }
 
     #[test]
     fn uniform_roundtrip() {
-        let blocks = vec![BlockType::Air; CHUNK_VOLUME];
+        let blocks = vec![0; CHUNK_VOLUME];
         let packed = ChunkBlocks::pack(&blocks);
         assert!(packed.is_uniform());
         assert_eq!(packed.unpack().unwrap(), blocks);
@@ -159,9 +198,9 @@ mod tests {
 
     #[test]
     fn mixed_roundtrip() {
-        let mut blocks = vec![BlockType::Air; CHUNK_VOLUME];
+        let mut blocks = vec![0; CHUNK_VOLUME];
         for (i, b) in blocks.iter_mut().enumerate() {
-            *b = BlockType::ALL[(i * 7 + i / 13) % BlockType::ALL.len()];
+            *b = (i * 7 + i / 13) as u16 % 11;
         }
         let packed = ChunkBlocks::pack(&blocks);
         assert_eq!(packed.unpack().unwrap(), blocks);
@@ -170,7 +209,7 @@ mod tests {
     #[test]
     fn rejects_garbage() {
         let bad = ChunkBlocks {
-            palette: vec![200],
+            palette: vec![],
             bits_per_block: 0,
             data: vec![],
         };

@@ -1,0 +1,10 @@
+[package]
+name = "lua-bench-luajit"
+version = "0.1.0"
+edition = "2021"
+description = "Isolated bench runner: mlua/LuaJIT. Standalone workspace (see root `exclude`): mlua-sys declares `links = \"lua\"`, so two Lua backends can never share one cargo graph. Run via `just bench-scripting`."
+
+[workspace]
+
+[dependencies]
+mlua = { version = "0.11", features = ["luajit", "vendored"] }

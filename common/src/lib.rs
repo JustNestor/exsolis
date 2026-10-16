@@ -1,14 +1,19 @@
 use serde::{Deserialize, Serialize};
 
+pub mod blocks;
 mod chunk_blocks;
 pub mod inventory;
 
+pub use blocks::{
+    AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart,
+    is_air_like_name, mc_item_template, orientation_parts, placement_pick,
+};
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
 /// Bumped to 3 for the entity messages (`SpawnEntity`, `DespawnEntity`,
 /// `EntityStateUpdate`). `EntityKind` gained variants, so an old client's
 /// decode of a new server's stream would desync rather than fail cleanly.
-pub const PROTOCOL_ID: u64 = 3;
+pub const PROTOCOL_ID: u64 = 6;
 pub const SERVER_ADDR: &str = "127.0.0.1:5000";
 pub const TICK_RATE: f32 = 20.0;
 
@@ -55,52 +60,20 @@ impl BlockPos {
 /// `#[repr(u8)]` + explicit discriminants: the numeric id is what goes into
 /// `ChunkBlocks` palettes on the wire. Never reorder/renumber existing
 /// variants without bumping the protocol; append new ones and extend `ALL`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
-pub enum BlockType {
-    Air = 0,
-    Stone = 1,
-    Dirt = 2,
-    Grass = 3,
-    Sand = 4,
-    Water = 5,
-    Snow = 6,
-    Glass = 7,
-    Log = 8,
-    Leaves = 9,
-    /// Carries a `Container`. Placing one creates a block entity; breaking it
-    /// despawns that entity and spills its slots.
-    Chest = 10,
-}
-
-impl BlockType {
-    /// Every variant, indexed by its `u8` discriminant (checked by a test in
-    /// chunk_blocks.rs).
-    pub const ALL: [BlockType; 11] = [
-        BlockType::Air,
-        BlockType::Stone,
-        BlockType::Dirt,
-        BlockType::Grass,
-        BlockType::Sand,
-        BlockType::Water,
-        BlockType::Snow,
-        BlockType::Glass,
-        BlockType::Log,
-        BlockType::Leaves,
-        BlockType::Chest,
-    ];
-
-    pub fn from_u8(id: u8) -> Option<Self> {
-        Self::ALL.get(id as usize).copied()
-    }
-
-    pub fn is_air(self) -> bool {
-        matches!(self, BlockType::Air)
-    }
-
-    pub fn is_solid(self) -> bool {
-        !matches!(self, BlockType::Air | BlockType::Water)
-    }
+/// Legacy numeric ids for the 11 built-in blocks (frozen for compat).
+/// New code should use `BlockRegistry` names (`"exsolis:stone"`) instead.
+pub mod legacy_ids {
+    pub const AIR: u8 = 0;
+    pub const STONE: u8 = 1;
+    pub const DIRT: u8 = 2;
+    pub const GRASS: u8 = 3;
+    pub const SAND: u8 = 4;
+    pub const WATER: u8 = 5;
+    pub const SNOW: u8 = 6;
+    pub const GLASS: u8 = 7;
+    pub const LOG: u8 = 8;
+    pub const LEAVES: u8 = 9;
+    pub const CHEST: u8 = 10;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,7 +169,11 @@ pub enum ClientMessage {
     },
     PlaceBlock {
         pos: BlockPos,
-        kind: BlockType,
+        kind: String,
+        /// Clicked face of the targeted block (placement cell minus target
+        /// cell), for view-dependent blocks (stairs facing, slab halves,
+        /// pillar axes, wall torches). Appended for wire compatibility.
+        face: Face,
     },
     BreakBlock {
         pos: BlockPos,
@@ -243,6 +220,12 @@ pub enum ClientMessage {
     AssetLoadComplete {
         paths: Vec<String>,
     },
+    /// Creative-tab request: give one stack of a registered block.
+    /// The server validates the name and decides the slot; the client's
+    /// inventory is updated via `InventorySync`. Appended last.
+    CreativeGive {
+        name: String,
+    },
 }
 
 #[non_exhaustive]
@@ -267,7 +250,7 @@ pub enum ServerMessage {
     },
     BlockUpdate {
         pos: BlockPos,
-        kind: BlockType,
+        kind: String,
     },
     /// Authoritative position of the receiving player themself. Sent on the
     /// unreliable channel whenever it changes (and repeated a few ticks
@@ -366,6 +349,19 @@ pub enum ServerMessage {
         entity_id: EntityId,
         state: EntityState,
     },
+    /// Full sorted block-name list for the creative tab. Sent once per join
+    /// (reliable). The client renders `block#<name>` icons from it.
+    /// Appended last so existing variant indices don't shift.
+    BlockList {
+        blocks: Vec<String>,
+    },
+    /// Authoritative hotbar contents: `(block name, count)` per slot plus
+    /// the selected index. Sent on join and after every change (give, place,
+    /// break, select). The client renders exactly this. Appended last.
+    InventorySync {
+        slots: Vec<Option<(String, u8)>>,
+        selected: u8,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,8 +374,9 @@ pub const HOTBAR_SIZE: usize = 9;
 
 // ---- SDUI limits, shared so server-side validation matches the client ----
 
-/// Max size of one `UiShow.xml` payload.
-pub const UI_MAX_XML_BYTES: usize = 64 * 1024;
+/// Max size of one `UiShow.xml` payload. Sized for the Lua creative tab
+/// (~1200 `block#` cells in rows); reliable-ordered, sent on open only.
+pub const UI_MAX_XML_BYTES: usize = 512 * 1024;
 /// Max length of `ui_id` / `element_id`.
 pub const UI_MAX_ID_LEN: usize = 64;
 /// Max length of `UiAction.action` and `UiAction.data`.

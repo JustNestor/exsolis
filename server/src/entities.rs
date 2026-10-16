@@ -21,8 +21,8 @@ use glam::Vec3;
 use crate::net::{GameplaySet, OutgoingPacket};
 
 use exsolis_common::{
-    BlockPos, BlockType, EntityId, EntityKind, EntityState, MODEL_PATH_MAX_LEN, PlayerId,
-    ServerMessage,
+    BlockId, BlockPos, BlockRegistry, EntityId, EntityKind, EntityState, MODEL_PATH_MAX_LEN,
+    PlayerId, ServerMessage,
 };
 
 /// Model path used for every player avatar, and the scale that makes it the
@@ -59,14 +59,13 @@ pub struct EntityTransform(pub EntityState);
 #[derive(Component, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlockEntity {
     pub pos: BlockPos,
-    pub block: BlockType,
+    pub block: BlockId,
 }
 
-/// A block type whose placed form owns an entity. Kept as a function rather
-/// than a table so adding a container block is a one-line change here plus a
-/// variant, not a data file the type DB and the entity system can drift on.
-pub fn is_block_entity(block: BlockType) -> bool {
-    matches!(block, BlockType::Chest)
+/// A block type whose placed form owns an entity. Resolved through the
+/// registry so mod-registered container blocks work the same way.
+pub fn is_block_entity(block: BlockId, registry: &BlockRegistry) -> bool {
+    registry.is_block_entity(block)
 }
 
 /// One live entity.
@@ -178,7 +177,7 @@ pub struct SpawnEntityRequest {
 pub enum SpawnExtra {
     None,
     Player,
-    BlockEntity(BlockType),
+    BlockEntity(BlockId),
 }
 
 #[derive(Message, Debug, Clone, Copy)]
@@ -218,6 +217,7 @@ pub fn spawn_requested(
     mut player_map: ResMut<crate::PlayerMap>,
     mut commands: Commands,
     mut outgoing: MessageWriter<OutgoingPacket>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for req in requests.read() {
         let Some(id) = registry.allocate() else {
@@ -258,7 +258,7 @@ pub fn spawn_requested(
                 player_map.playerid_to_entity.insert(token, entity);
                 player_map.entity_to_playerid.insert(entity, token);
             }
-            crate::events::attach_player_components(&mut commands, entity);
+            crate::events::attach_player_components(&mut commands, entity, &blocks.0);
         }
 
         registry.records.insert(
@@ -292,7 +292,7 @@ impl SpawnExtra {
         matches!(self, SpawnExtra::Player)
     }
 
-    fn block(self) -> Option<BlockType> {
+    fn block(self) -> Option<BlockId> {
         match self {
             SpawnExtra::BlockEntity(block) => Some(block),
             _ => None,

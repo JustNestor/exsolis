@@ -104,8 +104,8 @@ worldgen = {
 
     -- Surface blocks and water level
     surface = {
-        -- Block IDs (see exsolis_common::BlockType::ALL):
-        -- 0=Air, 1=Stone, 2=Dirt, 3=Grass, 4=Sand, 5=Water, 6=Snow, 7=Glass, 8=Log, 9=Leaves, 10=Chest
+        -- Block names (see exsolis_common::BlockRegistry::default_registry).
+        -- Numeric ids stay frozen (0=Air, 1=Stone, ...) for worldgen compat.
         top_block = 3,        -- Surface block (Grass)
         filler_block = 2,     -- Sub-surface block (Dirt)
         stone_block = 1,      -- Deep stone block (Stone)

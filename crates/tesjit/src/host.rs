@@ -85,8 +85,29 @@ impl HostRegistry {
         self.fns.len()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.fns.is_empty()
+    /// Cheap stable hash of this registry's signatures. Used as the *shape*
+    /// component of hot-reload's reject-on-layout-change rule (§7 of
+    /// `docs/SCRIPTING_ECS_MODS_PLAN.md`). Two registries with the same
+    /// hash present an identical mod surface to the JIT.
+    pub fn layout_hash(&self) -> u64 {
+        let mut entries: Vec<String> = self
+            .fns
+            .values()
+            .map(|f| {
+                let ps: Vec<String> = f.params.iter().map(|p| p.name().into_owned()).collect();
+                format!("{}({}) -> {}", f.name, ps.join(","), f.ret.name())
+            })
+            .collect();
+        entries.sort();
+        let mut h: u64 = 0xcbf29ce484222325;
+        for entry in &entries {
+            for b in entry.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h = h.wrapping_mul(0x100000001b3); // separator
+        }
+        h
     }
 }
 

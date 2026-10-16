@@ -7,7 +7,7 @@ use bevy_renet::RenetServer;
 use bevy_renet::renet::DefaultChannel;
 use bevy_tasks::futures_lite::future;
 use bevy_tasks::{AsyncComputeTaskPool, Task};
-use exsolis_common::{BlockType, ChunkBlocks, ChunkCoord};
+use exsolis_common::{AIR_ID, BlockId, ChunkBlocks, ChunkCoord};
 use glam::Vec3;
 use std::collections::{HashMap, HashSet};
 
@@ -101,7 +101,10 @@ impl SimpleWorldGen {
 
     pub fn generate_chunk(&self, coord: ChunkCoord) -> ChunkBlocks {
         const SIZE: usize = 32;
-        let mut blocks = vec![BlockType::Air; SIZE * SIZE * SIZE];
+        // Frozen M0 ids: stone = 1, grass = 3 (see BlockRegistry::default_registry).
+        const STONE: BlockId = 1;
+        const GRASS: BlockId = 3;
+        let mut blocks = vec![AIR_ID; SIZE * SIZE * SIZE];
 
         for x in 0..SIZE {
             for z in 0..SIZE {
@@ -115,11 +118,11 @@ impl SimpleWorldGen {
                     let world_y = coord.y * SIZE as i32 + y as i32;
                     let idx = x + y * SIZE + z * SIZE * SIZE;
                     blocks[idx] = if world_y < height {
-                        BlockType::Stone
+                        STONE
                     } else if world_y == height {
-                        BlockType::Grass
+                        GRASS
                     } else {
-                        BlockType::Air
+                        AIR_ID
                     };
                 }
             }

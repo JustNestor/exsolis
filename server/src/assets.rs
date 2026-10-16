@@ -362,6 +362,7 @@ fn handle_asset_packets(
     mut player_map: ResMut<PlayerMap>,
     mut joining: ResMut<crate::events::JoiningPlayers>,
     mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
+    blocks: Res<crate::blocks::ServerBlocks>,
     positions: Query<(&crate::chunks::PlayerPosition, &crate::movement::PlayerLook)>,
 ) {
     for packet in incoming.read() {
@@ -399,6 +400,7 @@ fn handle_asset_packets(
                     &positions,
                     &mut outgoing,
                     &mut spawns,
+                    &blocks,
                 );
             }
             ClientMessage::AssetLoadComplete { .. } => {}

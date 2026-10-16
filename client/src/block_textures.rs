@@ -1,12 +1,9 @@
 //! Client-side texture knowledge about blocks.
 //!
-//! `BlockType` lives in `exsolis_common` (no GPU/asset deps, shared with the
-//! server), so it can't grow an inherent `texture_mapping()` like the old
-//! single-crate project had. An extension trait gives the same call syntax
-//! (`block.texture_mapping()`) without polluting the common crate.
-//!
-//! The string keys are asset paths relative to `assets/`, without the `.png`
-//! extension, using `/` separators (see `TextureManager::discover_pngs`).
+//! Block ids are numeric [`BlockId`]s into the shared [`BlockRegistry`]
+//! (see `exsolis_common::blocks`); the string keys below are asset paths
+//! relative to `assets/`, without the `.png` extension, using `/`
+//! separators (see `TextureManager::discover_pngs`).
 //! e.g. `assets/blocks/stone.png` -> key `"blocks/stone"`.
 //!
 //! TODO(nestor): these keys are my best guess — I haven't seen your `assets/`
@@ -14,50 +11,43 @@
 //! NOT crash: `TextureManager::get` falls back to the first loaded texture,
 //! so it renders as the wrong texture (which is easy to spot).
 
-use exsolis_common::BlockType;
+use exsolis_common::{AIR_ID, BlockId, BlockRegistry};
 
 use crate::texture::TextureMapping;
 
-pub trait BlockTextures {
-    /// `None` for blocks that are never drawn (air).
-    fn texture_mapping(self) -> Option<TextureMapping>;
-
-    /// Needs a face-visibility check against neighbours: true for anything
-    /// you can see through (air, water, glass, leaves).
-    fn is_transparent(self) -> bool;
+/// `None` for blocks that are never drawn (air, unknown ids without art).
+pub fn texture_mapping(registry: &BlockRegistry, id: BlockId) -> Option<TextureMapping> {
+    if id == AIR_ID {
+        return None;
+    }
+    let def = registry.def(id)?;
+    Some(match def.name.as_str() {
+        "exsolis:stone" => TextureMapping::Single("blocks/stone"),
+        "exsolis:dirt" => TextureMapping::Single("blocks/dirt"),
+        "exsolis:grass" => TextureMapping::TopBottomSide {
+            top: "blocks/grass_top",
+            bottom: "blocks/dirt",
+            side: "blocks/grass_side",
+        },
+        "exsolis:sand" => TextureMapping::Single("blocks/sand"),
+        "exsolis:water" => TextureMapping::Single("blocks/water"),
+        "exsolis:snow" => TextureMapping::Single("blocks/snow"),
+        "exsolis:glass" => TextureMapping::Single("blocks/glass"),
+        "exsolis:log" => TextureMapping::TopBottomSide {
+            top: "blocks/log_top",
+            bottom: "blocks/log_top",
+            side: "blocks/log_side",
+        },
+        "exsolis:leaves" => TextureMapping::Single("blocks/leaves"),
+        // No dedicated chest art yet; planks read as a wooden crate and
+        // the block entity's container is what actually distinguishes it.
+        "exsolis:chest" => TextureMapping::Single("blocks/cherry_planks"),
+        _ => return None,
+    })
 }
 
-impl BlockTextures for BlockType {
-    fn texture_mapping(self) -> Option<TextureMapping> {
-        Some(match self {
-            BlockType::Air => return None,
-            BlockType::Stone => TextureMapping::Single("blocks/stone"),
-            BlockType::Dirt => TextureMapping::Single("blocks/dirt"),
-            BlockType::Grass => TextureMapping::TopBottomSide {
-                top: "blocks/grass_top",
-                bottom: "blocks/dirt",
-                side: "blocks/grass_side",
-            },
-            BlockType::Sand => TextureMapping::Single("blocks/sand"),
-            BlockType::Water => TextureMapping::Single("blocks/water"),
-            BlockType::Snow => TextureMapping::Single("blocks/snow"),
-            BlockType::Glass => TextureMapping::Single("blocks/glass"),
-            BlockType::Log => TextureMapping::TopBottomSide {
-                top: "blocks/log_top",
-                bottom: "blocks/log_top",
-                side: "blocks/log_side",
-            },
-            BlockType::Leaves => TextureMapping::Single("blocks/leaves"),
-            // No dedicated chest art yet; planks read as a wooden crate and
-            // the block entity's container is what actually distinguishes it.
-            BlockType::Chest => TextureMapping::Single("blocks/cherry_planks"),
-        })
-    }
-
-    fn is_transparent(self) -> bool {
-        matches!(
-            self,
-            BlockType::Air | BlockType::Water | BlockType::Glass | BlockType::Leaves
-        )
-    }
+/// Needs a face-visibility check against neighbours: true for anything
+/// you can see through (air, water, glass, leaves).
+pub fn is_transparent(registry: &BlockRegistry, id: BlockId) -> bool {
+    registry.is_transparent(id)
 }

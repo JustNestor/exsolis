@@ -28,7 +28,9 @@
 //! go(1.5);
 //! ```
 //!
-//! Types: `number/f64` → F64, `i32` → I32, `boolean` → I8, `void`.
+//! Types: integers `i8`–`i64` / `u8`–`u64`, floats `f32`/`f64`
+//! (`number` means `f64`), `boolean`, opaque `Entity` handles, `string`,
+//! `T[]`, `void`. Every function boundary is fully annotated.
 
 pub mod check;
 pub mod codegen;

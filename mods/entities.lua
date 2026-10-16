@@ -41,8 +41,8 @@ local function spawn_a_chest(player_id)
     local by = math.floor(pos.y)
     local bz = math.floor(pos.z)
 
-    -- BlockType::Chest is 10 (see exsolis_common::BlockType::ALL).
-    api.set_block(bx, by, bz, 10)
+    -- Block names (see exsolis_common::BlockRegistry::default_registry).
+    api.set_block(bx, by, bz, "exsolis:chest")
 
     local id = api.get_block_entity(bx, by, bz)
     if id then

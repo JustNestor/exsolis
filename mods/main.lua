@@ -1,66 +1,70 @@
 local SLOT_COUNT = 36
 IsInvOpen = IsInvOpen or {}
 
-local function ensure(player_id)
-    if not PlayerInventory.players[player_id] then
-        local inventory = PlayerInventory.create(player_id)
-        Container.set(inventory.container, 0, { id = "wood", count = 12 })
-        Container.set(inventory.container, 2, { id = "stone", count = 3 })
-    end
-    return PlayerInventory.get(player_id)
-end
+-- Inventory rendering reads the Rust authority through
+-- `api.get_inventory()` (snapshot written before Lua renders). Lua owns no
+-- items: clicks, gives and held stacks all mutate server-side, so the
+-- E-screen, the HUD and placement always agree.
 
 local function item_view(item)
     if not item then return nil end
-    local short_names = { wood = "W", stone = "S" }
-    local colors = { wood = "#8a5a32", stone = "#777777" }
+    local name = item.name
+    -- Items render flat (`item#`), blocks isometric (`block#`).
+    local prefix = "block#"
+    if name and not api.is_placeable(name) then prefix = "item#" end
+    local short = "?"
+    if name then
+        local base = string.match(name, "[^:]+$") or name
+        short = string.upper(string.sub(base, 1, 1))
+    end
     return {
         id = item.id,
         count = item.count,
-        short = short_names[item.id] or string.upper(string.sub(item.id, 1, 1)),
-        color = colors[item.id] or "#6f8f55",
+        short = short,
+        color = "#6f8f55",
+        img = name and (prefix .. name) or nil,
     }
 end
 
-local function return_held_item(player_id)
-    local inventory = ensure(player_id)
-    local held = inventory.held_item
-    if not held then return end
-    local remaining = PlayerInventory.add(player_id, held.id, held.count)
-    if remaining == 0 then
-        inventory.held_item = nil
-    else
-        held.count = remaining
-    end
-end
-
 local function inv_data(player_id)
-    local inv = ensure(player_id).container
-    local selected = ensure(player_id).selected
+    local inv = api.get_inventory(player_id)
+    if not inv then
+        inv = { slots = {}, selected = 0 }
+    end
+    local selected = inv.selected or 0
     local slots = {}
     local slots2 = {}
-    -- The 27 main-inventory slots follow the 9 hotbar slots in storage.
-    for i = 0, 26 do
-        local index = i + 9
-        slots[i + 1] = {
-            index = index,
-            item = item_view(Container.get(inv, index)),
-        }
+    -- Main storage follows the 9 hotbar slots (Lua 1-based).
+    for i = 9, 35 do
+        slots[#slots + 1] = { index = i, item = item_view(inv.slots[i + 1]) }
     end
     for i = 0, 8 do
-        local item = Container.get(inv, i)
-        slots2[i + 1] = {
+        slots2[#slots2 + 1] = {
             index = i,
-            item = item_view(item),
+            item = item_view(inv.slots[i + 1]),
             selected_bg = selected == i and "#b5b5b5" or "#777777",
         }
+    end
+    -- Creative grid, rows of 9 inside one scrollable column (flex
+    -- grids do not report overflow, so the wheel had nowhere to go).
+    local creative = {}
+    for _, name in ipairs(api.blocks()) do
+        local last = creative[#creative]
+        if not last or #last.cells >= 9 then
+            last = { cells = {} }
+            creative[#creative + 1] = last
+        end
+        local prefix = "block#"
+        if not api.is_placeable(name) then prefix = "item#" end
+        last.cells[#last.cells + 1] = { name = name, img = prefix .. name }
     end
     return {
         title = "Inventory",
         slots = slots,
         slots2 = slots2,
         selected = selected,
-        held_item = item_view(ensure(player_id).held_item),
+        held_item = item_view(inv.held),
+        creative = creative,
     }
 end
 
@@ -76,7 +80,7 @@ local function hide_inv(player_id)
 end
 
 local function close_inv(player_id)
-    return_held_item(player_id)
+    api.stash_held(player_id)
     hide_inv(player_id)
 end
 
@@ -98,13 +102,11 @@ api.on("player_join", function(ev)
         category = "Inventory"
     })
 
-    ensure(ev.player_id)
     IsInvOpen[ev.player_id] = false
 end)
 
 api.on("player_leave", function(ev)
     IsInvOpen[ev.player_id] = nil
-    PlayerInventory.remove_player(ev.player_id)
 end)
 
 
@@ -115,65 +117,26 @@ api.on("keybind", function(ev)
     end
 end)
 
-local function click_slot(player_id, index, right_click)
-    if index == nil or index < 0 or index >= SLOT_COUNT then return end
-    local inventory = ensure(player_id)
-    local container = inventory.container
-    local slot = Container.get(container, index)
-    local held = inventory.held_item
-
-    if not held then
-        if not slot then return end
-        if right_click then
-            local taken = math.floor((slot.count + 1) / 2)
-            inventory.held_item = { id = slot.id, count = taken }
-            slot.count = slot.count - taken
-            if slot.count == 0 then Container.set(container, index, nil) end
-        else
-            inventory.held_item = slot
-            Container.set(container, index, nil)
-        end
-    elseif not slot then
-        if right_click then
-            Container.set(container, index, { id = held.id, count = 1 })
-            held.count = held.count - 1
-        else
-            Container.set(container, index, held)
-            inventory.held_item = nil
-        end
-        if inventory.held_item and inventory.held_item.count == 0 then
-            inventory.held_item = nil
-        end
-    elseif slot.id == held.id and slot.count < PlayerInventory.max_stack then
-        local amount = right_click and 1 or math.min(held.count, PlayerInventory.max_stack - slot.count)
-        slot.count = slot.count + amount
-        held.count = held.count - amount
-        if held.count == 0 then inventory.held_item = nil end
-    elseif not right_click then
-        Container.set(container, index, held)
-        inventory.held_item = slot
-    else
-        return
-    end
-
-    show_inv(player_id)
-end
-
 api.on("ui_action", function(ev)
     if ev.ui_id ~= "inv" then return end
     if ev.action == "inventory:close" then
         close_inv(ev.player_id)
-    elseif ev.action == "inventory:click" then
-        local payload = ev.data or ""
-        local index = tonumber(string.match(payload, "(%d+)$"))
-        local right_click = string.find(payload, "right", 1, true) ~= nil
-        click_slot(ev.player_id, index, right_click)
+    elseif ev.action == "inventory:click" or ev.action == "inventory:creative" then
+        -- Applied server-side before this dispatch; render the snapshot.
+        if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
     end
 end)
 
 api.on("select_hotbar", function(ev)
-    if ev.index >= 0 and ev.index < 9 then
-        PlayerInventory.get(ev.player_id).selected = ev.index
-        if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
-    end
+    if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
+end)
+
+-- Place/break need no Lua mirror: the next render reads Rust state.
+-- Reshow while open so counts update live.
+api.on("place_block", function(ev)
+    if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
+end)
+
+api.on("break_block", function(ev)
+    if IsInvOpen[ev.player_id] then show_inv(ev.player_id) end
 end)

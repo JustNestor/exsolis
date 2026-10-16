@@ -504,7 +504,10 @@ impl Task for ChunkRenderTask {
                     0,
                     &vs::PushConstants {
                         view_proj: view_proj.to_cols_array_2d(),
-                        sampler_id: world.sampler_id,
+                        // Pixel-art sampler (Nearest): block textures are
+                        // 16x16 indexed-color style; the block sampler's
+                        // linear minification + aniso blurs them at distance.
+                        sampler_id: world.pixel_sampler_id,
                     },
                 );
             };

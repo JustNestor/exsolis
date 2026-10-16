@@ -9,7 +9,7 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, Declaration, Expression,
-    ForStatementInit, Function, LogicalOperator, SimpleAssignmentTarget, Statement, TSType,
+    ForStatementInit, ForStatementLeft, Function, LogicalOperator, SimpleAssignmentTarget, Statement, TSType,
     TSTypeName, UnaryOperator, UpdateOperator, VariableDeclaration,
 };
 use oxc_parser::Parser;
@@ -319,7 +319,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
 
     fn poison(&mut self, span: Span, msg: impl Into<String>) -> Expr {
         self.at(span, msg);
-        Expr::new(ExprKind::I32(0), Ty::I32, span)
+        Expr::new(ExprKind::Int(0), Ty::I32, span)
     }
 
     // ───────────────────────── statements ─────────────────────────
@@ -425,6 +425,82 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     body,
                     span: w.span,
                 })
+            }
+            Statement::ForOfStatement(f) => {
+                if f.r#await {
+                    self.at(f.span, "`await for` is not supported");
+                    return None;
+                }
+                let binding_decl = match &f.left {
+                    ForStatementLeft::VariableDeclaration(d) if d.declarations.len() == 1 => &d.declarations[0],
+                    _ => {
+                        self.at(f.span, "for-of requires a single binding");
+                        return None;
+                    }
+                };
+                let bpat = match &binding_decl.id {
+                    BindingPattern::BindingIdentifier(id) => id,
+                    _ => {
+                        self.at(f.span, "destructuring is not supported in for-of");
+                        return None;
+                    }
+                };
+
+                // Compute the iterable's elemental type.
+                let iterable = self.expr(&f.right, None);
+                let Some(elem_ty) = iterable.ty.elem() else {
+                    self.at(f.right.span(), format!("cannot iterate over {}", iterable.ty));
+                    return None;
+                };
+                let binding_slot = match self.declare(&bpat.name, elem_ty.clone(), bpat.span) {
+                    Some(s) => s,
+                    None => return None,
+                };
+
+                // Ensure binding initializer absent case: declare gives slot, zero init.
+                self.loop_depth += 1;
+                let index_slot = self.declare("__i", Ty::I32, bpat.span).unwrap_or(binding_slot);
+
+                // init: index = 0
+                let init_expr = Expr::new(ExprKind::Int(0), Ty::I32, f.span);
+                let init_stmt = Stmt::Let { local: index_slot, init: Some(init_expr), span: f.span };
+
+                let len_expr = Expr::new(ExprKind::Length { target: Box::new(iterable.clone()) }, Ty::I32, f.span);
+                let cond_lhs = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
+                let cond = Expr::new(
+                    ExprKind::Binary { op: BinaryOperator::LessThan, lhs: Box::new(cond_lhs), rhs: Box::new(len_expr) },
+                    Ty::Bool,
+                    f.span,
+                );
+
+                // read iterable[index] into binding before body
+                let index_val = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
+                let slice_expr = Expr::new(ExprKind::Index { target: Box::new(iterable.clone()), index: Box::new(index_val.clone()) }, elem_ty.clone(), f.span);
+                let bind_stmt = Stmt::Expr { expr: Expr::new(ExprKind::Assign { local: binding_slot, op: None, value: Box::new(slice_expr) }, Ty::Void, f.span), span: f.span };
+
+                let body_stmts = self.stmt_block(&f.body);
+                let mut full_body = Vec::with_capacity(body_stmts.len() + 2);
+                full_body.push(bind_stmt);
+                full_body.extend(body_stmts);
+
+                // write binding back to iterable[index] after body
+                let index_val2 = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
+                let binding_val = Expr::new(ExprKind::Local(binding_slot), elem_ty.clone(), f.span);
+                let write_back = Stmt::Expr { expr: Expr::new(ExprKind::SetIndex { target: Box::new(iterable.clone()), index: Box::new(index_val2), value: Box::new(binding_val) }, Ty::Void, f.span ), span: f.span };
+                full_body.push(write_back);
+
+                let update = Expr::new(ExprKind::Update { local: index_slot, inc: true, prefix: false }, Ty::I32, f.span);
+
+                let loop_stmt = Stmt::For {
+                    init: vec![init_stmt],
+                    cond: Some(cond),
+                    update: Some(update),
+                    body: full_body,
+                    span: f.span,
+                };
+                self.pop_scope();
+                self.loop_depth -= 1;
+                Some(loop_stmt)
             }
             Statement::ForStatement(f) => {
                 self.loop_depth += 1;
@@ -620,23 +696,55 @@ impl<'a, 'l> FnCtx<'a, 'l> {
 
     // ───────────────────────── expressions ─────────────────────────
 
+    /// Range-check a numeric literal against an integer type and lower it.
+    /// `v` is the (possibly already negated) mathematical value.
+    fn int_lit(&mut self, v: f64, expected: Ty, span: Span) -> Expr {
+        // Range-checked in `f64` arithmetic: `2^w` is exact in `f64` for
+        // `w <= 64`, so `v < 2^w` accepts exactly the representable in-range
+        // integers (an `as i128` comparison would spuriously reject
+        // `i64::MAX`, which rounds to 2^63 as an `f64`).
+        let width = expected.int_width().unwrap_or(32);
+        let limit = (1u128 << width) as f64;
+        let fits = if expected.is_signed() {
+            v >= -limit / 2.0 && v < limit / 2.0 && v.fract() == 0.0
+        } else {
+            v >= 0.0 && v < limit && v.fract() == 0.0
+        };
+        if !fits {
+            return self.poison(span, format!("literal does not fit in {expected}"));
+        }
+        // Exact: `v` is integral and inside the type's range. Unsigned
+        // values reuse the `i64` bit pattern.
+        let bits = if expected.is_signed() {
+            v as i64
+        } else {
+            (v as u64) as i64
+        };
+        Expr::new(ExprKind::Int(bits), expected, span)
+    }
+
     /// `expect` is the contextual type (used to type numeric literals and to
     /// propagate an operand type into the other side of a binary op).
     fn expr(&mut self, e: &Expression<'_>, expect: Option<Ty>) -> Expr {
         match e {
             Expression::NumericLiteral(n) => {
                 let span = n.span;
-                if expect == Some(Ty::I32) {
-                    if n.value.fract() != 0.0
-                        || n.value < i32::MIN as f64
-                        || n.value > i32::MAX as f64
-                    {
-                        return self.poison(span, "literal does not fit in i32");
-                    }
-                    Expr::new(ExprKind::I32(n.value as i32), Ty::I32, span)
-                } else {
-                    Expr::new(ExprKind::F64(n.value), Ty::F64, span)
+                // An explicitly expected integer width narrows the literal
+                // (range-checked below); otherwise it is an `f64`. `f32` never
+                // appears by inference — only through annotation + `as`.
+                if let Some(expected) = expect.clone()
+                    && expected.is_integer()
+                {
+                    return self.int_lit(n.value, expected, span);
                 }
+                if expect == Some(Ty::F32) {
+                    let v = n.value;
+                    if v < -(f32::MAX as f64) || v > f32::MAX as f64 {
+                        return self.poison(span, "literal does not fit in f32");
+                    }
+                    return Expr::new(ExprKind::Float(v), Ty::F32, span);
+                }
+                Expr::new(ExprKind::Float(n.value), Ty::F64, span)
             }
             Expression::BooleanLiteral(l) => Expr::new(ExprKind::Bool(l.value), Ty::Bool, l.span),
             Expression::StringLiteral(l) => {
@@ -693,8 +801,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     );
                 }
                 let index = self.expr(&m.expression, Some(Ty::I32));
-                if index.ty != Ty::I32 {
-                    self.at(m.span, "array index must be i32");
+                if !index.ty.is_integer() {
+                    self.at(m.span, "array index must be an integer");
                 }
                 // String indexing yields a byte (i32) — there is no char type yet.
                 Expr::new(
@@ -715,13 +823,27 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 Expr::new(ExprKind::Local(slot), ty, id.span)
             }
             Expression::UnaryExpression(u) => {
+                // `-(literal)` is folded before range-checking so the minimum
+                // value of each signed type (`-128`, ...) is expressible: the
+                // positive half alone would not fit.
+                if u.operator == UnaryOperator::UnaryNegation
+                    && let Expression::NumericLiteral(n) = &u.argument
+                    && let Some(expected) = expect.clone()
+                    && expected.is_integer()
+                    && expected.is_signed()
+                {
+                    let negated = self.int_lit(-n.value, expected, u.span);
+                    // A negation of a literal is a constant, not an `ineg` —
+                    // but it still carries the unary span for diagnostics.
+                    return negated;
+                }
                 let a = self.expr(&u.argument, expect);
                 let ty = a.ty.clone();
                 let span = u.span;
                 match (u.operator, ty.clone()) {
-                    (UnaryOperator::UnaryPlus, Ty::I32 | Ty::F64) => {}
-                    (UnaryOperator::UnaryNegation, Ty::I32 | Ty::F64) => {}
-                    (UnaryOperator::BitwiseNot, Ty::I32) => {}
+                    (UnaryOperator::UnaryPlus, t) if t.is_numeric() => {}
+                    (UnaryOperator::UnaryNegation, t) if t.is_numeric() => {}
+                    (UnaryOperator::BitwiseNot, t) if t.is_integer() => {}
                     (UnaryOperator::LogicalNot, Ty::Bool) => {}
                     _ => {
                         return self.poison(
@@ -820,8 +942,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         );
                     };
                     let index = self.expr(&m.expression, Some(Ty::I32));
-                    if index.ty != Ty::I32 {
-                        self.at(a.span, "array index must be i32");
+                    if !index.ty.is_integer() {
+                        self.at(a.span, "array index must be an integer");
                     }
                     let rhs = self.expr(&a.right, Some(elem.clone()));
                     if rhs.ty != elem.clone() {
@@ -930,6 +1052,106 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 )
             }
             Expression::CallExpression(c) => {
+                // Option<T> constructors.
+                if let Expression::Identifier(id) = &c.callee {
+                    match id.name.as_str() {
+                        "some" => {
+                            if c.arguments.len() != 1 {
+                                return self.poison(c.span, "some() takes exactly one argument");
+                            }
+                            let Some(arg) = c.arguments.first().and_then(|a| a.as_expression())
+                            else {
+                                return self.poison(c.span, "some() takes exactly one argument");
+                            };
+                            let v = self.expr(arg, None);
+                            return Expr::new(
+                                ExprKind::OptionSome {
+                                    value: Box::new(v.clone()),
+                                },
+                                Ty::Option(Box::new(v.ty)),
+                                c.span,
+                            );
+                        }
+                        "none" => {
+                            let Some(inner) = expect.clone().and_then(|t| t.option_elem()) else {
+                                return self.poison(
+                                    c.span,
+                                    "none() requires an `Option<T>` context",
+                                );
+                            };
+                            return Expr::new(
+                                ExprKind::OptionNone { ty: inner },
+                                expect.clone().unwrap(),
+                                c.span,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                // Option<T> methods.
+                if let Expression::StaticMemberExpression(m) = &c.callee {
+                    match m.property.name.as_str() {
+                        "isSome" => {
+                            let recv = self.expr(&m.object, None);
+                            let _ = recv.ty.option_elem().unwrap();
+                            if c.arguments.is_empty() {
+                                return Expr::new(
+                                    ExprKind::Call {
+                                        target: CallTarget::Intrinsic(Intrinsic::OptIsSome),
+                                        args: vec![recv],
+                                    },
+                                    Ty::Bool,
+                                    c.span,
+                                );
+                            }
+                        }
+                        "unwrap" => {
+                            let recv = self.expr(&m.object, None);
+                            let inner = match recv.ty.option_elem() {
+                                Some(t) => t,
+                                None => { return self.poison(c.span, "unwrap() requires Option<T>"); }
+                            };
+                            if c.arguments.is_empty() {
+                                return Expr::new(
+                                    ExprKind::Call {
+                                        target: CallTarget::Intrinsic(if inner.is_float() {
+                                            Intrinsic::OptUnwrapF64
+                                        } else {
+                                            Intrinsic::OptUnwrap
+                                        }),
+                                        args: vec![recv],
+                                    },
+                                    inner,
+                                    c.span,
+                                );
+                            }
+                        }
+                        "unwrapOr" => {
+                            let recv = self.expr(&m.object, None);
+                            let inner = match recv.ty.option_elem() {
+                                Some(t) => t,
+                                None => { return self.poison(c.span, "unwrapOr() requires Option<T>"); }
+                            };
+                            let default = match c.arguments.first().and_then(|a| a.as_expression()) {
+                                Some(ex) => self.expr(ex, Some(inner.clone())),
+                                None => return self.poison(c.span, "unwrapOr() requires a default"),
+                            };
+                            return Expr::new(
+                                ExprKind::Call {
+                                    target: CallTarget::Intrinsic(if inner.is_float() {
+                                        Intrinsic::OptUnwrapOrF64
+                                    } else {
+                                        Intrinsic::OptUnwrapOr
+                                    }),
+                                    args: vec![recv, default],
+                                },
+                                inner,
+                                c.span,
+                            );
+                        }
+                        _ => {}
+                    }
+                }
                 // `a.push(v)` — the only builtin method call for now.
                 if let Expression::StaticMemberExpression(m) = &c.callee
                     && m.property.name.as_str() == "push"
@@ -952,7 +1174,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                             );
                         }
                         let elem_size = Expr::new(
-                            ExprKind::I32(elem.elem_size().unwrap() as i32),
+                            ExprKind::Int(elem.elem_size().unwrap() as i64),
                             Ty::I32,
                             c.span,
                         );
@@ -974,6 +1196,72 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         .find(|(name, _)| *name == callee.name.as_str())
                 {
                     return self.builtin_call(*intrinsic, c);
+                }
+                // `a.foo(b, ...)` → UFCS resolution to `foo(a, b, ...)` for
+                // any function available in this unit (local or host). The
+                // receiver is prepended as the first argument. This is the
+                // foundation of `world.query()`, `q.iter()`, `commands.spawn()`
+                // style calls. (See §3.5 of SCRIPTING_ECS_MODS_PLAN.md.)
+                if let Expression::StaticMemberExpression(m) = &c.callee {
+                    let method = m.property.name.as_str();
+                    // `array.length` is a property, not a call — handled
+                    // below (`ExprKind::Length`). Reject it explicitly here.
+                    if method == "length" {
+                        return self.poison(
+                            c.span,
+                            "`length` is a property; use `.length` directly",
+                        );
+                    }
+                    let kind = self.sigs.kind_of(method).map(|k| k.clone());
+                    if let Some(kind) = kind {
+                        // Build args: object + forwarded args.
+                        let (params, ret) = match &kind {
+                            FnKind::Local => {
+                                let sig = self.sigs.sig(method).expect("local fn has a sig");
+                                (sig.params.clone(), sig.ret.clone())
+                            }
+                            FnKind::Host(sig) => (sig.params.clone(), sig.ret.clone()),
+                        };
+                        if params.is_empty() || c.arguments.len() + 1 != params.len() {
+                            // UFCS requires at least one parameter matching
+                            // the receiver. Dispatch falls through; if it is
+                            // still unresolved the user gets the standard
+                            // "not supported" diagnostic below.
+                            // Fall through to the generic rejection.
+                            return self.poison(
+                                c.span,
+                                "only calls to named functions or `array.push` are supported",
+                            );
+                        }
+                        let receiver = self.expr(&m.object, Some(params[0].clone()));
+                        let mut args = vec![receiver.clone()];
+                        let mut bad = false;
+                        if receiver.ty != params[0] {
+                            self.at(m.object.span(), format!("receiver is {}, expected {}", receiver.ty, params[0]));
+                            bad = true;
+                        }
+                        for (a, pty) in c.arguments.iter().zip(&params[1..]) {
+                            let Some(ex) = a.as_expression() else {
+                                self.at(c.span, "spread arguments are not supported");
+                                bad = true;
+                                continue;
+                            };
+                            let v = self.expr(ex, Some(pty.clone()));
+                            if v.ty != *pty {
+                                self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
+                                bad = true;
+                            }
+                            args.push(v);
+                        }
+                        if bad {
+                            return self.poison(c.span, "bad arguments");
+                        }
+                        let target = match kind {
+                            FnKind::Local => CallTarget::Local(self.sigs.index(method)),
+                            FnKind::Host(_) => CallTarget::Host(method.to_owned()),
+                        };
+                        return Expr::new(ExprKind::Call { target, args }, ret, c.span);
+                    }
                 }
                 let Expression::Identifier(callee) = &c.callee else {
                     return self.poison(
@@ -1032,20 +1320,33 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 };
                 let v = self.expr(&a.expression, None);
                 let cast_ty = to.clone();
-                match (v.ty.clone(), cast_ty.clone()) {
-                    (x, y) if x == y => v,
-                    (Ty::I32, Ty::F64)
-                    | (Ty::F64, Ty::I32)
-                    | (Ty::Bool, Ty::I32)
-                    | (Ty::Bool, Ty::F64) => Expr::new(
+                // Same type: no-op. Integers convert freely (wrap on
+                // narrowing, extend on widening); integer/float converts use
+                // saturating Cranelift conversions; `bool` converts to any
+                // numeric; `Entity` converts only to/from `u64` (same bits).
+                let ok = match (v.ty.clone(), cast_ty.clone()) {
+                    (x, y) if x == y => true,
+                    (x, y) if x.is_integer() && y.is_integer() => true,
+                    (x, y) if x.is_integer() && y.is_float() => true,
+                    (x, y) if x.is_float() && y.is_integer() => true,
+                    (Ty::F32, Ty::F64) | (Ty::F64, Ty::F32) => true,
+                    (Ty::Bool, y) if y.is_numeric() => true,
+                    (Ty::Entity, Ty::U64) | (Ty::U64, Ty::Entity) => true,
+                    _ => false,
+                };
+                if ok && v.ty == cast_ty {
+                    v
+                } else if ok {
+                    Expr::new(
                         ExprKind::Cast {
                             expr: Box::new(v),
                             to,
                         },
                         cast_ty,
                         a.span,
-                    ),
-                    (x, y) => self.poison(a.span, format!("cannot cast {x} to {y}")),
+                    )
+                } else {
+                    self.poison(a.span, format!("cannot cast {} to {cast_ty}", v.ty))
                 }
             }
             other => self.poison(other.span(), "unsupported expression"),
@@ -1061,7 +1362,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             );
             return;
         }
-        let supported = match (l.ty.clone(), op) {
+        let t = l.ty.clone();
+        let supported = match (t, op) {
             (Ty::Str, _) => matches!(
                 op,
                 BinaryOperator::Addition
@@ -1071,7 +1373,17 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     | BinaryOperator::StrictInequality
             ),
             (Ty::Array(_) | Ty::Ptr, _) => false,
-            (Ty::I32, _) => {
+            (
+                Ty::I8
+                | Ty::I16
+                | Ty::I32
+                | Ty::I64
+                | Ty::U8
+                | Ty::U16
+                | Ty::U32
+                | Ty::U64,
+                _,
+            ) => {
                 matches!(
                     op,
                     BinaryOperator::Addition
@@ -1087,7 +1399,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         | BinaryOperator::ShiftRightZeroFill
                 ) || is_comparison(op)
             }
-            (Ty::F64, _) => {
+            (Ty::F32 | Ty::F64, _) => {
                 matches!(
                     op,
                     BinaryOperator::Addition
@@ -1096,6 +1408,14 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         | BinaryOperator::Division
                 ) || is_comparison(op)
             }
+            // `Entity` handles compare like opaque ids; nothing else.
+            (Ty::Entity, _) => matches!(
+                op,
+                BinaryOperator::Equality
+                    | BinaryOperator::Inequality
+                    | BinaryOperator::StrictEquality
+                    | BinaryOperator::StrictInequality
+            ),
             (Ty::Bool, _) => matches!(
                 op,
                 BinaryOperator::Equality
@@ -1104,6 +1424,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     | BinaryOperator::StrictInequality
             ),
             (Ty::Void, _) => false,
+            _ => false,
         };
         if !supported {
             self.at(span, format!("operator {op:?} not supported on {}", l.ty));
@@ -1155,8 +1476,58 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
         TSType::TSVoidKeyword(_) => Ok(Ty::Void),
         TSType::TSTypeReference(r) => match &r.type_name {
             TSTypeName::IdentifierReference(id) => match id.name.as_str() {
+                "i8" => Ok(Ty::I8),
+                "i16" => Ok(Ty::I16),
                 "i32" => Ok(Ty::I32),
+                "i64" => Ok(Ty::I64),
+                "u8" => Ok(Ty::U8),
+                "u16" => Ok(Ty::U16),
+                "u32" => Ok(Ty::U32),
+                "u64" => Ok(Ty::U64),
+                "f32" => Ok(Ty::F32),
                 "f64" => Ok(Ty::F64),
+                "Entity" => Ok(Ty::Entity),
+                "Option" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Option<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Option<T> requires <T>".to_string()));
+                    }
+                    Ok(Ty::Option(Box::new(ty_of(&args.params[0])?)))
+                }
+                "Query" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Query<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Query<T> requires <T>".to_string()));
+                    }
+                    Ok(Ty::Query(Box::new(ty_of(&args.params[0])?)))
+                }
+                "Res" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Res<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Res<T> requires <T>".to_string()));
+                    }
+                    Ok(Ty::Res(Box::new(ty_of(&args.params[0])?)))
+                }
+                "Mut" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Mut<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Mut<T> requires <T>".to_string()));
+                    }
+                    Ok(Ty::Mut(Box::new(ty_of(&args.params[0])?)))
+                }
+                "Commands" => Ok(Ty::Commands),
                 other => Err(crate::diag::plain(format!("unknown type `{other}`"))),
             },
             _ => Err(crate::diag::plain("qualified type names are not supported")),

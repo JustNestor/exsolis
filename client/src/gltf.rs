@@ -1596,6 +1596,7 @@ pub fn sync_gltf_instances(
     camera: Query<(&Transform, &crate::player::FlyCamera), With<crate::player::LocalPlayer>>,
     swing: Res<crate::anim::UseSwing>,
     time: Res<Time>,
+    ui: Option<Res<crate::ui::UiManager>>,
 ) {
     let (Some(vk), Some(render_state)) = (vk, render_state) else {
         return;
@@ -1813,8 +1814,18 @@ pub fn sync_gltf_instances(
         let mut shared = render_state.shared.write().unwrap();
         shared.gltf_instance_count = matrices.len() as u32;
         shared.gltf_draws = draws;
-        shared.viewmodel_draws = viewmodel_draws;
-        shared.viewmodel_instance_count = viewmodel_total;
+        // The first-person arms draw in their own pass after everything,
+        // including the UI — over an open inventory that reads as a bug.
+        // Hidden while any modal screen captures input (for now; a proper
+        // UI-last task-graph order replaces this gate).
+        let modal_open = ui.as_ref().is_some_and(|u| u.captures_input());
+        if modal_open {
+            shared.viewmodel_draws = Vec::new();
+            shared.viewmodel_instance_count = 0;
+        } else {
+            shared.viewmodel_draws = viewmodel_draws;
+            shared.viewmodel_instance_count = viewmodel_total;
+        }
         (
             shared.gltf_instance_buffer_id.unwrap(),
             shared.gltf_material_buffer_id.unwrap(),
@@ -2057,6 +2068,37 @@ mod tests {
         assert_eq!(verts, 19_080, "girl.glb vertex count");
         // 12 real triangles per 24-vertex box.
         assert_eq!(tris, 9_540, "girl.glb triangle count after strip conversion");
+    }
+
+    #[test]
+    fn girl_base_copy_matches_girl() {
+        // `assets/models/player/girl_base.glb` is the first-person working
+        // copy of the avatar. Until adaptation starts it must decode
+        // identically to `girl.glb`; this pins that.
+        for name in ["girl.glb", "player/girl_base.glb"] {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../assets/models")
+                .join(name);
+            let Ok(bytes) = std::fs::read(&path) else {
+                eprintln!("SKIPPED: {name} absent");
+                return;
+            };
+            let bytes = normalize_model_bytes(name, &bytes);
+            let (document, buffers, _images) =
+                gltf::import_slice(&bytes).expect("glb parse");
+            let mut prims = 0usize;
+            let mut tris = 0usize;
+            for mesh in document.meshes() {
+                for prim in mesh.primitives() {
+                    let loaded =
+                        load_gltf_primitive(&prim, &buffers).expect("primitive decode");
+                    prims += 1;
+                    tris += loaded.indices.len() / 3;
+                }
+            }
+            assert_eq!(prims, 795, "{name} primitive count");
+            assert_eq!(tris, 9_540, "{name} triangle count");
+        }
     }
 
     #[test]

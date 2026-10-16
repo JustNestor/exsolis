@@ -12,6 +12,7 @@ use exsolis_common::ChunkCoord;
 use glam::IVec3;
 
 use crate::{
+    blocks::ClientBlocks,
     chunk::Chunk,
     chunk_registry::ChunkRegistry,
     mesh::{ChunkMeshData, ChunkNeighborhood, ChunkVertex, build_chunk_mesh},
@@ -160,6 +161,8 @@ pub(super) fn queue_chunk_meshing(
     mut commands: Commands,
     textures: Option<Res<TextureManager>>,
     registry: Res<ChunkRegistry>,
+    blocks: Option<Res<ClientBlocks>>,
+    mc: Option<Res<crate::loader::McAssets>>,
     all_chunks: Query<&Chunk>,
     needs_mesh: Query<
         (Entity, &Chunk),
@@ -185,6 +188,9 @@ pub(super) fn queue_chunk_meshing(
         );
         return;
     }
+    let Some(mc) = mc else {
+        return;
+    };
     let pool = AsyncComputeTaskPool::get();
 
     for (entity, chunk) in needs_mesh.iter().take(MAX_MESH_TASKS_STARTED_PER_FRAME) {
@@ -212,11 +218,16 @@ pub(super) fn queue_chunk_meshing(
         // borrow wrapper (not 'static, can't move into the task). TextureManager
         // wraps its map in an Arc, so this is a refcount bump, not a HashMap copy.
         let textures: TextureManager = (*textures).clone();
+        let registry_owned: exsolis_common::BlockRegistry = blocks
+            .as_ref()
+            .map(|b| b.0.clone())
+            .unwrap_or_else(exsolis_common::BlockRegistry::default_registry);
+        let baked = mc.baked.clone();
         let task = pool.spawn(async move {
             let neighborhood = ChunkNeighborhood {
                 chunks: neighbor_chunks,
             };
-            build_chunk_mesh(&neighborhood, &textures)
+            build_chunk_mesh(&neighborhood, &textures, &registry_owned, &baked)
         });
         commands
             .entity(entity)
@@ -259,10 +270,11 @@ pub(super) fn upload_ready_chunk_meshes(
     let mut pending: Vec<Pending> = Vec::new();
     for (entity, mut mesh_ready) in ready.iter_mut().take(MAX_UPLOADS_PER_FRAME) {
         let mesh = std::mem::take(&mut mesh_ready.0);
+        let (vertices, indices) = mesh.merged();
         pending.push(Pending {
             entity,
-            vertices: mesh.vertices,
-            indices: mesh.indices,
+            vertices,
+            indices,
         });
     }
 
@@ -339,6 +351,7 @@ pub(super) fn upload_ready_chunk_meshes(
             .insert(ChunkMeshReady(ChunkMeshData {
                 vertices: item.vertices,
                 indices: item.indices,
+                ..Default::default()
             }));
     }
 

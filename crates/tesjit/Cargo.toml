@@ -27,3 +27,13 @@ cranelift-native = "0.136.1"
 
 [dev-dependencies]
 tesjit-dwarf = { path = "../tesjit-dwarf" }
+criterion = "0.5"
+bevy_ecs = { workspace = true }
+
+[[bench]]
+name = "scripting"
+harness = false
+
+[[bench]]
+name = "ecs_spike"
+harness = false

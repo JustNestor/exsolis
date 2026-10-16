@@ -20,9 +20,10 @@
            width="40" height="40" align="center" justify="center">
         <div v-if="s.item" id="item_{{s.index}}"
              on-click="inventory:click" on-secondary-click="inventory:click"
-             data="{{s.index}}" z_index="10"
+             data="{{s.index}}" z-index="10"
              bg="{{s.item.color}}" border="2" border-color="#eeeeee"
              width="34" height="34" align="center" justify="center">
+          <img v-if="s.item.img" src="{{s.item.img}}" alt="?" width="30" height="30"/>
           <label font-size="11" color="#ffffff">{{s.item.short}}</label>
           <label position="absolute" right="1" bottom="0" font-size="10" color="#ffffff">{{s.item.count}}</label>
         </div>
@@ -42,8 +43,20 @@
              data="{{s.index}}"
              bg="{{s.item.color}}" border="2" border-color="#eeeeee"
              width="34" height="34" align="center" justify="center">
+          <img v-if="s.item.img" src="{{s.item.img}}" alt="?" width="30" height="30"/>
           <label font-size="11" color="#ffffff">{{s.item.short}}</label>
           <label position="absolute" right="1" bottom="0" font-size="10" color="#ffffff">{{s.item.count}}</label>
+        </div>
+      </div>
+    </div>
+
+    <label font-size="14" color="#404040">Creative (scroll)</label>
+    <div layout="column" gap="2" padding="4" bg="#8b8b8b"
+         border="2" border-color="#373737" overflow="scroll" height="320">
+      <div v-for="r in creative" layout="row" gap="2">
+        <div v-for="c in r.cells" on-click="inventory:creative"
+             data="{{c.name}}" width="44" height="44">
+          <img src="{{c.img}}" alt="?" width="40" height="40"/>
         </div>
       </div>
     </div>
@@ -51,6 +64,7 @@
   <cursor v-if="held_item" width="40" height="40" layout="column"
           bg="{{held_item.color}}" border="2" border-color="#ffffff"
           padding="2" align="center" justify="center">
+    <img v-if="held_item.img" src="{{held_item.img}}" alt="?" width="34" height="34"/>
     <label font-size="11" color="#ffffff">{{held_item.short}}</label>
     <label font-size="9" color="#ffffff">{{held_item.count}}</label>
   </cursor>

@@ -1,5 +1,10 @@
 [workspace]
 members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf"]
+# Scripting-runtime bench runners. Each links a DIFFERENT Lua C library
+# (mlua unifies features per version and mlua-sys declares `links = "lua"`,
+# so two backends can never coexist in one cargo graph). They are excluded
+# from the workspace and run as isolated subprocesses via `just bench-scripting`.
+exclude = ["crates/lua-bench-luajit", "crates/lua-bench-luau", "crates/lua-bench-lua54", "crates/bms-bench"]
 resolver = "2"
 
 [workspace.dependencies]

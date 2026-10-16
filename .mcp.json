@@ -5,6 +5,14 @@
       "args": [
         "mcp"
       ]
+    },
+    "blockbench": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "http://localhost:3000/bb-mcp"
+      ]
     }
   }
 }

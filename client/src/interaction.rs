@@ -1,17 +1,18 @@
 // src/interaction.rs
 
 use bevy_app::prelude::*;
-use bevy_ecs::message::MessageWriter;
+use bevy_ecs::message::{MessageReader, MessageWriter};
 use bevy_ecs::prelude::*;
 use bevy_input::ButtonInput;
 use bevy_input::keyboard::KeyCode;
-use bevy_input::mouse::MouseButton;
-use bevy_log::{info, warn};
+use bevy_input::mouse::{MouseButton, MouseScrollUnit, MouseWheel};
+use bevy_log::{debug, info, warn};
 use bevy_time::{Time, Timer, TimerMode};
 use bevy_transform::prelude::Transform;
-use exsolis_common::{BlockPos, BlockType, ClientMessage, HOTBAR_SIZE};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, HOTBAR_SIZE};
 use glam::{IVec3, Vec3};
 
+use crate::blocks::ClientBlocks;
 use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
 use crate::net::{GameplaySet, NetConnected, OutgoingPacket};
@@ -49,31 +50,24 @@ pub struct TargetedBlock {
 
 #[derive(Resource, Debug)]
 pub struct ClientInventory {
-    pub slots: [Option<(BlockType, u8)>; HOTBAR_SIZE],
+    pub slots: [Option<(BlockId, u8)>; HOTBAR_SIZE],
     pub selected: u8,
 }
 
 impl Default for ClientInventory {
+    // Starts empty on purpose: contents are server state (join
+    // InventorySync fills them). A seeded local default would show blocks
+    // the server never gave, including while offline.
     fn default() -> Self {
-        let mut slots = [None; HOTBAR_SIZE];
-        for (index, item) in [
-            BlockType::Dirt,
-            BlockType::Stone,
-            BlockType::Sand,
-            BlockType::Snow,
-            BlockType::Glass,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            slots[index] = Some((item, 64));
+        Self {
+            slots: [None; HOTBAR_SIZE],
+            selected: 0,
         }
-        Self { slots, selected: 0 }
     }
 }
 
 impl ClientInventory {
-    pub fn selected_item(&self) -> Option<BlockType> {
+    pub fn selected_item(&self) -> Option<BlockId> {
         self.slots[self.selected as usize].map(|(item, _)| item)
     }
 }
@@ -107,6 +101,7 @@ impl Plugin for InteractionPlugin {
                     ensure_targeting_component,
                     (
                         select_hotbar_by_number_input,
+                        select_hotbar_by_wheel,
                         update_targeting,
                         handle_break_input,
                         handle_place_input,
@@ -162,7 +157,39 @@ fn select_hotbar_by_number_input(
     )));
 }
 
-fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockType> {
+/// Mouse wheel cycles the hotbar selection (same gates as place/break via
+/// `gameplay_input_allowed`). Scroll up steps back, scroll down steps
+/// forward; the local slot updates immediately and the server is told via
+/// `SelectHotbar` (authoritative state comes back through `InventorySync`).
+fn select_hotbar_by_wheel(
+    mut wheels: MessageReader<MouseWheel>,
+    connected: Res<NetConnected>,
+    mut inventory: ResMut<ClientInventory>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
+) {
+    let mut steps = 0i32;
+    for ev in wheels.read() {
+        steps += match ev.unit {
+            MouseScrollUnit::Line => ev.y.signum() as i32,
+            MouseScrollUnit::Pixel => (ev.y / 50.0).signum() as i32,
+        };
+    }
+    if steps == 0 {
+        return;
+    }
+    if !connected.get() {
+        warn!("[SelectHotbar] Mouse wheel scroll detected, but not connected");
+        return;
+    }
+    let n = HOTBAR_SIZE as i32;
+    // Positive `steps` (scroll up) moves toward slot 0, negative down.
+    let next = (inventory.selected as i32 - steps).rem_euclid(n) as u8;
+    inventory.selected = next;
+    debug!("[SelectHotbar] Wheel scrolled {steps}, selecting slot {next}");
+    outgoing.write(OutgoingPacket::reliable(ClientMessage::SelectHotbar(next)));
+}
+
+fn read_block(registry: &ChunkRegistry, chunks: &Query<&Chunk>, world: IVec3) -> Option<BlockId> {
     let coord = exsolis_common::ChunkCoord::new(
         world.x.div_euclid(CHUNK_SIZE_I32),
         world.y.div_euclid(CHUNK_SIZE_I32),
@@ -253,7 +280,7 @@ fn raycast_voxels(
 
     for _ in 0..RAYCAST_STEP_LIMIT {
         let block = read_block(registry, chunks, cell)?;
-        if block != BlockType::Air {
+        if block != AIR_ID {
             return Some(TargetedBlock {
                 pos: cell,
                 place_pos: prev_cell,
@@ -356,6 +383,7 @@ fn handle_place_input(
     connected: Res<NetConnected>,
     mut outgoing: MessageWriter<OutgoingPacket>,
     inventory: Res<ClientInventory>,
+    blocks: Option<Res<ClientBlocks>>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
     if !mouse.pressed(MouseButton::Right) {
@@ -403,9 +431,29 @@ fn handle_place_input(
             "[PlaceBlock] Sending PlaceBlock packet for item {:?} at place_pos {:?}",
             item, target.place_pos
         );
+        let kind = blocks
+            .as_ref()
+            .and_then(|b| b.0.def(item).map(|d| d.name.clone()))
+            .unwrap_or_else(|| "exsolis:stone".to_string());
+        // Clicked face = placement cell minus the targeted solid cell.
+        let delta = target.place_pos - target.pos;
+        let face = if delta.y > 0 {
+            exsolis_common::Face::Top
+        } else if delta.y < 0 {
+            exsolis_common::Face::Bottom
+        } else if delta.x > 0 {
+            exsolis_common::Face::Right
+        } else if delta.x < 0 {
+            exsolis_common::Face::Left
+        } else if delta.z > 0 {
+            exsolis_common::Face::Front
+        } else {
+            exsolis_common::Face::Back
+        };
         outgoing.write(OutgoingPacket::reliable(ClientMessage::PlaceBlock {
             pos: BlockPos::new(target.place_pos.x, target.place_pos.y, target.place_pos.z),
-            kind: item,
+            kind,
+            face,
         }));
     }
 }

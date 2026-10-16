@@ -1,4 +1,6 @@
 use crate::entities::{DespawnEntityRequest, SpawnEntityRequest, SpawnExtra};
+use crate::blocks::ServerBlocks;
+use crate::creative::CreativeGiveRequested;
 use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
 use crate::net::{IncomingPacket, OutgoingPacket};
 use crate::scripting::KeybindActionRequested;
@@ -6,7 +8,7 @@ use crate::scripting::KeybindActionRequested;
 use super::*;
 use bevy_ecs::message::Message;
 use chunks::{PlayerPosition, RenderDistanceRequested};
-use exsolis_common::{BlockType, EntityKind, EntityState, SPAWN_POS};
+use exsolis_common::{BlockRegistry, EntityKind, EntityState, SPAWN_POS};
 use glam::Vec3;
 use movement::{PlayerInput, PlayerLook, PositionSync};
 use std::collections::HashSet;
@@ -116,6 +118,7 @@ pub(crate) fn spawn_joined_player(
     positions: &Query<(&PlayerPosition, &PlayerLook)>,
     outgoing: &mut MessageWriter<OutgoingPacket>,
     spawns: &mut MessageWriter<SpawnEntityRequest>,
+    blocks: &ServerBlocks,
 ) {
     if !joining.requested.insert(client_id) {
         return;
@@ -123,6 +126,16 @@ pub(crate) fn spawn_joined_player(
     outgoing.write(OutgoingPacket::to(
         client_id,
         ServerMessage::YourPlayerId(client_id),
+    ));
+    let block_list = crate::creative::sorted_block_names(blocks);
+    info!(
+        "[BlockList] sending {} blocks to player {}",
+        block_list.len(),
+        client_id
+    );
+    outgoing.write(OutgoingPacket::to(
+        client_id,
+        ServerMessage::BlockList { blocks: block_list },
     ));
     // Everyone already here, so a joining client can render them before it
     // receives any of their movement updates.
@@ -175,16 +188,22 @@ pub struct JoiningPlayers {
 
 /// Components only a player entity carries: input, look, the authoritative
 /// position, sync state and a starting inventory.
-pub(crate) fn attach_player_components(commands: &mut Commands, entity: Entity) {
+pub(crate) fn attach_player_components(
+    commands: &mut Commands,
+    entity: Entity,
+    registry: &BlockRegistry,
+) {
     let mut inventory = crate::Inventory::default();
-    for block in [
-        BlockType::Dirt,
-        BlockType::Stone,
-        BlockType::Sand,
-        BlockType::Snow,
-        BlockType::Glass,
+    for name in [
+        "exsolis:dirt",
+        "exsolis:stone",
+        "exsolis:sand",
+        "exsolis:snow",
+        "exsolis:glass",
     ] {
-        inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+        if let Some(block) = registry.id(name) {
+            inventory.add_item(block, exsolis_common::inventory::MAX_STACK);
+        }
     }
     commands.entity(entity).insert((
         PlayerPosition(Vec3::from(SPAWN_POS)),
@@ -252,11 +271,12 @@ pub fn dispatch_incoming(
                     radius: *radius,
                 });
             }
-            ClientMessage::PlaceBlock { pos, kind } => {
+            ClientMessage::PlaceBlock { pos, kind, face } => {
                 commands.write_message(PlaceBlockRequested {
                     player_id: client_id,
                     pos: *pos,
-                    kind: *kind,
+                    kind: kind.clone(),
+                    face: *face,
                 });
             }
             ClientMessage::BreakBlock { pos } => {
@@ -276,6 +296,12 @@ pub fn dispatch_incoming(
                     id: id.clone(),
                     state: *state,
                     player_id: client_id,
+                });
+            }
+            ClientMessage::CreativeGive { name } => {
+                commands.write_message(CreativeGiveRequested {
+                    player_id: client_id,
+                    name: name.clone(),
                 });
             }
             _ => {}

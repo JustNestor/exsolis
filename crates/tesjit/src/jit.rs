@@ -126,8 +126,10 @@ impl Compiled {
             "call_i64 supports at most {MAX_ARGS} arguments"
         );
         assert!(
-            e.params.iter().all(|t| *t != Ty::F64),
-            "call_i64 cannot pass f64 parameters; use `get::<F>()`"
+            e.params
+                .iter()
+                .all(|t| !t.is_float()),
+            "call_i64 cannot pass f32/f64 parameters; use `get::<F>()`"
         );
         let mut buf = [0i64; MAX_ARGS];
         buf[..args.len()].copy_from_slice(args);
@@ -424,6 +426,11 @@ impl Jit {
             ("__tesjit_store_i64", vec![Ptr, Ptr, Ty::Ptr], Ty::Ptr),
             ("__tesjit_store_i32", vec![Ptr, Ptr, Ty::I32], Ty::I32),
             ("__tesjit_region_id", vec![Ty::Str], Ty::I32),
+            ("__tesjit_opt_is_some", vec![Ty::Ptr], Ty::Ptr),
+            ("__tesjit_opt_unwrap_i64", vec![Ty::Ptr], Ty::Ptr),
+            ("__tesjit_opt_unwrap_f64", vec![Ty::Ptr], Ty::F64),
+            ("__tesjit_opt_unwrap_or_i64", vec![Ty::Ptr, Ty::Ptr], Ty::Ptr),
+            ("__tesjit_opt_unwrap_or_f64", vec![Ty::Ptr, Ty::F64], Ty::F64),
             ("__tesjit_arr_get", vec![Ptr, Ptr, Ptr], Ptr),
             ("__tesjit_arr_set", vec![Ptr, Ptr, Ptr, Ptr], Ptr),
         ]

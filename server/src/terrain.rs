@@ -1,4 +1,4 @@
-use exsolis_common::{BlockType, ChunkCoord, CHUNK_SIZE};
+use exsolis_common::{BlockId, ChunkCoord, CHUNK_SIZE};
 use opensimplex2::fast::{noise2, noise3_Fallback};
 
 /// World generation configuration loaded from Lua
@@ -44,11 +44,11 @@ pub struct BiomesConfig {
 #[derive(Debug, Clone)]
 pub struct SurfaceConfig {
     #[allow(dead_code)]
-    pub top_block: BlockType,
+    pub top_block: BlockId,
     #[allow(dead_code)]
-    pub filler_block: BlockType,
+    pub filler_block: BlockId,
     #[allow(dead_code)]
-    pub stone_block: BlockType,
+    pub stone_block: BlockId,
     pub water_level: i32,
     pub beach_depth: i32,
 }
@@ -131,9 +131,9 @@ impl Default for WorldGenConfig {
                 erosion_weight: 1.0,
             },
             surface: SurfaceConfig {
-                top_block: BlockType::Grass,
-                filler_block: BlockType::Dirt,
-                stone_block: BlockType::Stone,
+                top_block: exsolis_common::legacy_ids::GRASS as BlockId,
+                filler_block: exsolis_common::legacy_ids::DIRT as BlockId,
+                stone_block: exsolis_common::legacy_ids::STONE as BlockId,
                 water_level: 63,
                 beach_depth: 4,
             },
@@ -226,28 +226,30 @@ pub enum Biome {
 }
 
 impl Biome {
-    pub fn surface_block(&self) -> BlockType {
+    pub fn surface_block(&self) -> BlockId {
+        use exsolis_common::legacy_ids as ids;
         match self {
-            Biome::Ocean | Biome::Beach => BlockType::Sand,
-            Biome::Desert => BlockType::Sand,
-            Biome::Swamp => BlockType::Dirt,
-            Biome::Jungle => BlockType::Grass,
-            Biome::SnowyPlains | Biome::SnowyMountains => BlockType::Snow,
-            _ => BlockType::Grass,
+            Biome::Ocean | Biome::Beach => ids::SAND as BlockId,
+            Biome::Desert => ids::SAND as BlockId,
+            Biome::Swamp => ids::DIRT as BlockId,
+            Biome::Jungle => ids::GRASS as BlockId,
+            Biome::SnowyPlains | Biome::SnowyMountains => ids::SNOW as BlockId,
+            _ => ids::GRASS as BlockId,
         }
     }
 
-    pub fn filler_block(&self) -> BlockType {
+    pub fn filler_block(&self) -> BlockId {
+        use exsolis_common::legacy_ids as ids;
         match self {
-            Biome::Ocean | Biome::Beach | Biome::Desert => BlockType::Sand,
-            Biome::Swamp => BlockType::Dirt,
-            Biome::SnowyPlains | Biome::SnowyMountains => BlockType::Snow,
-            _ => BlockType::Dirt,
+            Biome::Ocean | Biome::Beach | Biome::Desert => ids::SAND as BlockId,
+            Biome::Swamp => ids::DIRT as BlockId,
+            Biome::SnowyPlains | Biome::SnowyMountains => ids::SNOW as BlockId,
+            _ => ids::DIRT as BlockId,
         }
     }
 
-    pub fn stone_block(&self) -> BlockType {
-        BlockType::Stone
+    pub fn stone_block(&self) -> BlockId {
+        exsolis_common::legacy_ids::STONE as BlockId
     }
 }
 
@@ -290,9 +292,10 @@ impl WorldGenerator {
     }
 
     /// Generate a chunk using all noise layers
-    pub fn generate_chunk(&self, coord: ChunkCoord) -> Vec<BlockType> {
+    pub fn generate_chunk(&self, coord: ChunkCoord) -> Vec<BlockId> {
+        use exsolis_common::AIR_ID;
         const SIZE: usize = CHUNK_SIZE as usize;
-        let mut blocks = vec![BlockType::Air; SIZE * SIZE * SIZE];
+        let mut blocks = vec![AIR_ID; SIZE * SIZE * SIZE];
 
         for x in 0..SIZE {
             for z in 0..SIZE {
@@ -440,7 +443,7 @@ impl WorldGenerator {
 
     fn generate_column(
         &self,
-        blocks: &mut [BlockType],
+        blocks: &mut [BlockId],
         x: usize,
         z: usize,
         chunk_y: i32,
@@ -461,9 +464,9 @@ impl WorldGenerator {
             if self.config.caves.enabled && world_y > 0 && world_y < 255 {
                 if self.is_cave(world_x, world_y, world_z) {
                     blocks[idx] = if world_y <= water_level {
-                        BlockType::Water
+                        exsolis_common::legacy_ids::WATER as BlockId
                     } else {
-                        BlockType::Air
+                        exsolis_common::AIR_ID
                     };
                     continue;
                 }
@@ -478,16 +481,16 @@ impl WorldGenerator {
             } else if world_y == surface_height {
                 // Surface block
                 if world_y <= water_level {
-                    blocks[idx] = BlockType::Water;
+                    blocks[idx] = exsolis_common::legacy_ids::WATER as BlockId;
                 } else {
                     blocks[idx] = biome.surface_block();
                 }
             } else if world_y <= water_level {
                 // Below water level but above surface: water
-                blocks[idx] = BlockType::Water;
+                blocks[idx] = exsolis_common::legacy_ids::WATER as BlockId;
             } else {
                 // Above surface: air
-                blocks[idx] = BlockType::Air;
+                blocks[idx] = exsolis_common::AIR_ID;
             }
         }
     }
@@ -626,9 +629,17 @@ pub fn load_worldgen_config(lua: &mlua::Lua) -> mlua::Result<WorldGenConfig> {
     };
 
     let surface = SurfaceConfig {
-        top_block: BlockType::from_u8(surface_table.get("top_block").unwrap_or(3)).unwrap_or(BlockType::Grass),
-        filler_block: BlockType::from_u8(surface_table.get("filler_block").unwrap_or(2)).unwrap_or(BlockType::Dirt),
-        stone_block: BlockType::from_u8(surface_table.get("stone_block").unwrap_or(1)).unwrap_or(BlockType::Stone),
+        top_block: read_block_id(&surface_table, "top_block", exsolis_common::legacy_ids::GRASS),
+        filler_block: read_block_id(
+            &surface_table,
+            "filler_block",
+            exsolis_common::legacy_ids::DIRT,
+        ),
+        stone_block: read_block_id(
+            &surface_table,
+            "stone_block",
+            exsolis_common::legacy_ids::STONE,
+        ),
         water_level: surface_table.get("water_level").unwrap_or(63),
         beach_depth: surface_table.get("beach_depth").unwrap_or(4),
     };
@@ -640,6 +651,18 @@ pub fn load_worldgen_config(lua: &mlua::Lua) -> mlua::Result<WorldGenConfig> {
         biomes,
         surface,
     })
+}
+
+/// Read a legacy u8 block id from a Lua config table, falling back to
+/// `default` when missing or unknown. Frozen M0 ids match `BlockId`
+/// numerically, so the cast is a no-op for the built-in set.
+fn read_block_id(table: &mlua::Table, key: &str, default: u8) -> BlockId {
+    let raw: u8 = table.get(key).unwrap_or(default);
+    if raw <= exsolis_common::legacy_ids::CHEST {
+        raw as BlockId
+    } else {
+        default as BlockId
+    }
 }
 
 fn load_noise_layer(table: &mlua::Table, key: &str, default: &NoiseLayerConfig) -> NoiseLayerConfig {

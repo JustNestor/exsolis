@@ -50,7 +50,7 @@ use bevy_ecs::prelude::*;
 use bevy_log::{debug, error, info, warn};
 use tesjit::{Compiled, HostFn, JitBuilder, Ty};
 
-use exsolis_common::{BlockPos, BlockType, PlayerId};
+use exsolis_common::{AIR_ID, BlockId, BlockPos, PlayerId};
 
 use crate::assets::mods_directory;
 use crate::chunks::{ChunkWorld, PlayerPosition};
@@ -219,6 +219,9 @@ thread_local! {
     /// Requests queued by host calls while a handler runs.
     static OUTBOX: std::cell::RefCell<Option<Arc<Mutex<Vec<ScriptRequest>>>>> =
         const { std::cell::RefCell::new(None) };
+    /// Live block registry length, installed per tick so `host_set_block`
+    /// can validate a legacy numeric id without world access.
+    static REGISTRY_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(11) };
 }
 
 impl PullCtx {
@@ -463,13 +466,17 @@ extern "C" fn host_broadcast(kind: i64) {
 }
 
 extern "C" fn host_set_block(x: i32, y: i32, z: i32, block: i32) {
-    let Some(block) = BlockType::from_u8(block as u8) else {
+    // Legacy numeric ids match `BlockId` one-to-one for the frozen M0 set;
+    // anything outside the live registry is rejected here (and again at
+    // drain time, in case the registry changed mid-tick).
+    let len = REGISTRY_LEN.with(|l| l.get());
+    if block < 0 || (block as usize) >= len {
         warn!("ts mod: set_block: invalid block id {block}");
         return;
-    };
+    }
     queue(ScriptRequest::SetBlock {
         pos: BlockPos::new(x, y, z),
-        block,
+        block: block as BlockId,
     });
 }
 
@@ -485,7 +492,7 @@ extern "C" fn host_get_block(x: i32, y: i32, z: i32) -> i32 {
     block
 }
 
-/// Block id at a world position, or `Air` when the chunk is not loaded.
+/// Block id at a world position, or air when the chunk is not loaded.
 fn block_at(world: &ChunkWorld, x: i32, y: i32, z: i32) -> i32 {
     let world: &ChunkWorld = world;
     let (coord, idx) = world_to_chunk_index(BlockPos::new(x, y, z));
@@ -494,7 +501,7 @@ fn block_at(world: &ChunkWorld, x: i32, y: i32, z: i32) -> i32 {
         .get(&coord)
         .and_then(|c| c.unpack())
         .and_then(|u| u.get(idx).copied())
-        .unwrap_or(BlockType::Air) as u8 as i32
+        .unwrap_or(AIR_ID) as i32
 }
 
 extern "C" fn host_player_count() -> i32 {
@@ -1082,6 +1089,9 @@ pub fn ts_tick_system(world: &mut World) {
         Some(chunks) => chunks as *const ChunkWorld,
         None => std::ptr::null(),
     };
+    if let Some(blocks) = world.get_resource::<crate::blocks::ServerBlocks>() {
+        REGISTRY_LEN.with(|l| l.set(blocks.0.len()));
+    }
 
     // Packed rows for `query_players`. The `Vec` lives in this system and is
     // never mutated during the tick, so the pointers registered against it stay
@@ -1149,6 +1159,9 @@ fn ts_drain_system(
     despawns: MessageWriter<crate::entities::DespawnEntityRequest>,
     outgoing: MessageWriter<crate::net::OutgoingPacket>,
     loaded_by: Query<(&crate::Player, &crate::chunks::ChunkRenderState)>,
+    blocks: Res<crate::blocks::ServerBlocks>,
+    player_map: Res<crate::PlayerMap>,
+    mut inventories: Query<&mut crate::Inventory>,
 ) {
     let outbox = runtime.outbox();
     let requests = outbox
@@ -1168,6 +1181,9 @@ fn ts_drain_system(
         despawns,
         outgoing,
         loaded_by,
+        &blocks,
+        &player_map,
+        &mut inventories,
     );
 }
 
@@ -1197,8 +1213,13 @@ pub fn ts_forward_leave(
 pub fn ts_forward_place_block(
     mut events: MessageReader<crate::interaction::PlaceBlockRequested>,
     runtime: Res<TsRuntime>,
+    blocks: Res<crate::blocks::ServerBlocks>,
 ) {
     for ev in events.read() {
+        // TS mods still speak numeric ids; resolve the name through the
+        // registry (-1 when unknown, which can only happen if the request
+        // itself was already rejected for the same reason).
+        let id = blocks.id(&ev.kind).map(|id| id as i32).unwrap_or(-1);
         runtime.dispatch(
             "place_block",
             &[
@@ -1206,7 +1227,7 @@ pub fn ts_forward_place_block(
                 HostArg::I32(ev.pos.x),
                 HostArg::I32(ev.pos.y),
                 HostArg::I32(ev.pos.z),
-                HostArg::I32(ev.kind as u8 as i32),
+                HostArg::I32(id),
             ],
         );
     }
@@ -1757,4 +1778,20 @@ fn host_field_offset_str(
         .iter()
         .find(|f| f.name == field)
         .map(|f| f.offset as u32)
+}
+
+#[cfg(test)]
+mod ts_mod_compile_tests {
+    use super::*;
+
+    #[test]
+    fn demo_option_compiles() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap(); // /home/nestor/prj/exsolis
+        let p = root.join("mods").join("ts").join("demo_option.ts");
+        match compile_mod(&p) {
+            Ok(_) => {}
+            Err(es) => panic!("demo_option.ts failed: {:#?}", es),
+        }
+    }
 }

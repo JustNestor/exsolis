@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use bevy_ecs::prelude::*;
-use exsolis_common::{BlockType, ChunkBlocks, ChunkCoord};
+use exsolis_common::{AIR_ID, BlockId, ChunkBlocks, ChunkCoord};
 
 pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
@@ -13,7 +13,7 @@ pub const CHUNK_SIZE_I32: i32 = CHUNK_SIZE as i32;
 #[derive(Component, Debug, Clone)]
 pub struct Chunk {
     pub coord: ChunkCoord,
-    blocks: Arc<[BlockType]>,
+    blocks: Arc<[BlockId]>,
 }
 
 impl Chunk {
@@ -24,7 +24,7 @@ impl Chunk {
         })
     }
 
-    pub fn set(&mut self, x: usize, y: usize, z: usize, kind: BlockType) {
+    pub fn set(&mut self, x: usize, y: usize, z: usize, kind: BlockId) {
         if x < CHUNK_SIZE && y < CHUNK_SIZE && z < CHUNK_SIZE {
             let idx = Self::index(x, y, z);
             Arc::make_mut(&mut self.blocks)[idx] = kind;
@@ -39,9 +39,9 @@ impl Chunk {
     }
 
     #[inline]
-    pub fn get(&self, x: usize, y: usize, z: usize) -> BlockType {
+    pub fn get(&self, x: usize, y: usize, z: usize) -> BlockId {
         if x >= CHUNK_SIZE || y >= CHUNK_SIZE || z >= CHUNK_SIZE {
-            return BlockType::Air;
+            return AIR_ID;
         }
         self.blocks[Self::index(x, y, z)]
     }
@@ -55,20 +55,24 @@ impl Chunk {
     }
 }
 
-/// Maps a color to each solid block type. Swap for real textures later —
+/// Maps a color to each solid block id. Swap for real textures later —
 /// mesh.rs only depends on `block_color`, nothing else needs to change.
-pub fn block_color(block: BlockType) -> [f32; 3] {
+///
+/// Ids are the frozen M0 registry order (air 0 .. chest 10); unknown ids
+/// fall back to magenta so missing defs are easy to spot.
+pub fn block_color(block: BlockId) -> [f32; 3] {
     match block {
-        BlockType::Air => [0.0, 0.0, 0.0], // never actually emitted
-        BlockType::Stone => [0.5, 0.5, 0.5],
-        BlockType::Dirt => [0.45, 0.3, 0.18],
-        BlockType::Grass => [0.25, 0.65, 0.25],
-        BlockType::Sand => [0.87, 0.8, 0.55],
-        BlockType::Water => [0.15, 0.4, 0.8],
-        BlockType::Snow => [0.95, 0.95, 0.97],
-        BlockType::Glass => [0.75, 0.9, 0.95],
-        BlockType::Log => [0.4, 0.27, 0.13],
-        BlockType::Leaves => [0.15, 0.45, 0.12],
-        BlockType::Chest => [0.55, 0.38, 0.22],
+        0 => [0.0, 0.0, 0.0], // air, never actually emitted
+        1 => [0.5, 0.5, 0.5], // stone
+        2 => [0.45, 0.3, 0.18], // dirt
+        3 => [0.25, 0.65, 0.25], // grass
+        4 => [0.87, 0.8, 0.55], // sand
+        5 => [0.15, 0.4, 0.8], // water
+        6 => [0.95, 0.95, 0.97], // snow
+        7 => [0.75, 0.9, 0.95], // glass
+        8 => [0.4, 0.27, 0.13], // log
+        9 => [0.15, 0.45, 0.12], // leaves
+        10 => [0.55, 0.38, 0.22], // chest
+        _ => [1.0, 0.0, 1.0], // unknown/modded: magenta
     }
 }

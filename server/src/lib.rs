@@ -11,6 +11,12 @@ pub mod gltf_pack;
 /// Model the server assigns to every player entity. A catalog asset path.
 pub const PLAYER_MODEL: &str = "models/girl.glb";
 
+/// First-person (arms-only) model. A working copy of the avatar
+/// (`assets/models/player/girl_base.glb`, edited from `girl.bbmodel`) so
+/// FP tuning — arm proportions, sleeve length, hand pose — never touches
+/// what other players see. Same rig, so the arm cut and bone palette match.
+pub const PLAYER_VIEWMODEL: &str = "models/player/girl_base.glb";
+
 /// Scale that takes the avatar's authored height to the ~1.8 blocks a
 /// player occupies.
 ///
