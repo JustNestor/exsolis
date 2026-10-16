@@ -16,7 +16,7 @@ use miette::NamedSource;
 use crate::check;
 use crate::codegen::{FnLowerer, FnSig};
 use crate::diag::{CompileError, Diagnostics, Src};
-use crate::hir::Module as HirModule;
+use crate::hir::{ComponentDecl, Module as HirModule, SystemExport};
 use crate::host::{HostFn, HostRegistry};
 use crate::runtime::TesjitRuntime;
 use crate::ty::Ty;
@@ -27,6 +27,12 @@ pub struct Compiled {
     /// Heap for strings/arrays created by the compiled code.
     runtime: Arc<TesjitRuntime>,
     pub fns: HashMap<String, Entry>,
+    /// Systems registered via `export default { stage: fn }`.
+    pub systems: Vec<SystemExport>,
+    /// Mod-defined component/resource layouts (for hot-reload hash checks).
+    pub components: Vec<ComponentDecl>,
+    /// Aggregate layout hash of `components` at compile time.
+    pub component_layout_hash: u64,
 }
 
 unsafe impl Send for Compiled {}
@@ -37,6 +43,11 @@ pub struct Entry {
     pub ptr: *const u8,
     pub params: Vec<Ty>,
     pub ret: Ty,
+    /// Host-frame loads for system functions (empty for ordinary exports).
+    pub frame_loads: Vec<crate::hir::FrameLoad>,
+    /// Number of machine i64 slots the function actually takes after frame
+    /// ABI expansion (Query → 2 slots). Host calls must pass this many args.
+    pub machine_arity: usize,
 }
 
 impl Compiled {
@@ -49,6 +60,16 @@ impl Compiled {
 
     pub fn entry(&self, name: &str) -> Option<&Entry> {
         self.fns.get(name)
+    }
+
+    /// Systems scheduled by this mod (`export default`).
+    pub fn systems(&self) -> &[SystemExport] {
+        &self.systems
+    }
+
+    /// Component/resource layouts declared by this mod.
+    pub fn components(&self) -> &[ComponentDecl] {
+        &self.components
     }
 
     /// Pending runtime trap (out-of-bounds index, out-of-memory, ...).
@@ -228,6 +249,11 @@ pub struct Jit {
     sigs: Vec<(String, FnSig)>,
     host: HostRegistry,
     src: Src,
+    /// Filled by the last successful `compile`.
+    systems: Vec<SystemExport>,
+    components: Vec<ComponentDecl>,
+    /// Per-function frame loads (systems only).
+    frame_loads: HashMap<String, Vec<crate::hir::FrameLoad>>,
 }
 
 impl Jit {
@@ -287,6 +313,9 @@ impl Jit {
             runtime,
             host,
             src,
+            systems: Vec::new(),
+            components: Vec::new(),
+            frame_loads: HashMap::new(),
         })
     }
 
@@ -299,13 +328,33 @@ impl Jit {
         }
         let module = module.expect("no diagnostics implies a module");
 
+        self.systems = module.systems.clone();
+        self.components = module.components.clone();
+        self.frame_loads.clear();
+        for f in &module.functions {
+            if !f.frame_loads.is_empty() {
+                self.frame_loads.insert(f.name.clone(), f.frame_loads.clone());
+            }
+        }
+        // Register mod component layouts on the host registry so signature
+        // checks and reload hashing see them.
+        for c in &module.components {
+            self.host.insert_component(c.name.clone(), Arc::clone(&c.layout));
+        }
+
         self.sigs.clear();
         // Local functions first (source order — this is the order HIR call
         // indices refer to), host imports after: host calls carry names, so
         // their position does not matter.
         for f in &module.functions {
-            let id = FnLowerer::declare(&mut self.module, &f.name, &f.params, f.ret.clone())
-                .map_err(|e| Diagnostics::from(CompileError::Plain(e)))?;
+            let id = FnLowerer::declare_framed(
+                &mut self.module,
+                &f.name,
+                &f.params,
+                f.ret.clone(),
+                &f.frame_loads,
+            )
+            .map_err(|e| Diagnostics::from(CompileError::Plain(e)))?;
             self.sigs.push((
                 f.name.clone(),
                 FnSig {
@@ -382,19 +431,47 @@ impl Jit {
                 continue;
             }
             let ptr = self.module.get_finalized_function(sig.id);
+            let frame_loads = self.frame_loads.remove(name).unwrap_or_default();
+            let machine_arity = if frame_loads.is_empty() {
+                sig.params.len()
+            } else {
+                frame_loads.iter().map(|fl| match &fl.kind {
+                    crate::hir::FrameLoadKind::Query { .. } => 2usize,
+                    _ => 1usize,
+                }).sum()
+            };
             fns.insert(
                 name.clone(),
                 Entry {
                     ptr,
                     params: sig.params.clone(),
                     ret: sig.ret.clone(),
+                    frame_loads,
+                    machine_arity,
                 },
             );
         }
+        let component_layout_hash = {
+            let mut h: u64 = 0xcbf29ce484222325;
+            let mut entries: Vec<_> = self.components.iter().map(|c| (&c.name, c.layout.layout_hash())).collect();
+            entries.sort_by(|a, b| a.0.cmp(b.0));
+            for (name, lh) in entries {
+                for b in name.bytes() {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(0x100000001b3);
+                }
+                h ^= lh;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h
+        };
         Ok(Compiled {
             module: Some(self.module),
             runtime,
             fns,
+            systems: self.systems,
+            components: self.components,
+            component_layout_hash,
         })
     }
 

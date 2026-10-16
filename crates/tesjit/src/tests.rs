@@ -1024,3 +1024,130 @@ fn for_of_arrays_mutate() {
     }
     drop(guard);
 }
+
+// ───────────────────── phase 2: struct layout / POD ─────────────────────
+
+#[test]
+fn struct_layout_repr_c_offsets() {
+    use crate::ty::{StructLayout, Ty};
+    let layout = StructLayout::repr_c(
+        "Pos",
+        vec![
+            ("x".into(), Ty::F32),
+            ("y".into(), Ty::F32),
+            ("z".into(), Ty::F32),
+        ],
+    )
+    .expect("layout");
+    assert_eq!(layout.fields[0].offset, 0);
+    assert_eq!(layout.fields[1].offset, 4);
+    assert_eq!(layout.fields[2].offset, 8);
+    assert_eq!(layout.size, 12);
+    assert_eq!(layout.align, 4);
+    assert!(layout.is_pod);
+}
+
+#[test]
+fn struct_layout_padding_and_align() {
+    use crate::ty::{StructLayout, Ty};
+    // { u8, i32 } → offset 0, pad to 4, offset 4; size 8, align 4
+    let layout = StructLayout::repr_c(
+        "Padded",
+        vec![("a".into(), Ty::U8), ("b".into(), Ty::I32)],
+    )
+    .expect("layout");
+    assert_eq!(layout.fields[0].offset, 0);
+    assert_eq!(layout.fields[1].offset, 4);
+    assert_eq!(layout.size, 8);
+    assert_eq!(layout.align, 4);
+}
+
+#[test]
+fn non_pod_struct_rejected_for_component() {
+    use crate::ty::Ty;
+    let s = Ty::Str;
+    assert!(s.ensure_pod().is_err());
+    let arr = Ty::Array(Box::new(Ty::I32));
+    assert!(arr.ensure_pod().is_err());
+    assert!(Ty::I32.ensure_pod().is_ok());
+    assert!(Ty::F64.ensure_pod().is_ok());
+    assert!(Ty::Entity.ensure_pod().is_ok());
+}
+
+#[test]
+fn layout_hash_stable() {
+    use crate::ty::{StructLayout, Ty};
+    let a = StructLayout::repr_c(
+        "Vel",
+        vec![("dx".into(), Ty::F32), ("dy".into(), Ty::F32)],
+    )
+    .unwrap();
+    let b = StructLayout::repr_c(
+        "Vel",
+        vec![("dx".into(), Ty::F32), ("dy".into(), Ty::F32)],
+    )
+    .unwrap();
+    let c = StructLayout::repr_c(
+        "Vel",
+        vec![("dx".into(), Ty::F64), ("dy".into(), Ty::F64)],
+    )
+    .unwrap();
+    assert_eq!(a.layout_hash(), b.layout_hash());
+    assert_ne!(a.layout_hash(), c.layout_hash());
+}
+
+#[test]
+fn component_layout_hash_on_empty_module() {
+    let src = r#"
+        export function go(): void {}
+    "#;
+    let c = build(src);
+    // Empty component set: hash equals the FNV offset basis seed.
+    assert_eq!(c.component_layout_hash, 0xcbf29ce484222325);
+    assert!(c.systems().is_empty());
+    assert!(c.components().is_empty());
+}
+
+#[test]
+fn host_registry_component_layout_hash_changes() {
+    use crate::host::HostRegistry;
+    use crate::ty::{StructLayout, Ty};
+    use std::sync::Arc;
+
+    let mut reg = HostRegistry::new();
+    let h0 = reg.component_layout_hash();
+
+    let layout = StructLayout::repr_c(
+        "Pos",
+        vec![("x".into(), Ty::F32), ("y".into(), Ty::F32)],
+    )
+    .unwrap();
+    reg.insert_component("Pos", Arc::new(layout));
+    let h1 = reg.component_layout_hash();
+    assert_ne!(h0, h1);
+
+    // Same layout again → same hash.
+    let layout2 = StructLayout::repr_c(
+        "Pos",
+        vec![("x".into(), Ty::F32), ("y".into(), Ty::F32)],
+    )
+    .unwrap();
+    let mut reg2 = HostRegistry::new();
+    reg2.insert_component("Pos", Arc::new(layout2));
+    assert_eq!(reg.component_layout_hash(), reg2.component_layout_hash());
+}
+
+#[test]
+fn signature_hash_stable() {
+    use crate::host::{HostFn, HostRegistry};
+    use crate::ty::Ty;
+
+    let mut a = HostRegistry::new();
+    a.insert(HostFn::new("log", vec![Ty::F64], Ty::Void, std::ptr::null()));
+    let mut b = HostRegistry::new();
+    b.insert(HostFn::new("log", vec![Ty::F64], Ty::Void, std::ptr::null()));
+    assert_eq!(a.signature_hash(), b.signature_hash());
+
+    b.insert(HostFn::new("send", vec![Ty::Str], Ty::Void, std::ptr::null()));
+    assert_ne!(a.signature_hash(), b.signature_hash());
+}

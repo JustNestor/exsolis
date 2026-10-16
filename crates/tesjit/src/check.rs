@@ -16,16 +16,39 @@ use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
 
 use crate::diag::{CompileError, Diagnostics, Src, err};
-use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Local, Module, Stmt};
+use crate::hir::{
+    CallTarget, ComponentDecl, Expr, ExprKind, FnDef, FrameLoad, FrameLoadKind, Intrinsic, Local,
+    Module, Place, QueryForCol, QueryShape, QueryTerm, Stmt, SystemExport,
+};
 use crate::host::{FnKind, HostRegistry, HostSig};
-use crate::ty::Ty;
+use crate::ty::{StructLayout, Ty};
 use miette::{SourceOffset, SourceSpan};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Type aliases and named structs discovered during lowering.
+#[derive(Clone, Debug, Default)]
+struct TypeScope {
+    aliases: HashMap<String, Ty>,
+}
+
+impl TypeScope {
+    fn insert(&mut self, name: String, ty: Ty) {
+        self.aliases.insert(name, ty);
+    }
+    fn get(&self, name: &str) -> Option<&Ty> {
+        self.aliases.get(name)
+    }
+}
 
 /// Collected pass state for one lowering run.
 pub struct Lowerer<'a> {
     src: &'a Src,
     host: &'a HostRegistry,
     diags: Diagnostics,
+    types: TypeScope,
+    components: Vec<ComponentDecl>,
+    systems: Vec<SystemExport>,
 }
 
 /// Extract the `Function` node of a top-level statement (function declaration,
@@ -51,6 +74,154 @@ impl<'a> Lowerer<'a> {
             src,
             host,
             diags: Diagnostics::new(),
+            types: TypeScope::default(),
+            components: Vec::new(),
+            systems: Vec::new(),
+        }
+    }
+
+
+    /// Parse `export default { update: sysFn }` into provisional SystemExport entries.
+    fn parse_default_export(&mut self, obj: &oxc_ast::ast::ObjectExpression<'_>) {
+        for prop in &obj.properties {
+            let oxc_ast::ast::ObjectPropertyKind::ObjectProperty(p) = prop else {
+                self.at(obj.span, "spread in export default is not supported");
+                continue;
+            };
+            let stage = match &p.key {
+                oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                oxc_ast::ast::PropertyKey::StringLiteral(s) => s.value.to_string(),
+                _ => {
+                    self.at(obj.span, "export default keys must be plain identifiers");
+                    continue;
+                }
+            };
+            let fn_name = match &p.value {
+                Expression::Identifier(id) => id.name.to_string(),
+                _ => {
+                    self.at(obj.span, "export default values must be function names");
+                    continue;
+                }
+            };
+            // Encode fn name until pass-2 resolution (fn_index == MAX).
+            self.systems.push(SystemExport {
+                stage: format!("{stage}\0{fn_name}"),
+                fn_index: usize::MAX,
+                fn_name: fn_name.clone(),
+            });
+        }
+    }
+
+    fn resolve_ty(&self, t: &TSType<'_>) -> Result<Ty, CompileError> {
+        ty_of_env(t, Some(&self.types))
+    }
+
+    /// Process a `type Foo = ...` alias at the module level (Pass 0).
+    fn lower_type_alias(&mut self, alias: &oxc_ast::ast::TSTypeAliasDeclaration<'_>) {
+        let name = alias.id.name.to_string();
+        match ty_of_env(&alias.type_annotation, Some(&self.types)) {
+            Ok(ty) => {
+                // Register as component/resource when wrapped, else plain alias.
+                if let Ty::Component(inner) = &ty {
+                    if let Some(layout) = inner.struct_layout() {
+                        let mut layout = (*layout).clone();
+                        layout.name = name.clone();
+                        let layout = Arc::new(layout);
+                        self.components.push(ComponentDecl {
+                            name: name.clone(),
+                            layout: layout.clone(),
+                            is_resource: false,
+                            span: alias.span,
+                        });
+                        self.types.insert(name.clone(), Ty::Struct(layout));
+                    } else {
+                        // Scalar component: synthesize single-field layout.
+                        match StructLayout::repr_c(&name, vec![("value".into(), (**inner).clone())]) {
+                            Ok(layout) => {
+                                let layout = Arc::new(layout);
+                                self.components.push(ComponentDecl {
+                                    name: name.clone(),
+                                    layout: layout.clone(),
+                                    is_resource: false,
+                                    span: alias.span,
+                                });
+                                self.types.insert(name, Ty::Struct(layout));
+                            }
+                            Err(e) => self.at(alias.span, e),
+                        }
+                    }
+                } else if let Ty::Resource(inner) = &ty {
+                    if let Some(layout) = inner.struct_layout() {
+                        let mut layout = (*layout).clone();
+                        layout.name = name.clone();
+                        let layout = Arc::new(layout);
+                        self.components.push(ComponentDecl {
+                            name: name.clone(),
+                            layout: layout.clone(),
+                            is_resource: true,
+                            span: alias.span,
+                        });
+                        self.types.insert(name.clone(), Ty::Struct(layout));
+                    } else {
+                        match StructLayout::repr_c(&name, vec![("value".into(), (**inner).clone())]) {
+                            Ok(layout) => {
+                                let layout = Arc::new(layout);
+                                self.components.push(ComponentDecl {
+                                    name: name.clone(),
+                                    layout: layout.clone(),
+                                    is_resource: true,
+                                    span: alias.span,
+                                });
+                                self.types.insert(name, Ty::Struct(layout));
+                            }
+                            Err(e) => self.at(alias.span, e),
+                        }
+                    }
+                } else if let Ty::Struct(layout) = &ty {
+                    let mut layout = (**layout).clone();
+                    layout.name = name.clone();
+                    let layout = Arc::new(layout);
+                    self.types.insert(name, Ty::Struct(layout));
+                } else {
+                    self.types.insert(name, ty);
+                }
+            }
+            Err(e) => self.at(alias.span, e.to_string()),
+        }
+    }
+
+    /// Process an `interface Pos { x: f32; ... }` at the module level (Pass 0).
+    fn lower_interface(&mut self, iface: &oxc_ast::ast::TSInterfaceDeclaration<'_>) {
+        let name = iface.id.name.to_string();
+        let mut fields = Vec::new();
+        for m in &iface.body.body {
+            match m {
+                oxc_ast::ast::TSSignature::TSPropertySignature(p) => {
+                    let fname = match &p.key {
+                        oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                        _ => {
+                            self.at(iface.span, "only plain identifier fields supported");
+                            continue;
+                        }
+                    };
+                    let Some(ann) = p.type_annotation.as_ref() else {
+                        self.at(iface.span, format!("field `{fname}` needs a type"));
+                        continue;
+                    };
+                    match ty_of_env(&ann.type_annotation, Some(&self.types)) {
+                        Ok(fty) => fields.push((fname, fty)),
+                        Err(e) => self.at(iface.span, e.to_string()),
+                    }
+                }
+                _ => self.at(iface.span, "only property signatures supported in interfaces"),
+            }
+        }
+        match StructLayout::repr_c(&name, fields) {
+            Ok(layout) => {
+                let layout = Arc::new(layout);
+                self.types.insert(name, Ty::Struct(layout));
+            }
+            Err(e) => self.at(iface.span, e),
         }
     }
 
@@ -92,6 +263,26 @@ impl<'a> Lowerer<'a> {
 
     /// Lower every top-level function of the program.
     fn lower(&mut self, body: &[Statement<'_>]) -> Module {
+        // Pass 0: type aliases / interfaces so later signatures can resolve
+        // mod-defined component names.
+        for stmt in body {
+            match stmt {
+                Statement::TSTypeAliasDeclaration(alias) => {
+                    self.lower_type_alias(alias);
+                }
+                Statement::TSInterfaceDeclaration(iface) => {
+                    self.lower_interface(iface);
+                }
+                // export default { update: foo } — collect system schedule.
+                Statement::ExportDefaultDeclaration(e) => {
+                    if let oxc_ast::ast::ExportDefaultDeclarationKind::ObjectExpression(obj) = &e.declaration {
+                        self.parse_default_export(obj);
+                    }
+                }
+                _ => {}
+            }
+        }
+
         // Pass 1: signatures. This is what makes forward calls legal and lets
         // the checker validate `declare function` against the host registry.
         //
@@ -111,7 +302,7 @@ impl<'a> Lowerer<'a> {
                 match p
                     .type_annotation
                     .as_ref()
-                    .map(|a| ty_of(&a.type_annotation))
+                    .map(|a| self.resolve_ty(&a.type_annotation))
                 {
                     Some(Ok(ty)) => params.push(ty),
                     Some(Err(e)) => {
@@ -128,7 +319,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             let ret = match &f.return_type {
-                Some(a) => match ty_of(&a.type_annotation) {
+                Some(a) => match self.resolve_ty(&a.type_annotation) {
                     Ok(ty) => ty,
                     Err(e) => {
                         self.push(e);
@@ -208,7 +399,27 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        Module { functions }
+        // Resolve system export function names → indices.
+        let mut systems = std::mem::take(&mut self.systems);
+        for sys in &mut systems {
+            if sys.fn_index == usize::MAX {
+                if let Some((stage, fname)) = sys.stage.split_once('\0') {
+                    sys.fn_name = fname.to_string();
+                    if let Some(idx) = functions.iter().position(|f| f.name == fname) {
+                        sys.stage = stage.to_string();
+                        sys.fn_index = idx;
+                    } else {
+                        sys.stage = stage.to_string();
+                    }
+                }
+            }
+        }
+
+        Module {
+            functions,
+            components: std::mem::take(&mut self.components),
+            systems,
+        }
     }
 
     fn lower_function(
@@ -219,16 +430,107 @@ impl<'a> Lowerer<'a> {
         scope: &ModuleScope,
     ) -> Option<FnDef> {
         let mut locals = Vec::with_capacity(f.params.items.len() + 16);
+        let mut frame_loads = Vec::new();
+        let mut has_ecs = false;
+        let mut has_value = false;
+
         for (i, p) in f.params.items.iter().enumerate() {
             let BindingPattern::BindingIdentifier(id) = &p.pattern else {
                 self.at(p.span, "destructuring parameters are not supported");
                 return None;
             };
-            locals.push(Local {
-                name: id.name.to_string(),
-                ty: sig.params[i].clone(),
-                span: id.span,
-            });
+            let pty = sig.params[i].clone();
+            let mut local = Local::simple(id.name.to_string(), pty.clone(), id.span);
+
+            // Signature-only ECS params arrive via the host frame, not as
+            // ordinary register arguments. Mark them and record a FrameLoad.
+            match &pty {
+                Ty::Query(row) => {
+                    has_ecs = true;
+                    local.indirect = true; // holds chunks_ptr
+                    let shape = query_shape_from_row(row, &self.types);
+                    frame_loads.push(FrameLoad {
+                        local: i,
+                        kind: FrameLoadKind::Query { shape },
+                    });
+                    // Synthetic chunk_count local (name is stable for QueryFor).
+                    // Allocated after all params so indices stay predictable.
+                }
+                Ty::Res(inner) => {
+                    has_ecs = true;
+                    local.indirect = true;
+                    let type_name = match inner.as_ref() {
+                        Ty::Struct(l) => l.name.clone(),
+                        other => other.name().into_owned(),
+                    };
+                    frame_loads.push(FrameLoad {
+                        local: i,
+                        kind: FrameLoadKind::Resource {
+                            type_name,
+                            mutable: false,
+                        },
+                    });
+                }
+                Ty::Mut(inner) => {
+                    has_ecs = true;
+                    local.indirect = true;
+                    local.mutable = true;
+                    let type_name = match inner.as_ref() {
+                        Ty::Struct(l) => l.name.clone(),
+                        other => other.name().into_owned(),
+                    };
+                    frame_loads.push(FrameLoad {
+                        local: i,
+                        kind: FrameLoadKind::Resource {
+                            type_name,
+                            mutable: true,
+                        },
+                    });
+                }
+                Ty::Commands => {
+                    has_ecs = true;
+                    frame_loads.push(FrameLoad {
+                        local: i,
+                        kind: FrameLoadKind::Commands,
+                    });
+                }
+                Ty::Component(_) | Ty::Resource(_) => {
+                    // These are type-level markers, not values — reject as params.
+                    self.at(p.span, format!("`{pty}` is not a valid parameter type; use Query/Res/Mut"));
+                    return None;
+                }
+                _ => {
+                    has_value = true;
+                }
+            }
+            locals.push(local);
+        }
+
+        if has_ecs && has_value {
+            self.at(
+                f.span,
+                "cannot mix ordinary value parameters with Query/Res/Mut/Commands in one function",
+            );
+            return None;
+        }
+
+        // For each Query param, allocate a sibling chunk_count local so
+        // QueryFor can bind it (host writes both via the frame).
+        let query_slots: Vec<usize> = frame_loads
+            .iter()
+            .filter(|fl| matches!(fl.kind, FrameLoadKind::Query { .. }))
+            .map(|fl| fl.local)
+            .collect();
+        for qslot in query_slots {
+            let count_name = format!("__qcount_{qslot}");
+            let count_local = Local::simple(count_name, Ty::I64, f.span);
+            locals.push(count_local);
+            // Note: QueryFor will look up __qcount_{slot} by declare() during
+            // body lowering; the pre-allocated name ensures no duplicate error
+            // if the for-of path also tries to declare it. The for-of path
+            // uses declare which checks lookup — so pre-declaring here means
+            // for-of must *look up* the existing slot. We keep the name
+            // convention identical.
         }
 
         let body = f.body.as_ref().expect("checked in pass 1");
@@ -240,9 +542,6 @@ impl<'a> Lowerer<'a> {
             ret: sig.ret.clone(),
             loop_depth: 0,
         };
-        // The function body lives in the function's own (base) scope: locals
-        // declared at its top level must stay alive for the whole function, so
-        // no extra scope is pushed here.
         let body = ctx.stmts(&body.statements);
         Some(FnDef {
             name,
@@ -251,6 +550,7 @@ impl<'a> Lowerer<'a> {
             locals: std::mem::take(&mut ctx.locals),
             body,
             span: f.span,
+            frame_loads,
         })
     }
 
@@ -309,11 +609,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             self.at(span, format!("duplicate binding `{name}`"));
             return None;
         }
-        self.locals.push(Local {
-            name: name.to_owned(),
-            ty,
-            span,
-        });
+        self.locals.push(Local::simple(name.to_owned(), ty, span));
         Some(self.locals.len() - 1)
     }
 
@@ -438,30 +734,160 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         return None;
                     }
                 };
-                let bpat = match &binding_decl.id {
-                    BindingPattern::BindingIdentifier(id) => id,
-                    _ => {
-                        self.at(f.span, "destructuring is not supported in for-of");
+
+                // Compute the iterable.
+                let iterable = self.expr(&f.right, None);
+
+                // ── Query<T> path ──────────────────────────────────────
+                if let Some(row_ty) = iterable.ty.query_row() {
+                    // Binding may be a plain identifier or a simple array
+                    // pattern for multi-component rows: `for (const [a, b] of q)`.
+                    let binding_names: Vec<(String, Span)> = match &binding_decl.id {
+                        BindingPattern::BindingIdentifier(id) => {
+                            vec![(id.name.to_string(), id.span)]
+                        }
+                        BindingPattern::ObjectPattern(_) => {
+                            self.at(f.span, "object destructuring in for-of is not supported");
+                            return None;
+                        }
+                        BindingPattern::ArrayPattern(ap) => {
+                            let mut names = Vec::new();
+                            for el in &ap.elements {
+                                match el {
+                                    Some(BindingPattern::BindingIdentifier(id)) => {
+                                        names.push((id.name.to_string(), id.span));
+                                    }
+                                    _ => {
+                                        self.at(f.span, "nested patterns in query for-of are not supported");
+                                        return None;
+                                    }
+                                }
+                            }
+                            names
+                        }
+                        _ => {
+                            self.at(f.span, "unsupported for-of binding form");
+                            return None;
+                        }
+                    };
+
+                    // Resolve row elements: Tuple → list of component tys;
+                    // single Component/Struct → one element.
+                    let terms: Vec<Ty> = match &row_ty {
+                        Ty::Tuple(ts) => ts.clone(),
+                        other => vec![other.clone()],
+                    };
+                    if binding_names.len() != terms.len() {
+                        self.at(
+                            f.span,
+                            format!(
+                                "query row has {} component(s) but binding has {} name(s)",
+                                terms.len(),
+                                binding_names.len()
+                            ),
+                        );
                         return None;
                     }
-                };
 
-                // Compute the iterable's elemental type.
-                let iterable = self.expr(&f.right, None);
+                    // The query param itself must be a local (signature-only
+                    // Query value is never materialised; the host passes
+                    // (chunks_ptr, chunk_count) via frame loads).
+                    let query_slot = match &iterable.kind {
+                        ExprKind::Local(s) => *s,
+                        _ => {
+                            self.at(f.span, "query for-of requires a query parameter");
+                            return None;
+                        }
+                    };
+
+                    // Allocate synthetic locals for chunks_ptr / chunk_count
+                    // if the frame ABI hasn't already bound them. For now we
+                    // reuse the query slot as chunks_ptr and invent a count
+                    // slot; the host frame loader will populate both.
+                    let chunks_ptr = query_slot;
+                    let count_name = format!("__qcount_{query_slot}");
+                    let chunk_count = if let Some(s) = self.lookup(&count_name) {
+                        s
+                    } else {
+                        match self.declare(&count_name, Ty::I64, f.span) {
+                            Some(s) => s,
+                            None => return None,
+                        }
+                    };
+
+                    self.loop_depth += 1;
+                    let mut columns = Vec::with_capacity(terms.len());
+                    for ((bname, bspan), term) in binding_names.iter().zip(terms.iter()) {
+                        // Determine mutability from Mut<T> wrapper.
+                        let (mutable, inner) = match term {
+                            Ty::Mut(t) => (true, (**t).clone()),
+                            Ty::Component(t) => (false, (**t).clone()),
+                            other => (false, other.clone()),
+                        };
+                        let (size, _) = inner.size_align().unwrap_or((8, 8));
+                        // Declare binding as indirect pointer local.
+                        let slot = match self.declare(bname, inner.clone(), *bspan) {
+                            Some(s) => s,
+                            None => return None,
+                        };
+                        self.locals[slot].indirect = true;
+                        self.locals[slot].mutable = mutable;
+                        if mutable {
+                            // Dirty flag local.
+                            if let Some(d) = self.declare(&format!("__dirty_{slot}"), Ty::Bool, *bspan) {
+                                self.locals[slot].dirty_slot = Some(d);
+                            }
+                        }
+                        columns.push(QueryForCol {
+                            local: slot,
+                            mutable,
+                            field_offset: 0,
+                            size,
+                            ty: inner,
+                        });
+                    }
+
+                    // Body stays in the same scope so bindings remain visible.
+                    let body_stmts = {
+                        let mut out = Vec::new();
+                        if let Some(stmt) = self.stmt(&f.body) {
+                            out.push(stmt);
+                        } else if let Statement::BlockStatement(b) = &f.body {
+                            out.extend(self.stmts(&b.body));
+                        }
+                        out
+                    };
+                    self.loop_depth -= 1;
+
+                    return Some(Stmt::QueryFor {
+                        chunks_ptr,
+                        chunk_count,
+                        columns,
+                        body: body_stmts,
+                        span: f.span,
+                    });
+                }
+
+                // ── Array path (existing desugar) ──────────────────────
                 let Some(elem_ty) = iterable.ty.elem() else {
                     self.at(f.right.span(), format!("cannot iterate over {}", iterable.ty));
                     return None;
+                };
+                let bpat = match &binding_decl.id {
+                    BindingPattern::BindingIdentifier(id) => id,
+                    _ => {
+                        self.at(f.span, "destructuring is not supported in array for-of");
+                        return None;
+                    }
                 };
                 let binding_slot = match self.declare(&bpat.name, elem_ty.clone(), bpat.span) {
                     Some(s) => s,
                     None => return None,
                 };
 
-                // Ensure binding initializer absent case: declare gives slot, zero init.
                 self.loop_depth += 1;
                 let index_slot = self.declare("__i", Ty::I32, bpat.span).unwrap_or(binding_slot);
 
-                // init: index = 0
                 let init_expr = Expr::new(ExprKind::Int(0), Ty::I32, f.span);
                 let init_stmt = Stmt::Let { local: index_slot, init: Some(init_expr), span: f.span };
 
@@ -473,7 +899,6 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     f.span,
                 );
 
-                // read iterable[index] into binding before body
                 let index_val = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
                 let slice_expr = Expr::new(ExprKind::Index { target: Box::new(iterable.clone()), index: Box::new(index_val.clone()) }, elem_ty.clone(), f.span);
                 let bind_stmt = Stmt::Expr { expr: Expr::new(ExprKind::Assign { local: binding_slot, op: None, value: Box::new(slice_expr) }, Ty::Void, f.span), span: f.span };
@@ -483,7 +908,6 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 full_body.push(bind_stmt);
                 full_body.extend(body_stmts);
 
-                // write binding back to iterable[index] after body
                 let index_val2 = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
                 let binding_val = Expr::new(ExprKind::Local(binding_slot), elem_ty.clone(), f.span);
                 let write_back = Stmt::Expr { expr: Expr::new(ExprKind::SetIndex { target: Box::new(iterable.clone()), index: Box::new(index_val2), value: Box::new(binding_val) }, Ty::Void, f.span ), span: f.span };
@@ -545,6 +969,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 Some(Stmt::Continue { span: c.span })
             }
             Statement::EmptyStatement(_) => None,
+            // Type aliases and interfaces are processed at module scope (Pass 0);
+            // nested ones are silently ignored.
             Statement::TSTypeAliasDeclaration(_) | Statement::TSInterfaceDeclaration(_) => None,
             other => {
                 self.at(other.span(), "unsupported statement");
@@ -572,7 +998,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 continue;
             };
             let declared = match &decl.type_annotation {
-                Some(a) => match ty_of(&a.type_annotation) {
+                Some(a) => match self.lowerer.resolve_ty(&a.type_annotation) {
                     Ok(ty) => Some(ty),
                     Err(e) => {
                         self.at(decl.span, e.to_string());
@@ -789,7 +1215,43 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             }
             Expression::StaticMemberExpression(m) => {
                 let target = self.expr(&m.object, None);
-                self.member_length(&target, m.span)
+                // `s.length` / `a.length`
+                if m.property.name.as_str() == "length" {
+                    return self.member_length(&target, m.span);
+                }
+                // Struct / component field access → PlaceRead.
+                if let Some((offset, fty)) = target.ty.field(m.property.name.as_str()) {
+                    let place = match &target.kind {
+                        ExprKind::Local(slot) => {
+                            let local = &self.locals[*slot];
+                            Place {
+                                slot: *slot,
+                                offset,
+                                ty: fty.clone(),
+                                indirect: local.indirect,
+                                dirty_slot: local.dirty_slot,
+                            }
+                        }
+                        ExprKind::PlaceRead { place } => Place {
+                            slot: place.slot,
+                            offset: place.offset + offset,
+                            ty: fty.clone(),
+                            indirect: place.indirect,
+                            dirty_slot: place.dirty_slot,
+                        },
+                        _ => {
+                            return self.poison(
+                                m.span,
+                                "field access only on locals or places (no temporary structs)",
+                            );
+                        }
+                    };
+                    return Expr::new(ExprKind::PlaceRead { place }, fty, m.span);
+                }
+                self.poison(
+                    m.span,
+                    format!("type {} has no field `{}`", target.ty, m.property.name),
+                )
             }
             Expression::ComputedMemberExpression(m) => {
                 let target = self.expr(&m.object, None);
@@ -988,16 +1450,85 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         a.span,
                     );
                 }
+                // `x.field = v` / `x.field += v`
+                if let AssignmentTarget::StaticMemberExpression(m) = &a.left {
+                    let base = self.expr(&m.object, None);
+                    let Some((offset, fty)) = base.ty.field(m.property.name.as_str()) else {
+                        return self.poison(
+                            a.span,
+                            format!("type {} has no field `{}`", base.ty, m.property.name),
+                        );
+                    };
+                    let place = match &base.kind {
+                        ExprKind::Local(slot) => {
+                            let local = &self.locals[*slot];
+                            if !local.mutable && local.indirect {
+                                self.at(a.span, "cannot write through an immutable binding");
+                            }
+                            Place {
+                                slot: *slot,
+                                offset,
+                                ty: fty.clone(),
+                                indirect: local.indirect,
+                                dirty_slot: local.dirty_slot,
+                            }
+                        }
+                        ExprKind::PlaceRead { place } => {
+                            Place {
+                                slot: place.slot,
+                                offset: place.offset + offset,
+                                ty: fty.clone(),
+                                indirect: place.indirect,
+                                dirty_slot: place.dirty_slot,
+                            }
+                        }
+                        _ => {
+                            return self.poison(
+                                a.span,
+                                "field assignment only on locals or places",
+                            );
+                        }
+                    };
+                    let rhs = self.expr(&a.right, Some(fty.clone()));
+                    let op = if a.operator == AssignmentOperator::Assign {
+                        None
+                    } else {
+                        compound_op(a.operator)
+                    };
+                    if let Some(op) = op {
+                        self.check_arith(
+                            op,
+                            &Expr::new(ExprKind::PlaceRead { place: place.clone() }, fty.clone(), a.span),
+                            &rhs,
+                            a.span,
+                        );
+                    } else if rhs.ty != fty {
+                        self.at(a.span, format!("cannot assign {} to {}", rhs.ty, fty));
+                    }
+                    return Expr::new(
+                        ExprKind::PlaceWrite {
+                            place,
+                            op,
+                            value: Box::new(rhs),
+                        },
+                        fty,
+                        a.span,
+                    );
+                }
                 let AssignmentTarget::AssignmentTargetIdentifier(id) = &a.left else {
                     return self.poison(
                         a.span,
-                        "only assignment to plain variables or array elements is supported",
+                        "only assignment to plain variables, fields, or array elements is supported",
                     );
                 };
                 let Some(slot) = self.lookup(id.name.as_str()) else {
                     return self.poison(a.span, format!("unknown variable `{}`", id.name));
                 };
                 let ty = self.locals[slot].ty.clone();
+                // Reject whole-struct copies (phase-2 rule).
+                if matches!(ty, Ty::Struct(_)) {
+                    return self.poison(a.span, "copying a struct is not supported; assign fields individually");
+                }
                 let rhs = self.expr(&a.right, Some(ty.clone()));
                 let op = if a.operator == AssignmentOperator::Assign {
                     None
@@ -1019,6 +1550,26 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     );
                 } else if rhs.ty != ty {
                     self.at(a.span, format!("cannot assign {} to {}", rhs.ty, ty));
+                }
+                // Indirect mutable locals (query bindings) go through PlaceWrite
+                // so the dirty flag is set.
+                if self.locals[slot].indirect {
+                    let place = Place {
+                        slot,
+                        offset: 0,
+                        ty: ty.clone(),
+                        indirect: true,
+                        dirty_slot: self.locals[slot].dirty_slot,
+                    };
+                    return Expr::new(
+                        ExprKind::PlaceWrite {
+                            place,
+                            op,
+                            value: Box::new(rhs),
+                        },
+                        ty,
+                        a.span,
+                    );
                 }
                 Expr::new(
                     ExprKind::Assign {
@@ -1467,13 +2018,117 @@ fn is_comparison(op: BinaryOperator) -> bool {
 }
 
 /// Resolve a TS type annotation to a [`Ty`].
+/// Build a QueryShape from a Query row type (tuple or single component).
+fn query_shape_from_row(row: &Ty, types: &TypeScope) -> QueryShape {
+    let terms_ty: Vec<Ty> = match row {
+        Ty::Tuple(ts) => ts.clone(),
+        other => vec![other.clone()],
+    };
+    let mut terms = Vec::with_capacity(terms_ty.len());
+    for t in terms_ty {
+        let (mutable, inner) = match &t {
+            Ty::Mut(inner) => (true, (**inner).clone()),
+            other => (false, other.clone()),
+        };
+        let name = match &inner {
+            Ty::Struct(l) => l.name.clone(),
+            Ty::Component(c) => match c.as_ref() {
+                Ty::Struct(l) => l.name.clone(),
+                other => other.name().into_owned(),
+            },
+            other => other.name().into_owned(),
+        };
+        // Prefer layout from the type itself, fall back to TypeScope alias.
+        let layout = inner
+            .struct_layout()
+            .or_else(|| types.get(&name).and_then(|t| t.struct_layout()));
+        terms.push(QueryTerm {
+            name,
+            layout,
+            mutable,
+        });
+    }
+    QueryShape { terms }
+}
+
 pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
+    ty_of_env(t, None)
+}
+
+/// Type lowering with optional alias environment (for mod-defined structs).
+pub fn ty_of_env(t: &TSType<'_>, env: Option<&TypeScope>) -> Result<Ty, CompileError> {
     match t {
         TSType::TSNumberKeyword(_) => Ok(Ty::F64),
         TSType::TSBooleanKeyword(_) => Ok(Ty::Bool),
         TSType::TSStringKeyword(_) => Ok(Ty::Str),
-        TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of(&arr.element_type)?))),
+        TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of_env(&arr.element_type, env)?))),
         TSType::TSVoidKeyword(_) => Ok(Ty::Void),
+        TSType::TSTupleType(tup) => {
+            let mut elems = Vec::with_capacity(tup.element_types.len());
+            for el in &tup.element_types {
+                // TSTupleElement is either a type or a named rest; we only
+                // support plain types for now.
+                let ts = match el {
+                    oxc_ast::ast::TSTupleElement::TSAnyKeyword(k) => {
+                        return Err(crate::diag::plain("any is not supported in tuples".into()));
+                    }
+                    other => {
+                        // Most variants implement the type through a nested field;
+                        // fall back to span-based error for unsupported forms.
+                        // The common case is a bare TSType via the enum's type payload.
+                        // oxc represents tuple elements as TSType in recent versions
+                        // via a transparent wrapper; try the standard path.
+                        match other {
+                            _ => {
+                                // Best-effort: re-parse as TSType if the node span matches.
+                                // For phase 2 we accept only TSType-like elements by
+                                // using the first type-annotation style child.
+                                return Err(crate::diag::plain(
+                                    "tuple element form not yet supported; use a named struct".into(),
+                                ));
+                            }
+                        }
+                    }
+                };
+                let _ = ts;
+            }
+            // Fallback: empty tuple not useful; reject for now.
+            Err(crate::diag::plain(
+                "tuple types in annotations are limited; prefer a named interface/type alias".into(),
+            ))
+        }
+        TSType::TSTypeLiteral(lit) => {
+            // Anonymous object type → anonymous struct layout.
+            let mut fields = Vec::new();
+            for m in &lit.members {
+                match m {
+                    oxc_ast::ast::TSSignature::TSPropertySignature(p) => {
+                        let name = match &p.key {
+                            oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
+                            _ => {
+                                return Err(crate::diag::plain(
+                                    "only plain identifier field names are supported".into(),
+                                ));
+                            }
+                        };
+                        let ann = p
+                            .type_annotation
+                            .as_ref()
+                            .ok_or_else(|| crate::diag::plain(format!("field `{name}` needs a type")))?;
+                        let fty = ty_of_env(&ann.type_annotation, env)?;
+                        fields.push((name, fty));
+                    }
+                    _ => {
+                        return Err(crate::diag::plain(
+                            "only property signatures are supported in type literals".into(),
+                        ));
+                    }
+                }
+            }
+            let layout = StructLayout::repr_c("", fields)
+                .map_err(crate::diag::plain)?;
+            Ok(Ty::Struct(Arc::new(layout)))
+        }
         TSType::TSTypeReference(r) => match &r.type_name {
             TSTypeName::IdentifierReference(id) => match id.name.as_str() {
                 "i8" => Ok(Ty::I8),
@@ -1495,7 +2150,7 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Option<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Option(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Option(Box::new(ty_of_env(&args.params[0], env)?)))
                 }
                 "Query" => {
                     let args = r
@@ -1505,7 +2160,7 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Query<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Query(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Query(Box::new(ty_of_env(&args.params[0], env)?)))
                 }
                 "Res" => {
                     let args = r
@@ -1515,7 +2170,7 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Res<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Res(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Res(Box::new(ty_of_env(&args.params[0], env)?)))
                 }
                 "Mut" => {
                     let args = r
@@ -1525,10 +2180,42 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Mut<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Mut(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Mut(Box::new(ty_of_env(&args.params[0], env)?)))
+                }
+                "Component" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Component<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Component<T> requires <T>".to_string()));
+                    }
+                    let inner = ty_of_env(&args.params[0], env)?;
+                    inner.ensure_pod().map_err(crate::diag::plain)?;
+                    Ok(Ty::Component(Box::new(inner)))
+                }
+                "Resource" => {
+                    let args = r
+                        .type_arguments
+                        .as_ref()
+                        .ok_or_else(|| crate::diag::plain("Resource<T> requires <T>".to_string()))?;
+                    if args.params.is_empty() {
+                        return Err(crate::diag::plain("Resource<T> requires <T>".to_string()));
+                    }
+                    let inner = ty_of_env(&args.params[0], env)?;
+                    inner.ensure_pod().map_err(crate::diag::plain)?;
+                    Ok(Ty::Resource(Box::new(inner)))
                 }
                 "Commands" => Ok(Ty::Commands),
-                other => Err(crate::diag::plain(format!("unknown type `{other}`"))),
+                other => {
+                    // Look up mod-defined type aliases.
+                    if let Some(env) = env {
+                        if let Some(ty) = env.get(other) {
+                            return Ok(ty.clone());
+                        }
+                    }
+                    Err(crate::diag::plain(format!("unknown type `{other}`")))
+                }
             },
             _ => Err(crate::diag::plain("qualified type names are not supported")),
         },

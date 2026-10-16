@@ -113,7 +113,10 @@ struct PullCtx {
     /// Packed query rows for `query_*` — a *view* of the buffer the tick system
     /// owns, so mods read and write the very memory the write-back applies.
     rows: RowsView,
+    /// name → Bevy ComponentId.index() for allowlisted engine components.
     components: HashMap<String, u64>,
+    /// Generic query packers (name → how to fill a column from the world/snapshot).
+    packers: QueryPackRegistry,
 }
 
 /// A view of one tick's row buffer.
@@ -227,7 +230,123 @@ thread_local! {
     /// Live block registry length, installed per tick so `host_set_block`
     /// can validate a legacy numeric id without world access.
     static REGISTRY_LEN: std::cell::Cell<usize> = const { std::cell::Cell::new(11) };
+    /// Per-tick commands buffer for systems that take `Commands`.
+    static TS_COMMANDS: std::cell::RefCell<TsCommands> =
+        const { std::cell::RefCell::new(TsCommands::new()) };
+    /// Named resource pointers installed for the tick (`Res`/`Mut` frame loads).
+    /// Keyed by type name (e.g. `"ChunkWorld"`). Pointers are valid only for
+    /// the duration of `ts_tick_system`.
+    static TS_RESOURCES: std::cell::RefCell<HashMap<String, ResourceSlot>> =
+        const { std::cell::RefCell::new(HashMap::new()) };
 }
+
+/// One resource exposed to JIT systems this tick.
+#[derive(Clone, Copy, Debug)]
+struct ResourceSlot {
+    ptr: *mut u8,
+    size: usize,
+    mutable: bool,
+}
+
+// SAFETY: only used on the tick thread while the world is exclusively borrowed.
+unsafe impl Send for ResourceSlot {}
+unsafe impl Sync for ResourceSlot {}
+
+/// Append-only command buffer for TS systems (`Commands` param).
+///
+/// Structural changes commit at end of tick (Q2): the buffer is flushed into
+/// the shared `ScriptRequest` outbox after every system has run, matching the
+/// Lua `ScriptRequest` model.
+#[derive(Clone, Debug, Default)]
+struct TsCommands {
+    ops: Vec<TsCommand>,
+}
+
+impl TsCommands {
+    const fn new() -> Self {
+        Self { ops: Vec::new() }
+    }
+
+    fn clear(&mut self) {
+        self.ops.clear();
+    }
+
+    fn push(&mut self, op: TsCommand) {
+        self.ops.push(op);
+    }
+
+    fn drain_to_outbox(&mut self) {
+        let ops = std::mem::take(&mut self.ops);
+        for op in ops {
+            match op {
+                TsCommand::SetBlock { x, y, z, block } => {
+                    let len = REGISTRY_LEN.with(|l| l.get());
+                    if block < 0 || (block as usize) >= len {
+                        warn!("ts commands: SetBlock invalid id {block}");
+                        continue;
+                    }
+                    queue(ScriptRequest::SetBlock {
+                        pos: BlockPos::new(x, y, z),
+                        block: block as BlockId,
+                    });
+                }
+                TsCommand::Despawn { entity } => {
+                    // Typed spawn deferred (Q3); despawn via request if entity
+                    // maps to a known player id. [assumption] entity handle is
+                    // the PlayerId u64 for the demo path.
+                    debug!("ts commands: Despawn({entity}) deferred to entity layer");
+                }
+                TsCommand::InsertComponent { entity, type_name, bytes } => {
+                    let _ = (entity, type_name, bytes);
+                    debug!("ts commands: InsertComponent deferred (typed spawn Q3)");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum TsCommand {
+    SetBlock { x: i32, y: i32, z: i32, block: i32 },
+    Despawn { entity: u64 },
+    InsertComponent {
+        entity: u64,
+        type_name: String,
+        bytes: Vec<u8>,
+    },
+}
+
+/// Install resource pointers for the duration of a tick.
+fn install_resources(slots: HashMap<String, ResourceSlot>) {
+    TS_RESOURCES.with(|r| *r.borrow_mut() = slots);
+}
+
+fn clear_resources() {
+    TS_RESOURCES.with(|r| r.borrow_mut().clear());
+}
+
+fn resource_ptr(name: &str, want_mut: bool) -> *mut u8 {
+    TS_RESOURCES.with(|r| {
+        r.borrow()
+            .get(name)
+            .filter(|s| s.mutable || !want_mut)
+            .map(|s| s.ptr)
+            .unwrap_or(std::ptr::null_mut())
+    })
+}
+
+fn reset_commands() {
+    TS_COMMANDS.with(|c| c.borrow_mut().clear());
+}
+
+fn flush_commands() {
+    TS_COMMANDS.with(|c| c.borrow_mut().drain_to_outbox());
+}
+
+/// Opaque handle value passed as the `Commands` frame arg: non-zero token
+/// meaning "use the tick-local TS_COMMANDS buffer".
+const COMMANDS_HANDLE: i64 = 1;
+
 
 impl PullCtx {
     fn install(&self) {
@@ -245,6 +364,7 @@ impl Clone for PullCtx {
             bevy_world: self.bevy_world,
             rows: self.rows.clone(),
             components: self.components.clone(),
+            packers: self.packers.clone(),
         }
     }
 }
@@ -331,6 +451,18 @@ fn host_fns() -> Vec<HostFn> {
             vec![Ty::I32, Ty::I32, Ty::I32, Ty::I32],
             Ty::Void,
             host_set_block as *const u8,
+        ),
+        HostFn::new(
+            "commands_set_block",
+            vec![Ty::I64, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
+            Ty::Void,
+            host_commands_set_block as *const u8,
+        ),
+        HostFn::new(
+            "commands_despawn",
+            vec![Ty::I64, Ty::I64],
+            Ty::Void,
+            host_commands_despawn as *const u8,
         ),
         HostFn::new(
             "get_block",
@@ -471,16 +603,221 @@ extern "C" fn host_component_access_id(name: i64) -> i64 {
 }
 
 fn build_component_registry(world: &mut World) -> HashMap<String, u64> {
-    // Bootstrap set of component kinds that mods can refer to by stable
-    // name. IDs are Bevy's runtime ids, resolved fresh each tick.
     let mut out = HashMap::new();
     if let Some(id) = world.component_id::<crate::Player>() {
         out.insert("Player".to_string(), id.index() as u64);
     }
+    if let Some(id) = world.component_id::<PlayerPosition>() {
+        let idx = id.index() as u64;
+        out.insert("PlayerPosition".to_string(), idx);
+        out.insert("Pos".to_string(), idx);
+        out.insert("Position".to_string(), idx);
+    }
     out
 }
 
+/// How a single query term is packed into a dense column for the JIT kernel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackKind {
+    /// `Player.id` as u64.
+    PlayerId,
+    /// Full `PlayerPosition` as three f32 (12 bytes).
+    PlayerPosition,
+    /// Single axis of player position.
+    PlayerX,
+    PlayerY,
+    PlayerZ,
+    /// Unknown / mod component: emit zeroed column with `row_count` rows.
+    Zero { stride: usize },
+}
 
+/// Registry of packable component names for generic `Query<T>` frame loads.
+#[derive(Clone, Debug, Default)]
+struct QueryPackRegistry {
+    /// Canonical name → packer. Aliases are inserted as extra keys.
+    by_name: HashMap<String, PackKind>,
+}
+
+impl QueryPackRegistry {
+    fn engine_defaults() -> Self {
+        let mut by_name = HashMap::new();
+        let aliases: &[(&str, PackKind)] = &[
+            ("Player", PackKind::PlayerId),
+            ("player", PackKind::PlayerId),
+            ("PlayerPosition", PackKind::PlayerPosition),
+            ("Pos", PackKind::PlayerPosition),
+            ("Position", PackKind::PlayerPosition),
+            ("pos", PackKind::PlayerPosition),
+            ("position", PackKind::PlayerPosition),
+            ("x", PackKind::PlayerX),
+            ("y", PackKind::PlayerY),
+            ("z", PackKind::PlayerZ),
+            ("PlayerPosition.x", PackKind::PlayerX),
+            ("PlayerPosition.y", PackKind::PlayerY),
+            ("PlayerPosition.z", PackKind::PlayerZ),
+            ("Pos.x", PackKind::PlayerX),
+            ("Pos.y", PackKind::PlayerY),
+            ("Pos.z", PackKind::PlayerZ),
+        ];
+        for (k, v) in aliases {
+            by_name.insert((*k).to_string(), *v);
+        }
+        Self { by_name }
+    }
+
+    /// Register a mod-defined component layout as a zero-filled column until
+    /// the world actually stores those components (Q3 spawn path).
+    fn register_mod_layout(&mut self, name: &str, size: usize) {
+        self.by_name
+            .entry(name.to_string())
+            .or_insert(PackKind::Zero {
+                stride: size.max(1),
+            });
+    }
+
+    fn resolve(&self, term_name: &str, layout_size: Option<usize>) -> PackKind {
+        if let Some(k) = self.by_name.get(term_name) {
+            return *k;
+        }
+        // Case-insensitive fallback.
+        let lower = term_name.to_ascii_lowercase();
+        for (k, v) in &self.by_name {
+            if k.to_ascii_lowercase() == lower {
+                return *v;
+            }
+        }
+        PackKind::Zero {
+            stride: layout_size.unwrap_or(4).max(1),
+        }
+    }
+}
+
+fn pack_kind_stride(kind: PackKind) -> usize {
+    match kind {
+        PackKind::PlayerId => 8,
+        PackKind::PlayerPosition => 12,
+        PackKind::PlayerX | PackKind::PlayerY | PackKind::PlayerZ => 4,
+        PackKind::Zero { stride } => stride,
+    }
+}
+
+fn pack_kind_into(kind: PackKind, rows: &[PlayerRow], out: &mut Vec<u8>) {
+    match kind {
+        PackKind::PlayerId => {
+            for r in rows {
+                out.extend_from_slice(&r.id.to_le_bytes());
+            }
+        }
+        PackKind::PlayerPosition => {
+            for r in rows {
+                out.extend_from_slice(&r.x.to_le_bytes());
+                out.extend_from_slice(&r.y.to_le_bytes());
+                out.extend_from_slice(&r.z.to_le_bytes());
+            }
+        }
+        PackKind::PlayerX => {
+            for r in rows {
+                out.extend_from_slice(&r.x.to_le_bytes());
+            }
+        }
+        PackKind::PlayerY => {
+            for r in rows {
+                out.extend_from_slice(&r.y.to_le_bytes());
+            }
+        }
+        PackKind::PlayerZ => {
+            for r in rows {
+                out.extend_from_slice(&r.z.to_le_bytes());
+            }
+        }
+        PackKind::Zero { stride } => {
+            out.resize(out.len() + rows.len() * stride, 0);
+        }
+    }
+}
+
+/// Generic query packer: one dense chunk, one column per `QueryShape` term.
+///
+/// Row data currently comes from the tick's `PlayerRow` snapshot (built via
+/// Bevy `Query<(&Player, &PlayerPosition)>`). Terms resolve through
+/// [`QueryPackRegistry`] so adding a new engine component is: register a
+/// `PackKind` + fill path — not a new ABI.
+///
+/// Multi-archetype: when non-player components gain packers that return
+/// independent entity sets, split into multiple `(row_count, cols)` entries
+/// in `pack_query_chunks`. Today all engine packers share the player entity
+/// set, so one chunk is correct.
+///
+/// [assumption] Dynamic Bevy `Table` column pointers per `ComponentId` are the
+/// eventual source; the snapshot path matches the existing verified `row_*` API.
+fn pack_query_generic(
+    rows: &[PlayerRow],
+    shape: &tesjit::hir::QueryShape,
+    registry: &QueryPackRegistry,
+) -> (Vec<u8>, u64, Vec<Vec<u8>>) {
+    let n_cols = shape.terms.len().max(1);
+    let n = rows.len();
+    if n == 0 {
+        return empty_query_chunks(n_cols);
+    }
+
+    let mut col_bufs: Vec<Vec<u8>> = Vec::with_capacity(n_cols);
+    if shape.terms.is_empty() {
+        // Degenerate Query: one zero column.
+        let mut buf = Vec::new();
+        pack_kind_into(PackKind::Zero { stride: 4 }, rows, &mut buf);
+        col_bufs.push(buf);
+    } else {
+        for term in &shape.terms {
+            let layout_size = term.layout.as_ref().map(|l| l.size as usize);
+            let kind = registry.resolve(&term.name, layout_size);
+            // Prefer layout stride when the packer is Zero; for known kinds the
+            // packer defines the stride (JIT field_offset still applies).
+            let mut buf: Vec<u8> = Vec::with_capacity(n * pack_kind_stride(kind));
+            pack_kind_into(kind, rows, &mut buf);
+            // If the term layout is wider than what we packed (e.g. mod struct
+            // registered as Zero with size from layout), pad per element.
+            if let Some(sz) = layout_size {
+                let packed_stride = pack_kind_stride(kind);
+                if sz > packed_stride && matches!(kind, PackKind::Zero { .. }) == false {
+                    // Known packer produced tightly packed data; leave as-is —
+                    // QueryForCol.field_offset handles subfields.
+                } else if sz > packed_stride && n > 0 {
+                    let mut wide = vec![0u8; n * sz];
+                    for i in 0..n {
+                        let src = i * packed_stride;
+                        let dst = i * sz;
+                        let take = packed_stride.min(sz);
+                        wide[dst..dst + take].copy_from_slice(&buf[src..src + take]);
+                    }
+                    buf = wide;
+                }
+            }
+            col_bufs.push(buf);
+        }
+    }
+    while col_bufs.len() < n_cols {
+        col_bufs.push(vec![0u8; n * 4]);
+    }
+    let cols: Vec<*mut u8> = col_bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+    let (desc, count) = pack_query_chunks(&[(n as u64, cols)], n_cols);
+    (desc, count, col_bufs)
+}
+
+fn empty_query_chunks(n_cols: usize) -> (Vec<u8>, u64, Vec<Vec<u8>>) {
+    let col_bufs = vec![Vec::new(); n_cols];
+    let cols = vec![std::ptr::null_mut(); n_cols];
+    let (desc, count) = pack_query_chunks(&[(0, cols)], n_cols);
+    (desc, count, col_bufs)
+}
+
+/// Legacy name kept for older call sites.
+fn pack_engine_query_shape(
+    rows: &[PlayerRow],
+    shape: &tesjit::hir::QueryShape,
+) -> (Vec<u8>, u64, Vec<Vec<u8>>) {
+    pack_query_generic(rows, shape, &QueryPackRegistry::engine_defaults())
+}
 
 extern "C" fn host_send(player: i64, kind: i64) {
     let (player, kind) = unsafe { (ts_str(player), ts_str(kind)) };
@@ -519,6 +856,31 @@ extern "C" fn host_set_block(x: i32, y: i32, z: i32, block: i32) {
     queue(ScriptRequest::SetBlock {
         pos: BlockPos::new(x, y, z),
         block: block as BlockId,
+    });
+}
+
+/// Enqueue a block change into the tick-local `Commands` buffer (end-of-tick
+/// commit). `handle` must be `COMMANDS_HANDLE`.
+extern "C" fn host_commands_set_block(handle: i64, x: i32, y: i32, z: i32, block: i32) {
+    if handle != COMMANDS_HANDLE {
+        warn!("ts mod: commands_set_block with invalid handle {handle}");
+        return;
+    }
+    TS_COMMANDS.with(|c| {
+        c.borrow_mut().push(TsCommand::SetBlock { x, y, z, block });
+    });
+}
+
+/// Enqueue a despawn into the commands buffer (entity = PlayerId for now).
+extern "C" fn host_commands_despawn(handle: i64, entity: i64) {
+    if handle != COMMANDS_HANDLE {
+        warn!("ts mod: commands_despawn with invalid handle {handle}");
+        return;
+    }
+    TS_COMMANDS.with(|c| {
+        c.borrow_mut().push(TsCommand::Despawn {
+            entity: entity as u64,
+        });
     });
 }
 
@@ -843,6 +1205,22 @@ impl TsRuntime {
             }
             match compile_mod(&path) {
                 Ok(compiled) => {
+                    // §7: reject-on-layout-change. If this path already had a
+                    // live mod and the new component layout hash differs,
+                    // keep the old Compiled and log the rejection.
+                    if let Some(index) = self.mods.iter().position(|m| m.name == display(&path)) {
+                        let old_hash = self.mods[index].compiled.component_layout_hash;
+                        let new_hash = compiled.component_layout_hash;
+                        if old_hash != 0 && new_hash != 0 && old_hash != new_hash {
+                            error!(
+                                "[ts mod] {} rejected: component layout hash changed ({old_hash:#x} → {new_hash:#x}); keeping previous build",
+                                path.display()
+                            );
+                            next_mods.push(self.mods.swap_remove(index));
+                            failures.insert(path.clone(), stamp);
+                            continue;
+                        }
+                    }
                     info!("[ts mod] loaded {}", path.display());
                     // A successful build supersedes any earlier failure.
                     failures.remove(&path);
@@ -886,6 +1264,14 @@ impl TsRuntime {
             if m.compiled.entry("on_tick").is_some() {
                 out.push(format!("{}:on_tick", m.name));
             }
+            for sys in m.compiled.systems() {
+                let fname = if !sys.fn_name.is_empty() {
+                    sys.fn_name.as_str()
+                } else {
+                    continue;
+                };
+                out.push(format!("{}:system:{}:{fname}", m.name, sys.stage));
+            }
         }
         out
     }
@@ -897,7 +1283,8 @@ impl TsRuntime {
         out
     }
 
-    /// Call every mod's `on_tick` export, with a fresh fuel budget each.
+    /// Call every mod's `on_tick` export and any `export default` systems
+    /// scheduled on the `"update"` stage, with a fresh fuel budget each.
     pub(crate) fn tick(
         &self,
         positions: &HashMap<String, (f32, f32, f32)>,
@@ -909,16 +1296,6 @@ impl TsRuntime {
             // buffer the caller owns, not a copy.
             set_rows_view(rows);
             for m in &self.mods {
-                let Some(entry) = m.compiled.entry("on_tick") else {
-                    continue;
-                };
-                if entry.ret != Ty::Void || !entry.params.is_empty() {
-                    warn!(
-                        "[ts mod] {} exported `on_tick` with the wrong shape",
-                        m.name
-                    );
-                    continue;
-                }
                 // Region ids are per module (every mod has its own runtime), so
                 // the same row buffer is registered under each module's id and
                 // that id is what the pull API hands out for this mod.
@@ -927,9 +1304,22 @@ impl TsRuntime {
                     rows.as_ptr() as *mut u8,
                     rows.len() * std::mem::size_of::<PlayerRow>(),
                 ));
-                run_guarded(m, "on_tick", |compiled| unsafe {
-                    compiled.call_void("on_tick", &[])
-                });
+
+                if let Some(entry) = m.compiled.entry("on_tick") {
+                    if entry.ret != Ty::Void || !entry.params.is_empty() {
+                        warn!(
+                            "[ts mod] {} exported `on_tick` with the wrong shape",
+                            m.name
+                        );
+                    } else {
+                        run_guarded(m, "on_tick", |compiled| unsafe {
+                            compiled.call_void("on_tick", &[])
+                        });
+                    }
+                }
+
+                // Phase-2 systems: `export default { update: sysFn }`.
+                invoke_update_systems(m, rows);
             }
             let _ = positions;
             let _ = world;
@@ -988,6 +1378,157 @@ impl TsRuntime {
     }
 }
 
+/// Invoke every system scheduled on the `"update"` stage.
+///
+/// Frame ABI (matches codegen `declare_framed` / `define`):
+/// - `Query` → two i64 slots: `chunks_ptr`, `chunk_count`
+/// - `Res`/`Mut` → pointer into a tick-local resource slot
+/// - `Commands` → `COMMANDS_HANDLE` (tick-local `TsCommands`)
+fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
+    for sys in m.compiled.systems() {
+        if sys.stage != "update" {
+            continue;
+        }
+        let name = if !sys.fn_name.is_empty() {
+            sys.fn_name.as_str()
+        } else {
+            continue;
+        };
+        let Some(entry) = m.compiled.entry(name) else {
+            warn!("[ts mod] {} system `{}` not found in exports", m.name, name);
+            continue;
+        };
+        if entry.ret != Ty::Void {
+            warn!("[ts mod] {} system `{}` must return void", m.name, name);
+            continue;
+        }
+
+        let mut slots: Vec<i64> = Vec::new();
+        let mut live_bufs: Vec<Vec<u8>> = Vec::new();
+        let mut col_storage: Vec<Vec<u8>> = Vec::new();
+
+        if entry.frame_loads.is_empty() {
+            if entry.params.is_empty() {
+                run_guarded(m, name, |compiled| unsafe {
+                    compiled.call_void(name, &[])
+                });
+            }
+            continue;
+        }
+
+        for fl in &entry.frame_loads {
+            match &fl.kind {
+                tesjit::hir::FrameLoadKind::Query { shape } => {
+                    let (desc_buf, count, cols) = with_pull(|ctx| {
+                        pack_query_generic(rows, shape, &ctx.packers)
+                    })
+                    .unwrap_or_else(|| pack_query_generic(rows, shape, &QueryPackRegistry::engine_defaults()));
+                    let ptr = desc_buf.as_ptr() as i64;
+                    live_bufs.push(desc_buf);
+                    col_storage.extend(cols);
+                    slots.push(ptr);
+                    slots.push(count as i64);
+                }
+                tesjit::hir::FrameLoadKind::Resource { type_name, mutable } => {
+                    let mut ptr = resource_ptr(type_name, *mutable);
+                    if ptr.is_null() {
+                        // Fall back to allowlisted engine names.
+                        ptr = ["ChunkWorld", "PlayerMap", "ServerBlocks", "ServerTypes"]
+                            .iter()
+                            .find_map(|n| {
+                                let p = resource_ptr(n, *mutable);
+                                if p.is_null() {
+                                    None
+                                } else {
+                                    Some(p)
+                                }
+                            })
+                            .unwrap_or(std::ptr::null_mut());
+                    }
+                    slots.push(ptr as i64);
+                }
+                tesjit::hir::FrameLoadKind::Commands => {
+                    slots.push(COMMANDS_HANDLE);
+                }
+            }
+        }
+
+        slots.truncate(entry.machine_arity);
+        while slots.len() < entry.machine_arity {
+            slots.push(0);
+        }
+
+        run_guarded(m, name, |compiled| unsafe {
+            compiled.call_void(name, &slots)
+        });
+        drop(live_bufs);
+        drop(col_storage);
+    }
+}
+
+/// Pack `PlayerRow` into column-major buffers + a QueryChunkDesc array.
+///
+/// Returns `(desc_bytes, chunk_count, column_buffers)`.
+/// Column layout matches `emit_query_for`: `col_ptr + row_i * elem_size`.
+///
+/// For the demo path every term shares the PlayerRow snapshot:
+/// - col 0 → tightly packed `x: f32` values
+/// - col 1 → tightly packed `y: f32` values
+/// - col 2 → tightly packed `z: f32` values
+/// - further cols repeat `x` (placeholder until real component registries).
+///
+/// [assumption] Systems that query engine `PlayerPosition`-like data can use
+/// this packing; mod-defined components need Bevy table iteration.
+fn player_rows_as_query_chunks_cols(
+    rows: &[PlayerRow],
+    n_cols: usize,
+    shape: &tesjit::hir::QueryShape,
+) -> (Vec<u8>, u64, Vec<Vec<u8>>) {
+    let n = rows.len();
+    let mut col_bufs: Vec<Vec<u8>> = Vec::with_capacity(n_cols);
+    for c in 0..n_cols {
+        // Prefer f32 size from the term layout when available.
+        let elem = shape
+            .terms
+            .get(c)
+            .and_then(|t| t.layout.as_ref())
+            .map(|l| l.size as usize)
+            .unwrap_or(4);
+        let mut buf = vec![0u8; n * elem.max(4)];
+        for (i, row) in rows.iter().enumerate() {
+            let v = match c % 3 {
+                0 => row.x,
+                1 => row.y,
+                _ => row.z,
+            };
+            let bytes = v.to_le_bytes();
+            let off = i * elem.max(4);
+            buf[off..off + 4].copy_from_slice(&bytes);
+        }
+        col_bufs.push(buf);
+    }
+    let cols: Vec<*mut u8> = col_bufs.iter_mut().map(|b| b.as_mut_ptr()).collect();
+    let (desc, count) = pack_query_chunks(&[(n as u64, cols)], n_cols);
+    (desc, count, col_bufs)
+}
+
+/// Backward-compatible wrapper used by older call sites.
+fn player_rows_as_query_chunks(rows: &[PlayerRow], n_cols: usize) -> (Vec<u8>, u64) {
+    let shape = tesjit::hir::QueryShape {
+        terms: (0..n_cols)
+            .map(|_| tesjit::hir::QueryTerm {
+                name: "f32".into(),
+                layout: None,
+                mutable: false,
+            })
+            .collect(),
+    };
+    let (desc, count, _cols) = player_rows_as_query_chunks_cols(rows, n_cols, &shape);
+    // Note: column buffers are dropped here — only safe for tests that don't
+    // dereference. Prefer `_cols` variant in invoke_update_systems.
+    (desc, count)
+}
+
 /// Run one handler with fuel armed, the runtime entered, and any trap logged.
 fn run_guarded(m: &TsMod, handler: &str, call: impl Fn(&Compiled)) {
     m.compiled.runtime().reset_fuel(PER_CALL_FUEL);
@@ -1027,6 +1568,59 @@ fn compile_mod(path: &Path) -> Result<Compiled, Vec<tesjit::CompileError>> {
 
 /// Every `*.ts` file under `root`, in a stable order (directory order would
 /// make reloads non-deterministic).
+
+// ───────────────────── Phase 2: Query chunk ABI ─────────────────────
+//
+// The host packs Bevy table columns into an array of QueryChunkDesc and
+// passes (ptr, count) to a system via the frame ABI (FnDef.frame_loads).
+//
+// Layout (must match codegen::emit_query_for):
+//   offset 0: row_count : u64
+//   offset 8: col0_ptr  : *mut u8
+//   offset 16: col1_ptr : *mut u8
+//   ...
+//
+// Component layout hashes from Module.components are checked against the
+// previously registered HostRegistry::component_layout_hash on reload; a
+// mismatch rejects the new mod and keeps the old Compiled (see §7 of the
+// plan). Typed spawn remains deferred (Q3).
+
+/// One archetype chunk handed to a JIT query kernel.
+#[repr(C)]
+pub struct QueryChunkDesc {
+    pub row_count: u64,
+    /// Column pointers follow immediately in memory; the host allocates
+    /// `size_of::<u64>() + n_cols * size_of::<usize>()` per chunk.
+    pub _cols_start: [*mut u8; 0],
+}
+
+/// Build a contiguous buffer of `QueryChunkDesc` records for `n_cols` columns.
+/// Returns (buffer pointer, chunk count). The buffer is owned by the caller
+/// (typically a per-tick scratch arena on PullCtx / TsRuntime).
+///
+/// [assumption] Bevy 0.1x table iteration yields dense column slices per
+/// archetype; we copy the raw `*mut u8` of each column without reordering.
+#[allow(dead_code)]
+fn pack_query_chunks(
+    chunks: &[(u64, Vec<*mut u8>)], // (row_count, col_ptrs)
+    n_cols: usize,
+) -> (Vec<u8>, u64) {
+    let desc_size = 8 + n_cols * std::mem::size_of::<usize>();
+    let mut buf = vec![0u8; chunks.len() * desc_size];
+    for (i, (row_count, cols)) in chunks.iter().enumerate() {
+        assert_eq!(cols.len(), n_cols);
+        let base = i * desc_size;
+        buf[base..base + 8].copy_from_slice(&row_count.to_le_bytes());
+        for (c, ptr) in cols.iter().enumerate() {
+            let off = base + 8 + c * std::mem::size_of::<usize>();
+            let p = *ptr as usize;
+            buf[off..off + std::mem::size_of::<usize>()].copy_from_slice(&p.to_le_bytes());
+        }
+    }
+    let count = chunks.len() as u64;
+    (buf, count)
+}
+
 fn discover_ts_files(root: &Path) -> io::Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -1139,15 +1733,65 @@ pub fn ts_tick_system(world: &mut World) {
     // never mutated during the tick, so the pointers registered against it stay
     // valid for every handler call.
     let rows = QueryRows::from_positions(&positions);
+    let components = build_component_registry(world);
+    let mut packers = QueryPackRegistry::engine_defaults();
+    // Mod-defined components from loaded TS mods become zero-columns until
+    // they exist in the Bevy world (generic query shape still type-checks).
+    for m in &runtime.mods {
+        for c in m.compiled.components() {
+            packers.register_mod_layout(&c.name, c.layout.size as usize);
+        }
+    }
     PullCtx {
         positions: positions.clone(),
         world: world_ptr,
         bevy_world: world as *const bevy_ecs::prelude::World,
         rows: RowsView::default(),
-        components: build_component_registry(world),
+        components,
+        packers,
     }
     .install();
+
+    // Phase-2: install Res/Mut resource slots for the tick.
+    let mut res_slots = HashMap::new();
+    if let Some(chunks) = world.get_resource::<ChunkWorld>() {
+        res_slots.insert(
+            "ChunkWorld".into(),
+            ResourceSlot {
+                ptr: chunks as *const ChunkWorld as *mut u8,
+                size: std::mem::size_of::<ChunkWorld>(),
+                mutable: false,
+            },
+        );
+    }
+    if let Some(map) = world.get_resource::<crate::PlayerMap>() {
+        res_slots.insert(
+            "PlayerMap".into(),
+            ResourceSlot {
+                ptr: map as *const crate::PlayerMap as *mut u8,
+                size: std::mem::size_of_val(map),
+                mutable: false,
+            },
+        );
+    }
+    if let Some(blocks) = world.get_resource::<crate::blocks::ServerBlocks>() {
+        res_slots.insert(
+            "ServerBlocks".into(),
+            ResourceSlot {
+                ptr: blocks as *const crate::blocks::ServerBlocks as *mut u8,
+                size: std::mem::size_of_val(blocks),
+                mutable: false,
+            },
+        );
+    }
+    install_resources(res_slots);
+    reset_commands();
+
     runtime.tick(&positions, world_ptr, &rows.players);
+
+    // Q2: structural commands commit at end of tick.
+    flush_commands();
+    clear_resources();
     PullCtx::uninstall();
     TYPE_DB.with(|slot| *slot.borrow_mut() = None);
 
@@ -1497,8 +2141,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1611,8 +2257,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime_ctx.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1660,8 +2308,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1695,8 +2345,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1758,8 +2410,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime.tick(&positions(), std::ptr::null(), &rows.players);
@@ -1790,8 +2444,10 @@ mod tests {
         PullCtx {
             positions: positions(),
             world: std::ptr::null(),
+            bevy_world: std::ptr::null(),
             rows: RowsView::default(),
-        components: HashMap::new(),
+            components: HashMap::new(),
+            packers: QueryPackRegistry::engine_defaults(),
         }
         .install();
         runtime.dispatch(

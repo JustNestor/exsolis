@@ -30,7 +30,9 @@
 //!
 //! Types: integers `i8`–`i64` / `u8`–`u64`, floats `f32`/`f64`
 //! (`number` means `f64`), `boolean`, opaque `Entity` handles, `string`,
-//! `T[]`, `void`. Every function boundary is fully annotated.
+//! `T[]`, named `repr(C)` structs, `Component<T>` / `Resource<T>`,
+//! `Query<T>` / `Res<T>` / `Mut<T>` / `Commands`, `void`.
+//! Every function boundary is fully annotated.
 
 pub mod check;
 pub mod codegen;
@@ -45,7 +47,7 @@ pub use diag::{CompileError, Diagnostics, SyntaxDiag};
 pub use host::{FnKind, FnTable, HostFn, HostRegistry, HostSig};
 pub use jit::{Compiled, Entry, Jit, JitBuilder};
 pub use runtime::{TesjitRuntime, TrapKind};
-pub use ty::Ty;
+pub use ty::{Field, StructLayout, Ty};
 
 #[cfg(test)]
 mod tests;

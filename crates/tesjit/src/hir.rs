@@ -8,22 +8,94 @@
 //! tables, no type expectations, no fallible decisions. That separation is what
 //! makes batch diagnostics ("report every error at once") and a future AOT
 //! backend cheap to add.
+//!
+//! Phase 2 additions:
+//! - resolved [`Place`] (slot + byte offset + ty + indirect flag) for field /
+//!   index writeback;
+//! - [`Stmt::QueryFor`] for `for (const row of query)` over Bevy column chunks;
+//! - [`SystemExport`] / [`FrameLoad`] for default-export system ABI;
+//! - [`ComponentDecl`] collected from mod type aliases.
 
 use oxc_ast::ast::{BinaryOperator, LogicalOperator, UnaryOperator};
 use oxc_span::Span;
 
-use crate::ty::Ty;
+use crate::ty::{StructLayout, Ty};
+use std::sync::Arc;
 
 /// A whole compilation unit.
 pub struct Module {
     /// TS-defined functions, in source order.
     pub functions: Vec<FnDef>,
+    /// Mod-defined components discovered from type aliases / interfaces.
+    pub components: Vec<ComponentDecl>,
+    /// Systems registered via `export default { update: … }` (or similar).
+    pub systems: Vec<SystemExport>,
 }
 
 impl Module {
     pub fn find(&self, name: &str) -> Option<&FnDef> {
         self.functions.iter().find(|f| f.name == name)
     }
+}
+
+/// A component (or resource) declared by the mod.
+#[derive(Clone, Debug)]
+pub struct ComponentDecl {
+    pub name: String,
+    pub layout: Arc<StructLayout>,
+    /// True for `Resource<T>`, false for `Component<T>`.
+    pub is_resource: bool,
+    pub span: Span,
+}
+
+/// A system exported by the mod (from `export default`).
+#[derive(Clone, Debug)]
+pub struct SystemExport {
+    /// Schedule stage name (`"update"`, `"setup"`, …).
+    pub stage: String,
+    /// Index into `Module::functions`.
+    pub fn_index: usize,
+    /// Function name (stable host lookup; preferred over fn_index).
+    pub fn_name: String,
+}
+
+/// Describes one parameter of a system that comes from the host frame
+/// (query descriptor pointer, resource pointer, commands handle, …).
+#[derive(Clone, Debug)]
+pub struct FrameLoad {
+    /// Local slot that receives the host-provided value.
+    pub local: usize,
+    /// What the host writes into that slot.
+    pub kind: FrameLoadKind,
+}
+
+#[derive(Clone, Debug)]
+pub enum FrameLoadKind {
+    /// Pointer to a `QueryChunkDesc` array + count (for `Query<T>` params).
+    Query { shape: QueryShape },
+    /// Pointer to a resource value (`Res<T>` / `Mut<T>`).
+    Resource {
+        /// Type name for host lookup (`"ChunkWorld"`, …).
+        type_name: String,
+        mutable: bool,
+    },
+    /// Opaque commands buffer handle.
+    Commands,
+}
+
+/// Shape of a `Query<T>` as seen by the host: ordered list of component
+/// terms with mutability.
+#[derive(Clone, Debug)]
+pub struct QueryShape {
+    pub terms: Vec<QueryTerm>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryTerm {
+    /// Component type name (for host lookup / layout hash).
+    pub name: String,
+    pub layout: Option<Arc<StructLayout>>,
+    pub mutable: bool,
 }
 
 /// A function definition: signature, locals, and a typed body.
@@ -39,6 +111,8 @@ pub struct FnDef {
     /// Typed function body.
     pub body: Vec<Stmt>,
     pub span: Span,
+    /// Host-frame loads for system functions (empty for ordinary exports).
+    pub frame_loads: Vec<FrameLoad>,
 }
 
 impl FnDef {
@@ -54,6 +128,28 @@ pub struct Local {
     pub name: String,
     pub ty: Ty,
     pub span: Span,
+    /// When true the local holds a *pointer* to the value (query column
+    /// binding, resource, …) rather than the value itself.
+    pub indirect: bool,
+    /// When true the local may be written (and, for query bindings, the
+    /// write must be flushed to the column at the end of the iteration).
+    pub mutable: bool,
+    /// Dirty flag slot (optional): set when a mutable indirect local is
+    /// written so the epilogue knows to store it back.
+    pub dirty_slot: Option<usize>,
+}
+
+impl Local {
+    pub fn simple(name: impl Into<String>, ty: Ty, span: Span) -> Self {
+        Self {
+            name: name.into(),
+            ty,
+            span,
+            indirect: false,
+            mutable: false,
+            dirty_slot: None,
+        }
+    }
 }
 
 /// A statement. Control flow keeps its body as a nested statement list, so
@@ -96,12 +192,52 @@ pub enum Stmt {
     Break { span: Span },
     /// `continue` — target is the innermost loop.
     Continue { span: Span },
+    /// Array `for-of` (desugared by the checker into a counted `For`).
+    /// Kept for backwards compatibility with existing array tests; new
+    /// query iteration uses [`Stmt::QueryFor`].
     ForOf {
         binding: usize,
         iter: Expr,
         body: Vec<Stmt>,
         span: Span,
     },
+    /// `for (const [a, b] of query)` over Bevy column chunks.
+    ///
+    /// Codegen emits:
+    /// ```text
+    /// for chunk_i in 0..chunk_count:
+    ///   load column pointers + row count from QueryChunkDesc[chunk_i]
+    ///   for row_i in 0..row_count:
+    ///     bind each column[row_i] into the binding locals (indirect)
+    ///     body
+    ///     write back dirty mutable columns
+    /// ```
+    QueryFor {
+        /// Local holding the pointer to the `QueryChunkDesc` array.
+        chunks_ptr: usize,
+        /// Local holding the chunk count.
+        chunk_count: usize,
+        /// Per-term column binding: (local slot, mutable, field offset inside
+        /// the component if the binding is a field projection, else 0).
+        columns: Vec<QueryForCol>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
+}
+
+/// One column binding inside a [`Stmt::QueryFor`].
+#[derive(Clone, Debug)]
+pub struct QueryForCol {
+    /// Local that receives the *pointer* to the element (or the element
+    /// itself for scalar components).
+    pub local: usize,
+    pub mutable: bool,
+    /// Byte offset within the component when the binding is a field of a
+    /// multi-field component; 0 for whole-component bindings.
+    pub field_offset: u32,
+    /// Size of the bound value in bytes (for write-back).
+    pub size: u32,
+    pub ty: Ty,
 }
 
 /// A typed expression. `ty` is always the checker-computed type of the node.
@@ -192,7 +328,6 @@ pub const BUILTINS: &[(&str, Intrinsic)] = &[
     ("store_f32", Intrinsic::StoreF32),
     ("store_i64", Intrinsic::StoreI64),
     ("load_i32", Intrinsic::LoadI32),
-    ("store_f64", Intrinsic::StoreF64),
     ("store_i32", Intrinsic::StoreI32),
     ("region_id", Intrinsic::RegionId),
 ];
@@ -305,17 +440,42 @@ pub enum ExprKind {
         elems: Vec<Expr>,
         elem_ty: Ty,
     },
-    PlaceRead { place: PlaceExpr },
+    /// Read through a resolved place (slot / field / index).
+    PlaceRead { place: Place },
+    /// Write through a resolved place. `op` is `None` for plain `=`.
     PlaceWrite {
-        place: PlaceExpr,
+        place: Place,
         op: Option<BinaryOperator>,
         value: Box<Expr>,
     },
+    /// Placeholder for query iteration (kept for phase-1 scaffolding).
     Iter { query: Box<Expr> },
     OptionSome { value: Box<Expr> },
     OptionNone { ty: Ty },
 }
 
+/// A fully resolved place expression.
+///
+/// The checker turns `x`, `x.field`, `a[i]` into this form so codegen only
+/// has to emit a load/store at `(base + offset)` (or an array element).
+#[derive(Clone, Debug)]
+pub struct Place {
+    /// Local slot that holds the base value (or pointer when `indirect`).
+    pub slot: usize,
+    /// Byte offset from the base (0 for whole-slot places).
+    pub offset: u32,
+    /// Type of the value being read/written.
+    pub ty: Ty,
+    /// When true, `slot` holds a *pointer* to the value; load/store go
+    /// through that pointer. Used for query column bindings and resources.
+    pub indirect: bool,
+    /// Optional dirty-flag local: set to 1 on write so the QueryFor
+    /// epilogue knows to flush the value back to the column.
+    pub dirty_slot: Option<usize>,
+}
+
+/// Legacy place form kept for source compatibility with older scaffolding.
+/// Prefer [`Place`].
 #[derive(Clone, Debug)]
 pub enum PlaceExpr {
     Slot(usize),

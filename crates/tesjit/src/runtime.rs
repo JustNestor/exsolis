@@ -155,6 +155,10 @@ impl Arena {
     }
 
     #[inline]
+    fn reset(&mut self) {
+        self.used = 0;
+    }
+
     fn alloc(&mut self, size: usize) -> Option<*mut u8> {
         // Every value carries an `i64` header (string length, array len/cap),
         // and the header is read with an *aligned* load, so allocations are
@@ -348,9 +352,25 @@ impl TesjitRuntime {
     ///
     /// The guard restores the previous runtime on drop, so nested or reentrant
     /// modules each keep their own heap.
+    ///
+    /// On the *outermost* enter the arena is reset so strings/arrays from a
+    /// previous call cannot leak into the next (phase-2 isolation rule).
+    /// Nested enters leave the arena alone — temporary strings built by a
+    /// host callback during a call must stay alive until the outer exit.
     pub fn enter(self: &Arc<Self>) -> RuntimeGuard {
         let previous = CURRENT.with(|c| c.borrow_mut().replace(self.clone()));
+        if previous.is_none() {
+            // Outermost: clear the bump arena.
+            self.arena.borrow_mut().reset();
+            self.clear_trap();
+            self.reset_fuel(DEFAULT_FUEL);
+        }
         RuntimeGuard { previous }
+    }
+
+    /// Reset the bump arena to empty (keeps the capacity).
+    pub fn reset_arena(&self) {
+        self.arena.borrow_mut().reset();
     }
 }
 

@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::ty::Ty;
+use crate::ty::{StructLayout, Ty};
+use std::sync::Arc;
 
 /// A registered host function: how to call it from JIT code.
 #[derive(Clone, Debug)]
@@ -56,6 +57,9 @@ impl HostFn {
 #[derive(Clone, Debug, Default)]
 pub struct HostRegistry {
     fns: HashMap<String, HostFn>,
+    /// Component / resource layouts registered by the host (engine allowlist)
+    /// or discovered from the mod. Keyed by type name.
+    components: HashMap<String, Arc<StructLayout>>,
 }
 
 impl HostRegistry {
@@ -85,11 +89,23 @@ impl HostRegistry {
         self.fns.len()
     }
 
-    /// Cheap stable hash of this registry's signatures. Used as the *shape*
-    /// component of hot-reload's reject-on-layout-change rule (§7 of
-    /// `docs/SCRIPTING_ECS_MODS_PLAN.md`). Two registries with the same
-    /// hash present an identical mod surface to the JIT.
-    pub fn layout_hash(&self) -> u64 {
+    /// Register (or replace) a component/resource layout by name.
+    pub fn insert_component(&mut self, name: impl Into<String>, layout: Arc<StructLayout>) {
+        self.components.insert(name.into(), layout);
+    }
+
+    pub fn component(&self, name: &str) -> Option<&Arc<StructLayout>> {
+        self.components.get(name)
+    }
+
+    pub fn components(&self) -> impl Iterator<Item = (&String, &Arc<StructLayout>)> {
+        self.components.iter()
+    }
+
+    /// Cheap stable hash of this registry's *function* signatures.
+    /// Renamed from `layout_hash` in phase 2: the old name collided with
+    /// per-component layout hashing (§7).
+    pub fn signature_hash(&self) -> u64 {
         let mut entries: Vec<String> = self
             .fns
             .values()
@@ -108,6 +124,33 @@ impl HostRegistry {
             h = h.wrapping_mul(0x100000001b3); // separator
         }
         h
+    }
+
+    /// Aggregate hash of every registered component layout. Used by the
+    /// hot-reload path to reject mods whose component shapes changed.
+    pub fn component_layout_hash(&self) -> u64 {
+        let mut entries: Vec<(&String, u64)> = self
+            .components
+            .iter()
+            .map(|(n, l)| (n, l.layout_hash()))
+            .collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        let mut h: u64 = 0xcbf29ce484222325;
+        for (name, lh) in entries {
+            for b in name.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= lh;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h
+    }
+
+    /// Backward-compatible alias — prefer [`signature_hash`].
+    #[deprecated(note = "renamed to signature_hash in phase 2")]
+    pub fn layout_hash(&self) -> u64 {
+        self.signature_hash()
     }
 }
 

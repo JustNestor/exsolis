@@ -3,8 +3,105 @@
 //! Every TS-facing type maps to exactly one Cranelift machine type, which is
 //! what makes the JIT boundary safe: there is no dynamic tagging, the codegen
 //! layer always knows the register class of a value.
+//!
+//! Phase 2 adds named structs with `repr(C)` layouts, `Component<T>` /
+//! `Resource<T>` aliases, and keeps `Query`/`Res`/`Mut`/`Commands` as
+//! signature-only types that never materialise as locals.
 
 use cranelift_codegen::ir::{self, types};
+use std::sync::Arc;
+
+/// A single field of a `repr(C)` struct.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct Field {
+    pub name: String,
+    pub ty: Ty,
+    /// Byte offset from the start of the struct (already aligned).
+    pub offset: u32,
+}
+
+/// Layout of a named or anonymous struct. Offsets are `repr(C)`:
+/// each field is aligned to its natural alignment, and the whole
+/// struct is padded to a multiple of its maximum field alignment.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct StructLayout {
+    pub name: String,
+    pub fields: Vec<Field>,
+    pub size: u32,
+    pub align: u32,
+    /// True when every leaf is a POD scalar (no strings, arrays, Options…).
+    /// Only POD structs may be components or resources.
+    pub is_pod: bool,
+}
+
+impl StructLayout {
+    /// Build a `repr(C)` layout from ordered `(name, Ty)` pairs.
+    pub fn repr_c(name: impl Into<String>, fields: Vec<(String, Ty)>) -> Result<Self, String> {
+        let mut out = Vec::with_capacity(fields.len());
+        let mut offset: u32 = 0;
+        let mut max_align: u32 = 1;
+        let mut is_pod = true;
+
+        for (fname, fty) in fields {
+            let (sz, al) = fty
+                .size_align()
+                .ok_or_else(|| format!("field `{fname}` has non-sized type {}", fty))?;
+            if !fty.is_pod_leaf() {
+                is_pod = false;
+            }
+            // Align offset up to field alignment.
+            let align_mask = al - 1;
+            offset = (offset + align_mask) & !align_mask;
+            out.push(Field {
+                name: fname,
+                ty: fty,
+                offset,
+            });
+            offset = offset.saturating_add(sz);
+            max_align = max_align.max(al);
+        }
+        // Pad struct size to multiple of max alignment.
+        let align_mask = max_align - 1;
+        let size = (offset + align_mask) & !align_mask;
+
+        Ok(Self {
+            name: name.into(),
+            fields: out,
+            size,
+            align: max_align,
+            is_pod,
+        })
+    }
+
+    pub fn field(&self, name: &str) -> Option<&Field> {
+        self.fields.iter().find(|f| f.name == name)
+    }
+
+    /// Stable hash of the layout (name + field names/types/offsets).
+    /// Used for hot-reload reject-on-layout-change (§7).
+    pub fn layout_hash(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for b in self.name.bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        for f in &self.fields {
+            for b in f.name.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            for b in f.ty.name().bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+            h ^= f.offset as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        h ^= self.size as u64;
+        h = h.wrapping_mul(0x100000001b3);
+        h
+    }
+}
 
 /// A statically known value type.
 ///
@@ -44,6 +141,14 @@ pub enum Ty {
     Option(Box<Ty>),
     /// `Tuple<...>` — positional product, row type of multi-component `Query`.
     Tuple(Vec<Ty>),
+    /// Named `repr(C)` struct. Shared via `Arc` so clones are cheap.
+    Struct(Arc<StructLayout>),
+    /// `Component<T>` — marks a POD struct (or scalar) as a mod-defined
+    /// component. Signature-only when used as a query term; the layout is
+    /// carried for offset/size queries and hot-reload hashing.
+    Component(Box<Ty>),
+    /// `Resource<T>` — marks a POD type as a mod-defined resource.
+    Resource(Box<Ty>),
     /// `Query<T>` — signature-only type (never materializes).
     Query(Box<Ty>),
     /// `Res<T>` — signature-only read-only resource handle.
@@ -71,7 +176,18 @@ impl Ty {
             Ty::I8 | Ty::U8 => types::I8,
             Ty::I16 | Ty::U16 => types::I16,
             Ty::I32 | Ty::U32 => types::I32,
-            Ty::I64 | Ty::U64 | Ty::Entity | Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands => types::I64,
+            Ty::I64
+            | Ty::U64
+            | Ty::Entity
+            | Ty::Option(_)
+            | Ty::Tuple(_)
+            | Ty::Struct(_)
+            | Ty::Component(_)
+            | Ty::Resource(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands => types::I64,
             Ty::F32 => types::F32,
             Ty::F64 => types::F64,
             Ty::Bool => types::I8,
@@ -99,7 +215,17 @@ impl Ty {
             Ty::Bool => "boolean".into(),
             Ty::Entity => "Entity".into(),
             Ty::Option(t) => format!("Option<{t}>").into(),
-            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")).into(),
+            Ty::Tuple(ts) => format!(
+                "({})",
+                ts.iter()
+                    .map(|t| t.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into(),
+            Ty::Struct(layout) => layout.name.clone().into(),
+            Ty::Component(t) => format!("Component<{t}>").into(),
+            Ty::Resource(t) => format!("Resource<{t}>").into(),
             Ty::Query(t) => format!("Query<{t}>").into(),
             Ty::Res(t) => format!("Res<{t}>").into(),
             Ty::Mut(t) => format!("Mut<{t}>").into(),
@@ -115,14 +241,28 @@ impl Ty {
     pub fn is_storable(&self) -> bool {
         !matches!(
             self,
-            Ty::Void | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
+            Ty::Void
+                | Ty::Query(_)
+                | Ty::Res(_)
+                | Ty::Mut(_)
+                | Ty::Commands
+                | Ty::Component(_)
+                | Ty::Resource(_)
         )
     }
 
     /// Types whose *values* never appear in JIT registers: only parameter or
     /// return slots. Codegen never allocates locals for these.
     pub fn is_signature_only(&self) -> bool {
-        matches!(self, Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands)
+        matches!(
+            self,
+            Ty::Query(_)
+                | Ty::Res(_)
+                | Ty::Mut(_)
+                | Ty::Commands
+                | Ty::Component(_)
+                | Ty::Resource(_)
+        )
     }
 
     /// `Option<T>` element accessor.
@@ -145,6 +285,24 @@ impl Ty {
     pub fn resource_elem(&self) -> Option<Ty> {
         match self {
             Ty::Res(t) | Ty::Mut(t) => Some((**t).clone()),
+            _ => None,
+        }
+    }
+
+    /// Unwrap `Component<T>` / `Resource<T>` to the inner type.
+    pub fn component_inner(&self) -> Option<Ty> {
+        match self {
+            Ty::Component(t) | Ty::Resource(t) => Some((**t).clone()),
+            _ => None,
+        }
+    }
+
+    /// If this is a struct (or Component/Resource wrapping a struct), return
+    /// the layout.
+    pub fn struct_layout(&self) -> Option<Arc<StructLayout>> {
+        match self {
+            Ty::Struct(l) => Some(Arc::clone(l)),
+            Ty::Component(inner) | Ty::Resource(inner) => inner.struct_layout(),
             _ => None,
         }
     }
@@ -209,8 +367,82 @@ impl Ty {
             Ty::I16 | Ty::U16 => Some(2),
             Ty::I32 | Ty::U32 | Ty::F32 => Some(4),
             Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some(8),
-            Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Str | Ty::Array(_) | Ty::Ptr => Some(8),
+            Ty::Option(_)
+            | Ty::Tuple(_)
+            | Ty::Struct(_)
+            | Ty::Component(_)
+            | Ty::Resource(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands
+            | Ty::Str
+            | Ty::Array(_)
+            | Ty::Ptr => Some(8),
             Ty::Void => None,
+        }
+    }
+
+    /// `(size, align)` in bytes for a value that can live in memory.
+    /// Returns `None` for signature-only / void types.
+    pub fn size_align(&self) -> Option<(u32, u32)> {
+        match self {
+            Ty::I8 | Ty::U8 | Ty::Bool => Some((1, 1)),
+            Ty::I16 | Ty::U16 => Some((2, 2)),
+            Ty::I32 | Ty::U32 | Ty::F32 => Some((4, 4)),
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity | Ty::Ptr | Ty::Str | Ty::Array(_) => {
+                Some((8, 8))
+            }
+            Ty::Option(_) => Some((8, 8)),
+            Ty::Struct(l) => Some((l.size, l.align)),
+            Ty::Component(inner) | Ty::Resource(inner) => inner.size_align(),
+            Ty::Tuple(ts) => {
+                // Treat tuple as an anonymous struct for sizing.
+                let fields: Vec<(String, Ty)> = ts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, t)| (format!("_{i}"), t.clone()))
+                    .collect();
+                StructLayout::repr_c("", fields)
+                    .ok()
+                    .map(|l| (l.size, l.align))
+            }
+            Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Void => None,
+        }
+    }
+
+    /// True for scalar POD leaves and POD structs. Used to decide whether a
+    /// type may be registered as a component or resource.
+    pub fn is_pod_leaf(&self) -> bool {
+        match self {
+            Ty::I8
+            | Ty::I16
+            | Ty::I32
+            | Ty::I64
+            | Ty::U8
+            | Ty::U16
+            | Ty::U32
+            | Ty::U64
+            | Ty::F32
+            | Ty::F64
+            | Ty::Bool
+            | Ty::Entity => true,
+            Ty::Struct(l) => l.is_pod,
+            Ty::Component(inner) | Ty::Resource(inner) => inner.is_pod_leaf(),
+            Ty::Tuple(ts) => ts.iter().all(|t| t.is_pod_leaf()),
+            _ => false,
+        }
+    }
+
+    /// Ensure this type (or its inner payload) is POD; return an error string
+    /// otherwise. Used when registering components/resources.
+    pub fn ensure_pod(&self) -> Result<(), String> {
+        if self.is_pod_leaf() {
+            Ok(())
+        } else {
+            Err(format!(
+                "type `{self}` is not POD (components/resources must be plain data)"
+            ))
         }
     }
 
@@ -220,6 +452,13 @@ impl Ty {
             Ty::Array(elem) => Some((**elem).clone()),
             _ => None,
         }
+    }
+
+    /// Look up a field by name when this is a struct (or Component/Resource of one).
+    pub fn field(&self, name: &str) -> Option<(u32, Ty)> {
+        let layout = self.struct_layout()?;
+        let f = layout.field(name)?;
+        Some((f.offset, f.ty.clone()))
     }
 }
 
