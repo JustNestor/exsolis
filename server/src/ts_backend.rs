@@ -332,6 +332,18 @@ fn host_fns() -> Vec<HostFn> {
             host_get_block as *const u8,
         ),
         HostFn::new(
+            "world_token",
+            vec![],
+            Ty::I64,
+            host_world_token as *const u8,
+        ),
+        HostFn::new(
+            "player_component_id",
+            vec![],
+            Ty::I64,
+            host_player_component_id as *const u8,
+        ),
+        HostFn::new(
             "player_count",
             vec![],
             Ty::I32,
@@ -439,6 +451,14 @@ fn host_fns() -> Vec<HostFn> {
 extern "C" fn host_log(x: f64) {
     info!("[ts mod] {x}");
 }
+extern "C" fn host_world_token() -> i64 {
+    with_pull(|ctx| ctx.world as i64).unwrap_or(0)
+}
+extern "C" fn host_player_component_id() -> i64 {
+    with_pull(|ctx| ctx.world as usize as i64).unwrap_or(0)
+}
+
+
 
 extern "C" fn host_send(player: i64, kind: i64) {
     let (player, kind) = unsafe { (ts_str(player), ts_str(kind)) };
@@ -1792,6 +1812,21 @@ mod ts_mod_compile_tests {
         match compile_mod(&p) {
             Ok(_) => {}
             Err(es) => panic!("demo_option.ts failed: {:#?}", es),
+        }
+    }
+}
+
+#[cfg(test)]
+mod phase2_smoke_compile_test {
+    use super::*;
+    #[test]
+    fn phase2_smoke_compiles() {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().unwrap();
+        let p = root.join("mods").join("ts").join("phase2_smoke.ts");
+        match compile_mod(&p) {
+            Ok(_) => {}
+            Err(es) => panic!("phase2_smoke.ts failed: {:#?}", es),
         }
     }
 }
