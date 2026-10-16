@@ -46,7 +46,7 @@
              bg="{{s.item.color}}" border="1" border-color="#b8c4ff88"
              width="38" height="38" align="center" justify="center" radius="6">
           <img v-if="s.item.img" src="{{s.item.img}}" alt="?" width="30" height="30"/>
-          <label font-size="11" color="#ffffff">{{s.item.short}}</label>
+          <!-- <label font-size="11" color="#ffffff">{{s.item.short}}</label> -->
           <label position="absolute" right="3" bottom="1" font-size="10" color="#ffffff">{{s.item.count}}</label>
         </div>
       </div>
