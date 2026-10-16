@@ -68,7 +68,7 @@ use crate::texture::sampled_image_index;
 use crate::vulkan_prelude::VulkanContext;
 
 use super::img_assets;
-use super::spawn::{UiElement, UiImageSrc, UiRoot};
+use super::spawn::{UiElement, UiImageSrc, UiRoot, UiScrollbarRail, UiVirtualList};
 
 fn wgpu_to_vulkano_format(format: TextureFormat) -> Option<Format> {
     match format {
@@ -506,6 +506,7 @@ fn extract_ui(
     images: Res<UiImageRegistry>,
     mut draw_list: ResMut<UiDrawList>,
     roots: Query<Entity, With<UiRoot>>,
+    rails: Query<(), With<UiScrollbarRail>>,
     nodes: Query<(
         &ComputedNode,
         &UiGlobalTransform,
@@ -517,6 +518,7 @@ fn extract_ui(
         Option<&bevy_text::TextColor>,
         Option<&Children>,
         Option<&UiImageSrc>,
+        Option<&UiVirtualList>,
     )>,
 ) {
     let Some(vk) = vk else {
@@ -526,7 +528,15 @@ fn extract_ui(
 
     let mut instances = Vec::new();
     for root in &roots {
-        walk(root, &nodes, &registry, &images, to_linear, &mut instances);
+        walk(
+            root,
+            &nodes,
+            &rails,
+            &registry,
+            &images,
+            to_linear,
+            &mut instances,
+        );
     }
 
     // bevy_log::info!(
@@ -564,6 +574,7 @@ fn extract_ui(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk(
     entity: Entity,
     nodes: &Query<(
@@ -577,14 +588,27 @@ fn walk(
         Option<&bevy_text::TextColor>,
         Option<&Children>,
         Option<&UiImageSrc>,
+        Option<&UiVirtualList>,
     )>,
+    rails: &Query<(), With<UiScrollbarRail>>,
     registry: &GlyphAtlasRegistry,
     images: &UiImageRegistry,
     to_linear: bool,
     out: &mut Vec<UiInstance>,
 ) {
-    let Ok((computed, transform, clip, bg, border, _outline, text, text_color, children, image)) =
-        nodes.get(entity)
+    let Ok((
+        computed,
+        transform,
+        clip,
+        bg,
+        border,
+        _outline,
+        text,
+        text_color,
+        children,
+        image,
+        virtual_list,
+    )) = nodes.get(entity)
     else {
         return;
     };
@@ -604,90 +628,122 @@ fn walk(
     let top_left = transform.translation - half;
     let rect = [top_left.x, top_left.y, size.x, size.y];
 
-    if let Some(bg) = bg {
-        if bg.0.alpha() > 0.0 {
-            let fill = to_instance_color(bg.0, to_linear);
-            let border_col = border
-                .map(|b| to_instance_color(b.top, to_linear))
-                .unwrap_or([0.0; 4]);
-            // `BorderRect` is `{ min_inset: Vec2, max_inset: Vec2 }`, not
-            // named left/top/right/bottom fields — same min/max-corner
-            // convention as `Rect` (docs.rs/bevy_ui: "no field `left` on
-            // `BorderRect`; available fields are `min_inset`, `max_inset`").
-            let b = computed.border();
-            out.push(UiInstance::boxed(
-                rect,
-                fill,
-                border_col,
-                [b.min_inset.x, b.min_inset.y, b.max_inset.x, b.max_inset.y],
-                computed.border_radius().top_left,
-                node_clip,
-            ));
+    // Culling: if this node's bounding rect is completely outside the clip rect,
+    // its quads would be discarded by the fragment shader anyway. Skip pushing.
+    let quad_visible = if let Some(c) = clip {
+        let right = rect[0] + rect[2];
+        let bottom = rect[1] + rect[3];
+        !(right < c.clip.min.x || rect[0] > c.clip.max.x || bottom < c.clip.min.y || rect[1] > c.clip.max.y)
+    } else {
+        true
+    };
+
+    if quad_visible {
+        if let Some(bg) = bg {
+            if bg.0.alpha() > 0.0 {
+                let fill = to_instance_color(bg.0, to_linear);
+                let border_col = border
+                    .map(|b| to_instance_color(b.top, to_linear))
+                    .unwrap_or([0.0; 4]);
+                // `BorderRect` is `{ min_inset: Vec2, max_inset: Vec2 }`, not
+                // named left/top/right/bottom fields — same min/max-corner
+                // convention as `Rect` (docs.rs/bevy_ui: "no field `left` on
+                // `BorderRect`; available fields are `min_inset`, `max_inset`").
+                let b = computed.border();
+                out.push(UiInstance::boxed(
+                    rect,
+                    fill,
+                    border_col,
+                    [b.min_inset.x, b.min_inset.y, b.max_inset.x, b.max_inset.y],
+                    computed.border_radius().top_left,
+                    node_clip,
+                ));
+            }
         }
-    }
 
-    if let Some(src) = image {
-        if let Some(entry) = images.entries.get(&src.src) {
-            // Inset by the border so a `border` on the <img> stays visible.
-            let b = computed.border();
-            let img_rect = [
-                rect[0] + b.min_inset.x,
-                rect[1] + b.min_inset.y,
-                (size.x - b.min_inset.x - b.max_inset.x).max(0.0),
-                (size.y - b.min_inset.y - b.max_inset.y).max(0.0),
-            ];
-            out.push(UiInstance::image(
-                img_rect,
-                entry.tex_id,
-                to_instance_color(Color::WHITE, to_linear),
-                computed.border_radius().top_left,
-                node_clip,
-            ));
+        if let Some(src) = image {
+            if let Some(entry) = images.entries.get(&src.src) {
+                // Inset by the border so a `border` on the <img> stays visible.
+                let b = computed.border();
+                let img_rect = [
+                    rect[0] + b.min_inset.x,
+                    rect[1] + b.min_inset.y,
+                    (size.x - b.min_inset.x - b.max_inset.x).max(0.0),
+                    (size.y - b.min_inset.y - b.max_inset.y).max(0.0),
+                ];
+                out.push(UiInstance::image(
+                    img_rect,
+                    entry.tex_id,
+                    to_instance_color(Color::WHITE, to_linear),
+                    computed.border_radius().top_left,
+                    node_clip,
+                ));
+            }
         }
-    }
 
-    let node_size = computed.size();
-    let node_top_left = transform.translation - 0.5 * node_size;
+        let node_size = computed.size();
+        let node_top_left = transform.translation - 0.5 * node_size;
 
-    if let Some(info) = text {
-        let color = text_color.map(|c| c.0).unwrap_or(Color::WHITE);
-        let color = to_instance_color(color, to_linear);
+        if let Some(info) = text {
+            let color = text_color.map(|c| c.0).unwrap_or(Color::WHITE);
+            let color = to_instance_color(color, to_linear);
 
-        for glyph in &info.glyphs {
-            let Some(entry) = registry.entries.get(&glyph.atlas_info.texture) else {
-                continue;
-            };
-            let atlas = &glyph.atlas_info;
-            let glyph_size = Vec2::new(atlas.rect.width(), atlas.rect.height());
+            for glyph in &info.glyphs {
+                let Some(entry) = registry.entries.get(&glyph.atlas_info.texture) else {
+                    continue;
+                };
+                let atlas = &glyph.atlas_info;
+                let glyph_size = Vec2::new(atlas.rect.width(), atlas.rect.height());
 
-            // position is already the center, relative to node top-left
-            let glyph_top_left = node_top_left + glyph.position - 0.5 * glyph_size;
+                // position is already the center, relative to node top-left
+                let glyph_top_left = node_top_left + glyph.position - 0.5 * glyph_size;
 
-            let uv_rect = [
-                atlas.rect.min.x,
-                atlas.rect.min.y,
-                atlas.rect.max.x,
-                atlas.rect.max.y,
-            ];
-            out.push(UiInstance::glyph(
-                [
-                    glyph_top_left.x,
-                    glyph_top_left.y,
-                    glyph_size.x,
-                    glyph_size.y,
-                ],
-                uv_rect,
-                color,
-                entry.size,
-                entry.tex_id,
-                node_clip,
-            ));
+                let uv_rect = [
+                    atlas.rect.min.x,
+                    atlas.rect.min.y,
+                    atlas.rect.max.x,
+                    atlas.rect.max.y,
+                ];
+                out.push(UiInstance::glyph(
+                    [
+                        glyph_top_left.x,
+                        glyph_top_left.y,
+                        glyph_size.x,
+                        glyph_size.y,
+                    ],
+                    uv_rect,
+                    color,
+                    entry.size,
+                    entry.tex_id,
+                    node_clip,
+                ));
+            }
         }
     }
 
     if let Some(children) = children {
-        for &child in children {
-            walk(child, nodes, registry, images, to_linear, out);
+        if let Some(virt) = virtual_list {
+            if virt.item_count > 0 && virt.visible_end > virt.visible_start {
+                let mut item_idx = 0;
+                for &child in children {
+                    if rails.contains(child) {
+                        walk(child, nodes, rails, registry, images, to_linear, out);
+                    } else {
+                        if item_idx >= virt.visible_start && item_idx < virt.visible_end {
+                            walk(child, nodes, rails, registry, images, to_linear, out);
+                        }
+                        item_idx += 1;
+                    }
+                }
+            } else {
+                for &child in children {
+                    walk(child, nodes, rails, registry, images, to_linear, out);
+                }
+            }
+        } else {
+            for &child in children {
+                walk(child, nodes, rails, registry, images, to_linear, out);
+            }
         }
     }
 }
@@ -717,6 +773,7 @@ impl Plugin for UiRenderBridgePlugin {
                 (
                     sync_glyph_atlases, //.run_if(resource_exists::<Assets<Image>>),
                     sync_ui_images,
+                    super::spawn::update_virtual_lists,
                     extract_ui,
                     // force_ui_geometry,
                     // debug_ui_layout,

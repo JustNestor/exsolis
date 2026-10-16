@@ -89,12 +89,140 @@ pub struct UiImageSrc {
 #[derive(Component, Debug, Clone, Copy)]
 pub struct UiScrollArea;
 
-/// Marker for scroll areas that should window their children (virtual list).
-/// Pass 2: populated by renderer; component currently inert.
-#[derive(Component, Copy, Clone, Default)]
+/// Marker for scroll areas that window their children (virtual list).
+#[derive(Component, Copy, Clone, Debug, PartialEq)]
 pub struct UiVirtualList {
+    pub item_count: usize,
     pub item_height: f32,
     pub overscan: usize,
+    pub viewport_items: usize,
+    pub visible_start: usize,
+    pub visible_end: usize,
+}
+
+impl Default for UiVirtualList {
+    fn default() -> Self {
+        Self {
+            item_count: 0,
+            item_height: 0.0,
+            overscan: 2,
+            viewport_items: 0,
+            visible_start: 0,
+            visible_end: 0,
+        }
+    }
+}
+
+/// Pure helper for computing the visible item index window with overscan.
+pub fn compute_virtual_range(
+    item_count: usize,
+    item_height: f32,
+    viewport_size: f32,
+    scroll_offset: f32,
+    overscan: usize,
+) -> (usize, usize, usize) {
+    if item_count == 0 {
+        return (0, 0, 0);
+    }
+    if item_height <= 0.0 {
+        return (item_count, 0, item_count);
+    }
+    let viewport_items = (viewport_size / item_height).ceil() as usize;
+    let offset = scroll_offset.max(0.0);
+    let start_idx = (offset / item_height).floor() as usize;
+    let visible_start = start_idx.saturating_sub(overscan);
+    let visible_end = (start_idx + viewport_items + overscan + 1).min(item_count);
+    (viewport_items, visible_start, visible_end)
+}
+
+pub fn update_virtual_lists(
+    mut lists: Query<(
+        &Node,
+        &ComputedNode,
+        &bevy_ui::ScrollPosition,
+        &Children,
+        &mut UiVirtualList,
+    )>,
+    child_nodes: Query<(&ComputedNode, Option<&UiScrollbarRail>)>,
+) {
+    for (node, computed, scroll_pos, children, mut virt) in &mut lists {
+        let mut item_count = 0;
+        let mut first_item_height = 0.0;
+        let mut first_item_width = 0.0;
+
+        for &child in children {
+            if let Ok((child_comp, rail)) = child_nodes.get(child) {
+                if rail.is_none() {
+                    item_count += 1;
+                    if first_item_height <= 0.0 {
+                        let h = child_comp.size().y * child_comp.inverse_scale_factor;
+                        if h > 0.0 {
+                            first_item_height = h;
+                        }
+                    }
+                    if first_item_width <= 0.0 {
+                        let w = child_comp.size().x * child_comp.inverse_scale_factor;
+                        if w > 0.0 {
+                            first_item_width = w;
+                        }
+                    }
+                }
+            }
+        }
+
+        virt.item_count = item_count;
+        if item_count == 0 {
+            virt.viewport_items = 0;
+            virt.visible_start = 0;
+            virt.visible_end = 0;
+            continue;
+        }
+
+        let is_horizontal = node.overflow.x == OverflowAxis::Scroll
+            && node.overflow.y != OverflowAxis::Scroll;
+
+        if is_horizontal {
+            let col_gap = match node.column_gap {
+                Val::Px(g) => g,
+                _ => 0.0,
+            };
+            if virt.item_height <= 0.0 && first_item_width > 0.0 {
+                virt.item_height = first_item_width + col_gap;
+            }
+
+            let viewport_w = computed.size().x * computed.inverse_scale_factor;
+            let (vp_items, v_start, v_end) = compute_virtual_range(
+                item_count,
+                virt.item_height,
+                viewport_w,
+                scroll_pos.x,
+                virt.overscan,
+            );
+            virt.viewport_items = vp_items;
+            virt.visible_start = v_start;
+            virt.visible_end = v_end;
+        } else {
+            let row_gap = match node.row_gap {
+                Val::Px(g) => g,
+                _ => 0.0,
+            };
+            if virt.item_height <= 0.0 && first_item_height > 0.0 {
+                virt.item_height = first_item_height + row_gap;
+            }
+
+            let viewport_h = computed.size().y * computed.inverse_scale_factor;
+            let (vp_items, v_start, v_end) = compute_virtual_range(
+                item_count,
+                virt.item_height,
+                viewport_h,
+                scroll_pos.y,
+                virt.overscan,
+            );
+            virt.viewport_items = vp_items;
+            virt.visible_start = v_start;
+            virt.visible_end = v_end;
+        }
+    }
 }
 
 #[derive(Component, Debug, Clone, Copy)]
@@ -347,6 +475,9 @@ fn spawn_widget(
         scrollbar,
         scrollbar_color,
         scrollbar_track,
+        virtual_enabled,
+        virtual_item_height,
+        virtual_overscan,
     } = style::resolve(def.kind, &def.attrs, warnings);
     let is_scroll_area =
         node.overflow.x == OverflowAxis::Scroll || node.overflow.y == OverflowAxis::Scroll;
@@ -438,6 +569,13 @@ fn spawn_widget(
     }
     if is_scroll_area {
         e.insert((UiScrollArea, bevy_ui::ScrollPosition::default()));
+        if virtual_enabled {
+            e.insert(UiVirtualList {
+                item_height: virtual_item_height.unwrap_or(0.0),
+                overscan: virtual_overscan.unwrap_or(2),
+                ..Default::default()
+            });
+        }
     }
 
     match def.kind {
@@ -612,3 +750,51 @@ fn spawn_widget(
     }
     id
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_compute_virtual_range_empty() {
+        assert_eq!(compute_virtual_range(0, 52.0, 320.0, 0.0, 2), (0, 0, 0));
+    }
+
+    #[test]
+    fn test_compute_virtual_range_zero_height() {
+        assert_eq!(compute_virtual_range(100, 0.0, 320.0, 0.0, 2), (100, 0, 100));
+    }
+
+    #[test]
+    fn test_compute_virtual_range_top() {
+        // item_height = 52.0, viewport = 320.0, scroll = 0.0, overscan = 2, total = 100 items
+        // ceil(320 / 52) = 7 items in viewport
+        // start_idx = 0 -> visible_start = 0, visible_end = (0 + 7 + 2 + 1) = 10
+        let (vp_items, start, end) = compute_virtual_range(100, 52.0, 320.0, 0.0, 2);
+        assert_eq!(vp_items, 7);
+        assert_eq!(start, 0);
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn test_compute_virtual_range_scrolled() {
+        // scroll = 260.0 (5 rows down)
+        // start_idx = 5
+        // visible_start = 5 - 2 = 3
+        // visible_end = 5 + 7 + 2 + 1 = 15
+        let (vp_items, start, end) = compute_virtual_range(100, 52.0, 320.0, 260.0, 2);
+        assert_eq!(vp_items, 7);
+        assert_eq!(start, 3);
+        assert_eq!(end, 15);
+    }
+
+    #[test]
+    fn test_compute_virtual_range_clamped_bottom() {
+        // total 20 items, scroll = 1000.0 (way past bottom)
+        let (vp_items, start, end) = compute_virtual_range(20, 52.0, 320.0, 1000.0, 2);
+        assert_eq!(vp_items, 7);
+        assert_eq!(start, 17); // 19 - 2 = 17
+        assert_eq!(end, 20); // clamped to total items
+    }
+}
+

@@ -143,6 +143,9 @@ pub struct ResolvedStyle {
     pub scrollbar: bool,
     pub scrollbar_color: Option<Color>,
     pub scrollbar_track: Option<Color>,
+    pub virtual_enabled: bool,
+    pub virtual_item_height: Option<f32>,
+    pub virtual_overscan: Option<usize>,
 }
 
 /// Drag/drop knobs for one widget. `None`/empty group means "matches any
@@ -366,6 +369,12 @@ pub fn resolve(kind: WidgetKind, attrs: &Attrs, warnings: &mut Vec<String>) -> R
         scrollbar: get("scrollbar", parse_bool, attrs, warnings).unwrap_or(true),
         scrollbar_color: get("scrollbar-color", parse_color, attrs, warnings),
         scrollbar_track: get("scrollbar-track", parse_color, attrs, warnings),
+        virtual_enabled: get("virtual", parse_bool, attrs, warnings).unwrap_or(true),
+        virtual_item_height: get("item-height", parse_val, attrs, warnings).and_then(|v| match v {
+            Val::Px(px) => Some(px),
+            _ => None,
+        }),
+        virtual_overscan: get("overscan", |s| s.trim().parse::<usize>().ok(), attrs, warnings),
     }
 }
 
@@ -438,6 +447,19 @@ mod tests {
         );
         assert_eq!(parse_color("#12"), None);
         assert_eq!(parse_color("red"), None);
+    }
+
+    #[test]
+    fn virtual_list_attrs() {
+        let mut attrs = Attrs::new();
+        attrs.insert("virtual".to_string(), "false".to_string());
+        attrs.insert("item-height".to_string(), "52px".to_string());
+        attrs.insert("overscan".to_string(), "3".to_string());
+        let mut warnings = Vec::new();
+        let res = resolve(WidgetKind::Div, &attrs, &mut warnings);
+        assert!(!res.virtual_enabled);
+        assert_eq!(res.virtual_item_height, Some(52.0));
+        assert_eq!(res.virtual_overscan, Some(3));
     }
 }
 

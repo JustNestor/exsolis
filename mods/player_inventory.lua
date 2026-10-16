@@ -11,7 +11,7 @@
 -- itself, the engine does that against the live `ServerBlocks` registry.
 PlayerInventory = PlayerInventory or {}
 PlayerInventory.players = PlayerInventory.players or {}
--- Slots 0..8 are the hotbar; 9..35 are the three main inventory rows.
+-- Slots 0..9 are the hotbar; 9..35 are the three main inventory rows.
 PlayerInventory.size = 36
 PlayerInventory.max_stack = 64
 

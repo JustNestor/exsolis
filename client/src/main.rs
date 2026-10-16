@@ -76,7 +76,16 @@ pub fn connection_config() -> ConnectionConfig {
     config
 }
 
+use tracing_subscriber::prelude::*;
+
 fn main() {
+    #[cfg(feature = "tracy")]
+    {
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_tracy::TracyLayer::default());
+        tracing::subscriber::set_global_default(subscriber).expect("tracing subscriber");
+    }
+
     App::new()
         .add_plugins((
             // AccessibilityPlugin,
