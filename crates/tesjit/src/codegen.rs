@@ -818,7 +818,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             if place.offset == 0 {
                 base
             } else {
-                b.ins().iadd_imm(base, place.offset as i64)
+                b.ins().iadd_imm_s(base, place.offset as i64)
             }
         } else if place.offset == 0 {
             // Whole local — just use the var (no memory).
@@ -867,7 +867,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             let addr = if place.offset == 0 {
                 base
             } else {
-                b.ins().iadd_imm(base, place.offset as i64)
+                b.ins().iadd_imm_s(base, place.offset as i64)
             };
             let flags = mem_flags();
             match &place.ty {
@@ -963,7 +963,8 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
 
         // chunk_i = 0
         let chunk_i = b.declare_var(types::I64);
-        b.def_var(chunk_i, b.ins().iconst(types::I64, 0));
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(chunk_i, zero);
 
         let header = b.create_block();
         let body_chunk = b.create_block();
@@ -980,14 +981,15 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
 
         b.switch_to_block(body_chunk);
         // desc = chunks_base + ci * desc_size
-        let off = b.ins().imul_imm(ci, desc_size as i64);
+        let off = b.ins().imul_imm_s(ci, desc_size as i64);
         let desc = b.ins().iadd(chunks_base, off);
         let flags = mem_flags();
         let row_count = b.ins().load(types::I64, flags, desc, 0);
 
         // row_i = 0
         let row_i = b.declare_var(types::I64);
-        b.def_var(row_i, b.ins().iconst(types::I64, 0));
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(row_i, zero);
 
         let row_header = b.create_block();
         let row_body = b.create_block();
@@ -1009,10 +1011,10 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         // Bind each column pointer: col_ptr + ri * size (+ field_offset)
         for (col_idx, col) in columns.iter().enumerate() {
             let col_ptr = b.ins().load(types::I64, flags, desc, (8 + col_idx * 8) as i32);
-            let elem_off = b.ins().imul_imm(ri, col.size as i64);
+            let elem_off = b.ins().imul_imm_s(ri, col.size as i64);
             let mut ptr = b.ins().iadd(col_ptr, elem_off);
             if col.field_offset != 0 {
-                ptr = b.ins().iadd_imm(ptr, col.field_offset as i64);
+                ptr = b.ins().iadd_imm_s(ptr, col.field_offset as i64);
             }
             b.def_var(self.vars[col.local], ptr);
             // clear dirty flag if present
@@ -1036,14 +1038,16 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
 
         // row_i++
         let ri2 = b.use_var(row_i);
-        b.def_var(row_i, b.ins().iadd_imm(ri2, 1));
+        let next_ri = b.ins().iadd_imm_s(ri2, 1);
+        b.def_var(row_i, next_ri);
         b.ins().jump(row_header, &[]);
         Self::dead_block(b);
 
         b.switch_to_block(row_exit);
         // chunk_i++
         let ci2 = b.use_var(chunk_i);
-        b.def_var(chunk_i, b.ins().iadd_imm(ci2, 1));
+        let next_ci = b.ins().iadd_imm_s(ci2, 1);
+        b.def_var(chunk_i, next_ci);
         b.ins().jump(header, &[]);
         Self::dead_block(b);
 
@@ -1452,7 +1456,15 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 };
                 ins.icmp(cc, l, r)
             }
-            Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands => {
+            Ty::Option(_)
+            | Ty::Tuple(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands
+            | Ty::Struct(_)
+            | Ty::Component(_)
+            | Ty::Resource(_) => {
                 unreachable!("no operators on {}", ty)
             }
             Ty::Void => unreachable!("void has no operands"),

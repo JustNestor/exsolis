@@ -1462,15 +1462,17 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     let place = match &base.kind {
                         ExprKind::Local(slot) => {
                             let local = &self.locals[*slot];
-                            if !local.mutable && local.indirect {
+                            let (mutable, indirect, dirty_slot) =
+                                (local.mutable, local.indirect, local.dirty_slot);
+                            if !mutable && indirect {
                                 self.at(a.span, "cannot write through an immutable binding");
                             }
                             Place {
                                 slot: *slot,
                                 offset,
                                 ty: fty.clone(),
-                                indirect: local.indirect,
-                                dirty_slot: local.dirty_slot,
+                                indirect,
+                                dirty_slot,
                             }
                         }
                         ExprKind::PlaceRead { place } => {
@@ -2056,47 +2058,16 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
 }
 
 /// Type lowering with optional alias environment (for mod-defined structs).
-pub fn ty_of_env(t: &TSType<'_>, env: Option<&TypeScope>) -> Result<Ty, CompileError> {
+fn ty_of_env(t: &TSType<'_>, env: Option<&TypeScope>) -> Result<Ty, CompileError> {
     match t {
         TSType::TSNumberKeyword(_) => Ok(Ty::F64),
         TSType::TSBooleanKeyword(_) => Ok(Ty::Bool),
         TSType::TSStringKeyword(_) => Ok(Ty::Str),
         TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of_env(&arr.element_type, env)?))),
         TSType::TSVoidKeyword(_) => Ok(Ty::Void),
-        TSType::TSTupleType(tup) => {
-            let mut elems = Vec::with_capacity(tup.element_types.len());
-            for el in &tup.element_types {
-                // TSTupleElement is either a type or a named rest; we only
-                // support plain types for now.
-                let ts = match el {
-                    oxc_ast::ast::TSTupleElement::TSAnyKeyword(k) => {
-                        return Err(crate::diag::plain("any is not supported in tuples".into()));
-                    }
-                    other => {
-                        // Most variants implement the type through a nested field;
-                        // fall back to span-based error for unsupported forms.
-                        // The common case is a bare TSType via the enum's type payload.
-                        // oxc represents tuple elements as TSType in recent versions
-                        // via a transparent wrapper; try the standard path.
-                        match other {
-                            _ => {
-                                // Best-effort: re-parse as TSType if the node span matches.
-                                // For phase 2 we accept only TSType-like elements by
-                                // using the first type-annotation style child.
-                                return Err(crate::diag::plain(
-                                    "tuple element form not yet supported; use a named struct".into(),
-                                ));
-                            }
-                        }
-                    }
-                };
-                let _ = ts;
-            }
-            // Fallback: empty tuple not useful; reject for now.
-            Err(crate::diag::plain(
-                "tuple types in annotations are limited; prefer a named interface/type alias".into(),
-            ))
-        }
+        TSType::TSTupleType(_) => Err(crate::diag::plain(
+            "tuple types in annotations are limited; prefer a named interface/type alias",
+        )),
         TSType::TSTypeLiteral(lit) => {
             // Anonymous object type → anonymous struct layout.
             let mut fields = Vec::new();
@@ -2107,7 +2078,7 @@ pub fn ty_of_env(t: &TSType<'_>, env: Option<&TypeScope>) -> Result<Ty, CompileE
                             oxc_ast::ast::PropertyKey::StaticIdentifier(id) => id.name.to_string(),
                             _ => {
                                 return Err(crate::diag::plain(
-                                    "only plain identifier field names are supported".into(),
+                                    "only plain identifier field names are supported",
                                 ));
                             }
                         };
@@ -2120,7 +2091,7 @@ pub fn ty_of_env(t: &TSType<'_>, env: Option<&TypeScope>) -> Result<Ty, CompileE
                     }
                     _ => {
                         return Err(crate::diag::plain(
-                            "only property signatures are supported in type literals".into(),
+                            "only property signatures are supported in type literals",
                         ));
                     }
                 }

@@ -923,7 +923,8 @@ fn integer_literals_are_range_checked() {
 fn phase1_types_parse_compile_clean() {
     let _c = build(
         r#"
-        export function noop(x: Option<i32>, q: Query<i32>, r: Res<i32>, c: Commands): void { }
+        export function noop(x: Option<i32>): void { }
+        export function systems(q: Query<i32>, r: Res<i32>, c: Commands): void { }
         "#,
     );
 }
@@ -939,12 +940,12 @@ fn option_roundtrip() {
     let guard = c.enter();
     unsafe {
         let wrap: extern "C" fn(i64) -> i64 = c.get("wrap").unwrap();
-        let unwrapOrZero: extern "C" fn(i64) -> i64 = c.get("unwrapOrZero").unwrap();
+        let unwrap_or_zero: extern "C" fn(i64) -> i64 = c.get("unwrapOrZero").unwrap();
         let empty: extern "C" fn() -> i64 = c.get("empty").unwrap();
         let p = wrap(42);
-        assert_eq!(unwrapOrZero(p), 42);
+        assert_eq!(unwrap_or_zero(p), 42);
         let p = empty();
-        assert_eq!(unwrapOrZero(p), 0);
+        assert_eq!(unwrap_or_zero(p), 0);
     }
     drop(guard);
 }

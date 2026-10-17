@@ -87,7 +87,9 @@ pub fn handler_for(event: &str) -> String {
 pub enum HostArg {
     Str(String),
     I32(i32),
+    #[allow(dead_code)]
     F64(f64),
+    #[allow(dead_code)]
     Bool(bool),
 }
 
@@ -129,17 +131,6 @@ struct RowsView {
     ptr: *const PlayerRow,
     len: usize,
     region: u64,
-}
-
-impl RowsView {
-    fn rows(&self) -> &[PlayerRow] {
-        if self.ptr.is_null() {
-            &[]
-        } else {
-            // SAFETY: the buffer outlives the tick that installed this view.
-            unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-        }
-    }
 }
 
 /// Packed, C-laid-out rows handed to mod code as memory regions.
@@ -191,8 +182,6 @@ impl PlayerRow {
 struct QueryRows {
     /// Every connected player, one [`PlayerRow`] each.
     players: Vec<PlayerRow>,
-    /// Region id of `players`, valid for the tick that registered it.
-    players_region: u64,
 }
 
 impl QueryRows {
@@ -211,10 +200,7 @@ impl QueryRows {
             })
             .collect();
         players.sort_by_key(|row| row.id);
-        Self {
-            players,
-            players_region: 0,
-        }
+        Self { players }
     }
 }
 
@@ -237,14 +223,13 @@ thread_local! {
     /// Keyed by type name (e.g. `"ChunkWorld"`). Pointers are valid only for
     /// the duration of `ts_tick_system`.
     static TS_RESOURCES: std::cell::RefCell<HashMap<String, ResourceSlot>> =
-        const { std::cell::RefCell::new(HashMap::new()) };
+        std::cell::RefCell::new(HashMap::new());
 }
 
 /// One resource exposed to JIT systems this tick.
 #[derive(Clone, Copy, Debug)]
 struct ResourceSlot {
     ptr: *mut u8,
-    size: usize,
     mutable: bool,
 }
 
@@ -309,6 +294,7 @@ impl TsCommands {
 enum TsCommand {
     SetBlock { x: i32, y: i32, z: i32, block: i32 },
     Despawn { entity: u64 },
+    #[allow(dead_code)]
     InsertComponent {
         entity: u64,
         type_name: String,
@@ -812,6 +798,7 @@ fn empty_query_chunks(n_cols: usize) -> (Vec<u8>, u64, Vec<Vec<u8>>) {
 }
 
 /// Legacy name kept for older call sites.
+#[allow(dead_code)]
 fn pack_engine_query_shape(
     rows: &[PlayerRow],
     shape: &tesjit::hir::QueryShape,
@@ -1251,7 +1238,8 @@ impl TsRuntime {
         self.failures = failures;
     }
 
-    /// Handler names every loaded mod exports (tests + tooling).
+    /// Handler names every loaded mod exports.
+    #[cfg(test)]
     pub fn exported_handlers(&self) -> Vec<String> {
         let mut out = Vec::new();
         for m in &self.mods {
@@ -1285,7 +1273,7 @@ impl TsRuntime {
 
     /// Call every mod's `on_tick` export and any `export default` systems
     /// scheduled on the `"update"` stage, with a fresh fuel budget each.
-    pub(crate) fn tick(
+    fn tick(
         &self,
         positions: &HashMap<String, (f32, f32, f32)>,
         world: *const ChunkWorld,
@@ -1479,6 +1467,7 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
 ///
 /// [assumption] Systems that query engine `PlayerPosition`-like data can use
 /// this packing; mod-defined components need Bevy table iteration.
+#[allow(dead_code)]
 fn player_rows_as_query_chunks_cols(
     rows: &[PlayerRow],
     n_cols: usize,
@@ -1513,6 +1502,7 @@ fn player_rows_as_query_chunks_cols(
 }
 
 /// Backward-compatible wrapper used by older call sites.
+#[allow(dead_code)]
 fn player_rows_as_query_chunks(rows: &[PlayerRow], n_cols: usize) -> (Vec<u8>, u64) {
     let shape = tesjit::hir::QueryShape {
         terms: (0..n_cols)
@@ -1605,14 +1595,15 @@ fn pack_query_chunks(
     chunks: &[(u64, Vec<*mut u8>)], // (row_count, col_ptrs)
     n_cols: usize,
 ) -> (Vec<u8>, u64) {
-    let desc_size = 8 + n_cols * std::mem::size_of::<usize>();
+    let header_size = std::mem::size_of::<QueryChunkDesc>();
+    let desc_size = header_size + n_cols * std::mem::size_of::<usize>();
     let mut buf = vec![0u8; chunks.len() * desc_size];
     for (i, (row_count, cols)) in chunks.iter().enumerate() {
         assert_eq!(cols.len(), n_cols);
         let base = i * desc_size;
-        buf[base..base + 8].copy_from_slice(&row_count.to_le_bytes());
+        buf[base..base + header_size].copy_from_slice(&row_count.to_le_bytes());
         for (c, ptr) in cols.iter().enumerate() {
-            let off = base + 8 + c * std::mem::size_of::<usize>();
+            let off = base + header_size + c * std::mem::size_of::<usize>();
             let p = *ptr as usize;
             buf[off..off + std::mem::size_of::<usize>()].copy_from_slice(&p.to_le_bytes());
         }
@@ -1759,7 +1750,6 @@ pub fn ts_tick_system(world: &mut World) {
             "ChunkWorld".into(),
             ResourceSlot {
                 ptr: chunks as *const ChunkWorld as *mut u8,
-                size: std::mem::size_of::<ChunkWorld>(),
                 mutable: false,
             },
         );
@@ -1769,7 +1759,6 @@ pub fn ts_tick_system(world: &mut World) {
             "PlayerMap".into(),
             ResourceSlot {
                 ptr: map as *const crate::PlayerMap as *mut u8,
-                size: std::mem::size_of_val(map),
                 mutable: false,
             },
         );
@@ -1779,7 +1768,6 @@ pub fn ts_tick_system(world: &mut World) {
             "ServerBlocks".into(),
             ResourceSlot {
                 ptr: blocks as *const crate::blocks::ServerBlocks as *mut u8,
-                size: std::mem::size_of_val(blocks),
                 mutable: false,
             },
         );
@@ -1965,7 +1953,8 @@ pub fn ts_forward_select_hotbar(
 /// hand them silently wrong offsets. Requires a `types.tdb` exported from a
 /// `debug = 2` binary (see `just export-types`); returns an error describing
 /// the drift, or when the type is missing from the database.
-pub fn check_row_layout(db: &tesjit_dwarf::TypeDb) -> Result<(), String> {
+#[cfg(test)]
+fn check_row_layout(db: &tesjit_dwarf::TypeDb) -> Result<(), String> {
     let field_offset = |ty: &str, field: &str| -> Result<u64, String> {
         let def = db
             .get(ty)
@@ -2252,7 +2241,7 @@ mod tests {
         TYPE_DB.with(|slot| *slot.borrow_mut() = Some(Arc::new(db)));
 
         // A region over the real Rust value, so the mod can read it.
-        let mut runtime_ctx = runtime;
+        let runtime_ctx = runtime;
         let rows = QueryRows::from_positions(&positions());
         PullCtx {
             positions: positions(),
@@ -2269,8 +2258,7 @@ mod tests {
 
         // The handler ran: offsets were queryable (a -1 result would mean the
         // database never reached the host functions).
-        let _ = value;
-        let _ = std::ptr::addr_of!(value);
+        std::hint::black_box((&value.seq, &value.flag, &value.scale));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&mod_dir);
     }
@@ -2470,6 +2458,7 @@ mod tests {
 
 /// Host-side view of `field_offset`, for tests (the host functions are
 /// `extern "C"` and take arena strings, which only compiled code can build).
+#[cfg(test)]
 fn host_field_offset_str(
     db: &tesjit_dwarf::TypeDb,
     ty: &str,
