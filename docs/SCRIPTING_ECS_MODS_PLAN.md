@@ -472,9 +472,11 @@ database is missing or stale.
 Migration status: a server-side `TsSchema` registry now accepts explicitly
 registered schemas and checks each schema's `size_of` / `align_of` against
 Bevy's registered component layout. The production registry currently covers
-`PlayerLook` and `PlayerPosition`; ECS linking can use those schemas with no
-`types.tdb`. The database remains a fallback for unmigrated types and is still
-used by the legacy `field_offset` / `type_size` host functions.
+`PlayerLook` and `PlayerPosition`; a derive is available for named-field
+structs using supported scalar or nested schema fields. ECS linking can use
+registered schemas with no `types.tdb`. The database remains a fallback for
+unmigrated types and is still used by the legacy `field_offset` / `type_size`
+host functions.
 
 Recommended replacement: an explicit, compile-time schema for opted-in
 components and resources. A `TsComponent`/`TsResource` derive (or equivalent
@@ -497,8 +499,9 @@ temporary migration fallback, not as the source of production JIT layouts.
 Migration steps:
 
 1. Extend `TsSchema` registrations to the supported components/resources and
-   add an ergonomic derive or registration macro; cover primitive and nested
-   fields, including `repr(Rust)` structs using compiler-provided `offset_of!`.
+   cover primitive and nested fields, including `repr(Rust)` structs using
+   compiler-provided `offset_of!`. The derive and primitive/nested field
+   machinery are implemented; registration coverage remains limited.
 2. Generate declarations from the explicit registry and require an exact match
    between schema and Bevy's runtime size/alignment before linking. The initial
    explicit registry and layout checks are implemented; declaration generation

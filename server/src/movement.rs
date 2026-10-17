@@ -10,7 +10,7 @@ const POSITION_REPEATS: u8 = 3;
 #[derive(Component, Debug, Default)]
 pub struct PlayerInput(pub Vec3);
 
-#[derive(Component, Debug, Default)]
+#[derive(Component, Debug, Default, tesjit_schema::TsSchema)]
 pub struct PlayerLook {
     pub yaw: f32,
     pub pitch: f32,

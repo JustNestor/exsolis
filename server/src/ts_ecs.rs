@@ -16,6 +16,75 @@ pub(crate) trait TsSchema: 'static {
     fn ts_schema() -> Result<StructLayout, String>;
 }
 
+pub(crate) trait TsSchemaField {
+    fn ts_field() -> Result<(Ty, bool), String>;
+}
+
+macro_rules! scalar_schema_fields {
+    ($($type:ty => $ty:expr),* $(,)?) => {
+        $(
+            impl TsSchemaField for $type {
+                fn ts_field() -> Result<(Ty, bool), String> {
+                    Ok(($ty, true))
+                }
+            }
+        )*
+    };
+}
+
+scalar_schema_fields! {
+    bool => Ty::Bool,
+    i8 => Ty::I8,
+    i16 => Ty::I16,
+    i32 => Ty::I32,
+    i64 => Ty::I64,
+    u8 => Ty::U8,
+    u16 => Ty::U16,
+    u32 => Ty::U32,
+    u64 => Ty::U64,
+    f32 => Ty::F32,
+    f64 => Ty::F64,
+}
+
+impl TsSchemaField for char {
+    fn ts_field() -> Result<(Ty, bool), String> {
+        Ok((Ty::U32, false))
+    }
+}
+
+impl TsSchemaField for glam::Vec3 {
+    fn ts_field() -> Result<(Ty, bool), String> {
+        Ok((Ty::Struct(Arc::new(vec3_schema()?)), true))
+    }
+}
+
+fn vec3_schema() -> Result<StructLayout, String> {
+    let mut layout = StructLayout::from_parts(
+        "Vec3",
+        vec![
+            StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: std::mem::offset_of!(glam::Vec3, x) as u64,
+            },
+            StructField {
+                name: "y".to_owned(),
+                ty: Ty::F32,
+                offset: std::mem::offset_of!(glam::Vec3, y) as u64,
+            },
+            StructField {
+                name: "z".to_owned(),
+                ty: Ty::F32,
+                offset: std::mem::offset_of!(glam::Vec3, z) as u64,
+            },
+        ],
+        std::mem::size_of::<glam::Vec3>() as u64,
+        std::mem::align_of::<glam::Vec3>() as u64,
+    )?;
+    layout.spawnable = true;
+    Ok(layout)
+}
+
 #[derive(Default)]
 pub(crate) struct TsSchemaRegistry {
     by_type: HashMap<TypeId, Arc<StructLayout>>,
@@ -55,59 +124,13 @@ pub(crate) fn server_ts_schemas() -> Result<TsSchemaRegistry, String> {
     Ok(schemas)
 }
 
-impl TsSchema for crate::movement::PlayerLook {
-    fn ts_schema() -> Result<StructLayout, String> {
-        let mut layout = StructLayout::from_parts(
-            "PlayerLook",
-            vec![
-                StructField {
-                    name: "yaw".to_owned(),
-                    ty: Ty::F32,
-                    offset: std::mem::offset_of!(Self, yaw) as u64,
-                },
-                StructField {
-                    name: "pitch".to_owned(),
-                    ty: Ty::F32,
-                    offset: std::mem::offset_of!(Self, pitch) as u64,
-                },
-            ],
-            std::mem::size_of::<Self>() as u64,
-            std::mem::align_of::<Self>() as u64,
-        )?;
-        layout.spawnable = true;
-        Ok(layout)
-    }
-}
-
 impl TsSchema for crate::chunks::PlayerPosition {
     fn ts_schema() -> Result<StructLayout, String> {
-        let vec3 = StructLayout::from_parts(
-            "Vec3",
-            vec![
-                StructField {
-                    name: "x".to_owned(),
-                    ty: Ty::F32,
-                    offset: std::mem::offset_of!(glam::Vec3, x) as u64,
-                },
-                StructField {
-                    name: "y".to_owned(),
-                    ty: Ty::F32,
-                    offset: std::mem::offset_of!(glam::Vec3, y) as u64,
-                },
-                StructField {
-                    name: "z".to_owned(),
-                    ty: Ty::F32,
-                    offset: std::mem::offset_of!(glam::Vec3, z) as u64,
-                },
-            ],
-            std::mem::size_of::<glam::Vec3>() as u64,
-            std::mem::align_of::<glam::Vec3>() as u64,
-        )?;
         let mut layout = StructLayout::from_parts(
             "PlayerPosition",
             vec![StructField {
                 name: "position".to_owned(),
-                ty: Ty::Struct(Arc::new(vec3)),
+                ty: Ty::Struct(Arc::new(vec3_schema()?)),
                 offset: std::mem::offset_of!(Self, 0) as u64,
             }],
             std::mem::size_of::<Self>() as u64,

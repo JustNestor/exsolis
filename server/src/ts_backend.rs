@@ -1609,6 +1609,17 @@ mod tests {
 
     #[test]
     fn built_in_component_schemas_validate_without_types_db() {
+        #[derive(tesjit_schema::TsSchema)]
+        struct NestedSchemaFixture {
+            look: crate::movement::PlayerLook,
+        }
+
+        let nested = <NestedSchemaFixture as crate::ts_ecs::TsSchema>::ts_schema().unwrap();
+        assert!(matches!(
+            nested.fields[0].ty,
+            Ty::Struct(ref schema) if schema.fields.len() == 2
+        ));
+
         let mut world = World::new();
         world.register_component::<crate::movement::PlayerLook>();
         world.register_component::<PlayerPosition>();
