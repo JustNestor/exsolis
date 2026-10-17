@@ -6,8 +6,9 @@ are implemented, including `With<T>` and `Without<T>` query filters.
 `Commands.spawn` with typed component values is implemented and defers entity
 insertion until all mods finish the tick. The broader `Commands` API, planned
 builder API, and performance/fuzz acceptance work remain outstanding. The
-initial runtime currently imports component layouts from `types.tdb`; replacing
-that runtime dependency is a planned migration (see §11).
+runtime now prefers offset-checked registered schemas for `PlayerLook` and
+`PlayerPosition`; `types.tdb` remains a fallback while more types are migrated
+(see §11).
 
 Sources of truth for this document:
 
@@ -468,6 +469,13 @@ types; using it as the source of a live JIT ABI ties mod loading to a separate
 binary-export step and can leave the server without typed queries when the
 database is missing or stale.
 
+Migration status: a server-side `TsSchema` registry now accepts explicitly
+registered schemas and checks each schema's `size_of` / `align_of` against
+Bevy's registered component layout. The production registry currently covers
+`PlayerLook` and `PlayerPosition`; ECS linking can use those schemas with no
+`types.tdb`. The database remains a fallback for unmigrated types and is still
+used by the legacy `field_offset` / `type_size` host functions.
+
 Recommended replacement: an explicit, compile-time schema for opted-in
 components and resources. A `TsComponent`/`TsResource` derive (or equivalent
 registration macro) emits each exposed type's field names, field types,
@@ -488,16 +496,17 @@ temporary migration fallback, not as the source of production JIT layouts.
 
 Migration steps:
 
-1. Add the schema trait/derive and tests for primitive and nested component
-   fields, including `repr(Rust)` structs using compiler-provided
-   `offset_of!`.
-2. Register opted-in component/resource schemas and generate declarations
-   from that registry. Require an exact match between schema and Bevy's
-   runtime size/alignment before linking.
-3. Move production query tests and supported server components off
-   `types.tdb`; keep a fixture proving missing `types.tdb` does not disable
-   registered schemas.
-4. Remove `ServerTypes` from mod compilation/linking. Retain the exporter
-   crate only for developer diagnostics if still useful.
+1. Extend `TsSchema` registrations to the supported components/resources and
+   add an ergonomic derive or registration macro; cover primitive and nested
+   fields, including `repr(Rust)` structs using compiler-provided `offset_of!`.
+2. Generate declarations from the explicit registry and require an exact match
+   between schema and Bevy's runtime size/alignment before linking. The initial
+   explicit registry and layout checks are implemented; declaration generation
+   still merges the temporary TypeDB fallback.
+3. Move remaining production query tests and supported server components off
+   `types.tdb`; keep the no-database schema fixture and production-schema tests.
+4. Remove `ServerTypes` from mod compilation/linking and replace or retire the
+   TypeDB-dependent host layout helpers. Retain the exporter crate only for
+   developer diagnostics if still useful.
 """, "path">
 /home/nestor/prj/exsolis/docs/SCRIPTING_ECS_MODS_PLAN.md

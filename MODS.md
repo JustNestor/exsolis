@@ -1,10 +1,11 @@
 # TypeScript mods
 
 TypeScript mods live under `mods/ts/` and are compiled by tesjit. The server
-loads the current component layouts from `types.tdb`; after a mod is first
-loaded, it writes `mods/exsolis.generated.d.ts` for editor completion. That
-generated file is managed by the server. If component types are missing from
-the database, regenerate it with `just export-types`.
+prefers explicitly registered component schemas and temporarily uses
+`types.tdb` as a fallback for types not yet migrated. Mods can use registered
+schemas even when the database is absent. After a mod is loaded, the server
+writes `mods/exsolis.generated.d.ts` for editor completion; that generated file
+is managed by the server.
 
 ## ECS queries
 

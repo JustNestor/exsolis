@@ -55,7 +55,7 @@ use exsolis_common::{AIR_ID, BlockId, BlockPos, PlayerId};
 use crate::assets::mods_directory;
 use crate::chunks::{ChunkWorld, PlayerPosition};
 use crate::scripting::{LuaScalar, ScriptRequest, apply_script_requests, world_to_chunk_index};
-use crate::ts_ecs::{ComponentRegistry, QuerySystem};
+use crate::ts_ecs::{ComponentRegistry, QuerySystem, TsSchemaRegistry};
 
 /// Fuel handed to each handler invocation: room for a per-tick hook worth of
 /// work (tens of thousands of statements), small enough that a spin loop dies
@@ -1204,7 +1204,14 @@ pub fn ts_reload_system(world: &mut World) {
     let types = world
         .get_resource::<crate::typedb::ServerTypes>()
         .map(|types| Arc::clone(&types.0));
-    let registry = ComponentRegistry::from_world(world, types.as_deref());
+    let schemas = match crate::ts_ecs::server_ts_schemas() {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            error!("ts ECS: failed to build registered component schemas: {error}");
+            TsSchemaRegistry::default()
+        }
+    };
+    let registry = ComponentRegistry::from_world_with_schemas(world, types.as_deref(), &schemas);
     if let Err(error) = registry.write_declarations(&runtime.root) {
         warn!(
             "ts ECS: could not update declarations in {}: {error}",
@@ -1601,6 +1608,74 @@ mod tests {
     }
 
     #[test]
+    fn built_in_component_schemas_validate_without_types_db() {
+        let mut world = World::new();
+        world.register_component::<crate::movement::PlayerLook>();
+        world.register_component::<PlayerPosition>();
+        let schemas = crate::ts_ecs::server_ts_schemas().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        let layouts: HashMap<_, _> = registry
+            .layouts()
+            .map(|(name, layout)| (name.to_owned(), Arc::clone(layout)))
+            .collect();
+        assert!(layouts.contains_key("PlayerLook"));
+        let position = layouts.get("PlayerPosition").unwrap();
+        assert_eq!(position.fields[0].name, "position");
+        assert!(matches!(
+            position.fields[0].ty,
+            Ty::Struct(ref nested) if nested.fields.len() == 3
+        ));
+    }
+
+    #[test]
+    fn registered_component_schemas_work_without_types_db() {
+        #[derive(Component)]
+        struct SchemaFixture {
+            amount: f64,
+        }
+
+        impl crate::ts_ecs::TsSchema for SchemaFixture {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SchemaFixture",
+                    vec![tesjit::StructField {
+                        name: "amount".to_owned(),
+                        ty: Ty::F64,
+                        offset: std::mem::offset_of!(Self, amount) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component::<SchemaFixture>();
+        let entity = world.spawn(SchemaFixture { amount: 2.5 }).id();
+        let mut schemas = TsSchemaRegistry::default();
+        schemas.register::<SchemaFixture>().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        let dir = mods_dir(&[(
+            "schema.ts",
+            r#"
+            export function on_tick(query: Query<Mut<SchemaFixture>>): void {
+              for (const value of query) {
+                value.amount += 1.0;
+              }
+            }
+            "#,
+        )]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 1);
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.get::<SchemaFixture>(entity).unwrap().amount, 3.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn query_systems_mutate_bevy_tables_and_discover_new_archetypes() {
         #[derive(Component)]
         struct QueryFixture {
@@ -1697,7 +1772,11 @@ mod tests {
                 FilterMarker,
             ))
             .id();
-        let registry = ComponentRegistry::from_world(&world, Some(&db));
+        let registry = ComponentRegistry::from_world_with_schemas(
+            &world,
+            Some(&db),
+            &TsSchemaRegistry::default(),
+        );
         assert!(registry.layouts().any(|(name, _)| name == "QueryFixture"));
         assert!(registry.layouts().any(|(name, _)| name == "RuntimeConfig"));
         assert!(
@@ -1790,7 +1869,11 @@ mod tests {
             unreachable!()
         };
         fields.fields[0].name = "measure".to_owned();
-        let changed_registry = ComponentRegistry::from_world(&world, Some(&db));
+        let changed_registry = ComponentRegistry::from_world_with_schemas(
+            &world,
+            Some(&db),
+            &TsSchemaRegistry::default(),
+        );
         runtime.reload_with_registry(Some(&changed_registry));
         runtime.reload_with_registry(Some(&changed_registry));
         assert_eq!(
@@ -1819,63 +1902,60 @@ mod tests {
             seen: u64,
         }
 
-        fn add_struct(
-            db: &mut tesjit_dwarf::TypeDb,
-            rust_name: String,
-            size: u64,
-            align: u64,
-            fields: Vec<tesjit_dwarf::Field>,
-        ) {
-            db.types.insert(
-                rust_name.clone(),
-                tesjit_dwarf::TypeDef {
-                    name: tesjit_dwarf::TypeName(rust_name),
-                    size,
-                    align,
-                    args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
-                        is_union: false,
-                        fields,
-                    }),
-                },
-            );
+        impl crate::ts_ecs::TsSchema for SpawnFixture {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SpawnFixture",
+                    vec![tesjit::StructField {
+                        name: "value".to_owned(),
+                        ty: Ty::F64,
+                        offset: std::mem::offset_of!(Self, value) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
         }
 
-        let mut db = tesjit_dwarf::TypeDb::new();
-        add_struct(
-            &mut db,
-            std::any::type_name::<SpawnFixture>().to_owned(),
-            8,
-            8,
-            vec![tesjit_dwarf::Field {
-                name: "value".to_owned(),
-                ty: tesjit_dwarf::TypeName::from("f64"),
-                offset: 0,
-            }],
-        );
-        add_struct(
-            &mut db,
-            std::any::type_name::<SpawnMarker>().to_owned(),
-            0,
-            1,
-            vec![],
-        );
-        add_struct(
-            &mut db,
-            std::any::type_name::<RuntimeConfig>().to_owned(),
-            8,
-            8,
-            vec![tesjit_dwarf::Field {
-                name: "seen".to_owned(),
-                ty: tesjit_dwarf::TypeName::from("u64"),
-                offset: 0,
-            }],
-        );
+        impl crate::ts_ecs::TsSchema for SpawnMarker {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SpawnMarker",
+                    vec![],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
+        }
+
+        impl crate::ts_ecs::TsSchema for RuntimeConfig {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                tesjit::StructLayout::from_parts(
+                    "RuntimeConfig",
+                    vec![tesjit::StructField {
+                        name: "seen".to_owned(),
+                        ty: Ty::U64,
+                        offset: std::mem::offset_of!(Self, seen) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )
+            }
+        }
 
         let mut world = World::new();
         world.register_component::<SpawnFixture>();
         world.register_component::<SpawnMarker>();
         world.insert_resource(RuntimeConfig { seen: 0 });
-        let registry = ComponentRegistry::from_world(&world, Some(&db));
+        let mut schemas = TsSchemaRegistry::default();
+        schemas.register::<SpawnFixture>().unwrap();
+        schemas.register::<SpawnMarker>().unwrap();
+        schemas.register::<RuntimeConfig>().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
         let dir = mods_dir(&[
             (
                 "a-spawner.ts",

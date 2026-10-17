@@ -1,5 +1,6 @@
 //! Bevy table access for tesjit's zero-copy query ABI.
 
+use std::any::TypeId;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -10,6 +11,112 @@ use bevy_ecs::storage::{TableId, TableRow};
 use nonmax::NonMaxU32;
 use tesjit::{QueryFilterKind, StructField, StructLayout, Ty, abi::QueryInput};
 use tesjit_dwarf::{TypeArgs, TypeDb, TypeDef};
+
+pub(crate) trait TsSchema: 'static {
+    fn ts_schema() -> Result<StructLayout, String>;
+}
+
+#[derive(Default)]
+pub(crate) struct TsSchemaRegistry {
+    by_type: HashMap<TypeId, Arc<StructLayout>>,
+}
+
+impl TsSchemaRegistry {
+    pub(crate) fn register<T: TsSchema>(&mut self) -> Result<(), String> {
+        let layout = T::ts_schema()?;
+        if layout.size != std::mem::size_of::<T>() as u64
+            || layout.align != std::mem::align_of::<T>() as u64
+        {
+            return Err(format!(
+                "TypeScript schema for `{}` has layout {}:{}, expected {}:{}",
+                std::any::type_name::<T>(),
+                layout.size,
+                layout.align,
+                std::mem::size_of::<T>(),
+                std::mem::align_of::<T>()
+            ));
+        }
+        let type_id = TypeId::of::<T>();
+        if self.by_type.contains_key(&type_id) {
+            return Err(format!(
+                "TypeScript schema for `{}` is already registered",
+                std::any::type_name::<T>()
+            ));
+        }
+        self.by_type.insert(type_id, Arc::new(layout));
+        Ok(())
+    }
+}
+
+pub(crate) fn server_ts_schemas() -> Result<TsSchemaRegistry, String> {
+    let mut schemas = TsSchemaRegistry::default();
+    schemas.register::<crate::movement::PlayerLook>()?;
+    schemas.register::<crate::chunks::PlayerPosition>()?;
+    Ok(schemas)
+}
+
+impl TsSchema for crate::movement::PlayerLook {
+    fn ts_schema() -> Result<StructLayout, String> {
+        let mut layout = StructLayout::from_parts(
+            "PlayerLook",
+            vec![
+                StructField {
+                    name: "yaw".to_owned(),
+                    ty: Ty::F32,
+                    offset: std::mem::offset_of!(Self, yaw) as u64,
+                },
+                StructField {
+                    name: "pitch".to_owned(),
+                    ty: Ty::F32,
+                    offset: std::mem::offset_of!(Self, pitch) as u64,
+                },
+            ],
+            std::mem::size_of::<Self>() as u64,
+            std::mem::align_of::<Self>() as u64,
+        )?;
+        layout.spawnable = true;
+        Ok(layout)
+    }
+}
+
+impl TsSchema for crate::chunks::PlayerPosition {
+    fn ts_schema() -> Result<StructLayout, String> {
+        let vec3 = StructLayout::from_parts(
+            "Vec3",
+            vec![
+                StructField {
+                    name: "x".to_owned(),
+                    ty: Ty::F32,
+                    offset: std::mem::offset_of!(glam::Vec3, x) as u64,
+                },
+                StructField {
+                    name: "y".to_owned(),
+                    ty: Ty::F32,
+                    offset: std::mem::offset_of!(glam::Vec3, y) as u64,
+                },
+                StructField {
+                    name: "z".to_owned(),
+                    ty: Ty::F32,
+                    offset: std::mem::offset_of!(glam::Vec3, z) as u64,
+                },
+            ],
+            std::mem::size_of::<glam::Vec3>() as u64,
+            std::mem::align_of::<glam::Vec3>() as u64,
+        )?;
+        let mut layout = StructLayout::from_parts(
+            "PlayerPosition",
+            vec![StructField {
+                name: "position".to_owned(),
+                ty: Ty::Struct(Arc::new(vec3)),
+                offset: std::mem::offset_of!(Self, 0) as u64,
+            }],
+            std::mem::size_of::<Self>() as u64,
+            std::mem::align_of::<Self>() as u64,
+        )?;
+        layout.spawnable = true;
+        Ok(layout)
+    }
+}
 
 #[derive(Clone)]
 struct EngineComponent {
@@ -84,27 +191,40 @@ fn collect_layouts(ty: &Ty, out: &mut Vec<String>) {
 }
 
 impl ComponentRegistry {
-    pub(crate) fn from_world(world: &World, db: Option<&TypeDb>) -> Self {
-        let Some(db) = db else {
-            return Self::default();
-        };
+    pub(crate) fn from_world_with_schemas(
+        world: &World,
+        db: Option<&TypeDb>,
+        schemas: &TsSchemaRegistry,
+    ) -> Self {
         let mut registry = Self::default();
         registry
             .resources
             .extend(world.iter_resources().map(|(info, _)| info.id()));
         for info in world.components().iter_registered() {
-            if info.type_id().is_none() {
-                continue;
-            }
-            let rust_name = info.name().to_string();
-            let Some(def) = find_type(db, &rust_name) else {
+            let Some(type_id) = info.type_id() else {
                 continue;
             };
-            let name = short_name(&def.name.0);
+            let rust_name = info.name().to_string();
+            let registered_layout = schemas
+                .by_type
+                .get(&type_id)
+                .map(|layout| (**layout).clone());
+            let (name, mut layout) = if let Some(layout) = registered_layout {
+                (layout.name.clone(), layout)
+            } else {
+                let Some(db) = db else {
+                    continue;
+                };
+                let Some(def) = find_type(db, &rust_name) else {
+                    continue;
+                };
+                let name = short_name(&def.name.0);
+                let Some(layout) = component_layout(db, def, &name) else {
+                    continue;
+                };
+                (name, layout)
+            };
             if !valid_ts_identifier(&name) {
-                continue;
-            }
-            let Some(mut layout) = component_layout(db, def, &name) else {
                 continue;
             };
             if !registry.resources.contains(&info.id()) {
@@ -119,7 +239,7 @@ impl ComponentRegistry {
             let actual = info.layout();
             if layout.size != actual.size() as u64 || layout.align != actual.align() as u64 {
                 bevy_log::warn!(
-                    "ts ECS: ignored `{}` because DWARF layout {}:{} differs from Bevy layout {}:{}",
+                    "ts ECS: ignored `{}` because registered layout {}:{} differs from Bevy layout {}:{}",
                     rust_name,
                     layout.size,
                     layout.align,
