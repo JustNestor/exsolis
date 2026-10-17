@@ -85,14 +85,38 @@ fn component_layouts_are_validated_and_query_types_resolve() {
     let compiled = jit.finish().unwrap();
     let entry = compiled.entry("move").unwrap();
     assert_eq!(entry.params.len(), 1);
-    let Ty::Query(row) = &entry.params[0] else {
+    let Ty::Query(row, filters) = &entry.params[0] else {
         panic!("expected a Query parameter");
     };
+    assert!(filters.is_empty());
     let Ty::Tuple(terms) = row.as_ref() else {
         panic!("expected tuple query row");
     };
     assert!(matches!(&terms[0], Ty::Mut(inner) if matches!(inner.as_ref(), Ty::Struct(_))));
     assert!(matches!(&terms[1], Ty::Struct(_)));
+}
+
+#[test]
+fn query_component_filters_are_typed() {
+    let component = std::sync::Arc::new(StructLayout::from_parts("Marker", vec![], 0, 1).unwrap());
+    let excluded = std::sync::Arc::new(StructLayout::from_parts("Excluded", vec![], 0, 1).unwrap());
+    let src = "export function tick(q: Query<Entity, [With<Marker>, Without<Excluded>]>): void {}";
+    let mut jit = JitBuilder::new("<query-filters>", std::sync::Arc::from(src))
+        .component("Marker", component)
+        .unwrap()
+        .component("Excluded", excluded)
+        .unwrap()
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    let entry = compiled.entry("tick").unwrap();
+    let Ty::Query(_, filters) = &entry.params[0] else {
+        panic!("expected a Query parameter");
+    };
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].kind, crate::ty::QueryFilterKind::With);
+    assert_eq!(filters[1].kind, crate::ty::QueryFilterKind::Without);
 }
 
 #[test]

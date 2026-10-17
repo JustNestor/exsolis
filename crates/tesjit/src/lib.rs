@@ -46,7 +46,7 @@ pub use diag::{CompileError, Diagnostics, SyntaxDiag};
 pub use host::{FnKind, FnTable, HostFn, HostRegistry, HostSig};
 pub use jit::{Compiled, Entry, Jit, JitBuilder};
 pub use runtime::{TesjitRuntime, TrapKind};
-pub use ty::{StructField, StructLayout, Ty};
+pub use ty::{QueryFilter, QueryFilterKind, StructField, StructLayout, Ty};
 
 #[cfg(test)]
 mod tests;

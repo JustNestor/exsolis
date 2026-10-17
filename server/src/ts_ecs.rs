@@ -8,7 +8,7 @@ use bevy_ecs::component::{ComponentId, StorageType};
 use bevy_ecs::prelude::World;
 use bevy_ecs::storage::{TableId, TableRow};
 use nonmax::NonMaxU32;
-use tesjit::{StructField, StructLayout, Ty, abi::QueryInput};
+use tesjit::{QueryFilterKind, StructField, StructLayout, Ty, abi::QueryInput};
 use tesjit_dwarf::{TypeArgs, TypeDb, TypeDef};
 
 #[derive(Clone)]
@@ -67,7 +67,13 @@ fn collect_layouts(ty: &Ty, out: &mut Vec<String>) {
                 collect_layouts(&field.ty, out);
             }
         }
-        Ty::Query(inner) | Ty::Mut(inner) | Ty::Res(inner) => collect_layouts(inner, out),
+        Ty::Query(inner, filters) => {
+            collect_layouts(inner, out);
+            for filter in filters {
+                collect_layouts(&Ty::Struct(Arc::clone(&filter.component)), out);
+            }
+        }
+        Ty::Mut(inner) | Ty::Res(inner) => collect_layouts(inner, out),
         Ty::Tuple(elements) => {
             for element in elements {
                 collect_layouts(element, out);
@@ -84,7 +90,7 @@ impl ComponentRegistry {
         };
         let mut registry = Self::default();
         for info in world.components().iter_registered() {
-            if info.layout().size() == 0 || info.type_id().is_none() {
+            if info.type_id().is_none() {
                 continue;
             }
             let rust_name = info.name().to_string();
@@ -310,13 +316,18 @@ struct QueryTerm {
 /// Linked query shape with a cache of tables matching its component set.
 pub(crate) struct QueryPlan {
     terms: Vec<QueryTerm>,
+    filters: Vec<(ComponentId, QueryFilterKind)>,
     archetypes_seen: usize,
     tables: Vec<TableId>,
     table_ids: HashSet<u32>,
 }
 
 impl QueryPlan {
-    fn link(row: &Ty, registry: &ComponentRegistry) -> Result<Self, String> {
+    fn link(
+        row: &Ty,
+        query_filters: &[tesjit::ty::QueryFilter],
+        registry: &ComponentRegistry,
+    ) -> Result<Self, String> {
         let terms = match row {
             Ty::Tuple(terms) => terms.as_slice(),
             term => std::slice::from_ref(term),
@@ -414,8 +425,47 @@ impl QueryPlan {
                 other => return Err(format!("unsupported query term `{other}`")),
             }
         }
+        let mut filters = Vec::with_capacity(query_filters.len());
+        let mut filter_kinds = HashMap::new();
+        for filter in query_filters {
+            let component = registry.get(&filter.component.name).ok_or_else(|| {
+                format!(
+                    "query filter component `{}` is not linked to a Bevy component",
+                    filter.component.name
+                )
+            })?;
+            if !component.table_stored {
+                return Err(format!(
+                    "query filter component `{}` is not table-stored",
+                    filter.component.name
+                ));
+            }
+            if component.layout.size != filter.component.size
+                || component.layout.align != filter.component.align
+            {
+                return Err(format!(
+                    "query filter component `{}` layout changed since compilation",
+                    filter.component.name
+                ));
+            }
+            if let Some(previous) = filter_kinds.insert(component.id, filter.kind)
+                && previous != filter.kind
+            {
+                return Err(format!(
+                    "query filter component `{}` is both With and Without",
+                    filter.component.name
+                ));
+            }
+            if !filters
+                .iter()
+                .any(|(id, kind)| *id == component.id && *kind == filter.kind)
+            {
+                filters.push((component.id, filter.kind));
+            }
+        }
         Ok(Self {
             terms: linked,
+            filters,
             archetypes_seen: 0,
             tables: Vec::new(),
             table_ids: HashSet::new(),
@@ -429,6 +479,9 @@ impl QueryPlan {
             if self.terms.iter().all(|term| {
                 term.component
                     .is_none_or(|component| archetype.contains(component))
+            }) && self.filters.iter().all(|(component, kind)| match kind {
+                QueryFilterKind::With => archetype.contains(*component),
+                QueryFilterKind::Without => !archetype.contains(*component),
             }) {
                 let id = archetype.table_id();
                 if self.table_ids.insert(id.as_u32()) {
@@ -577,8 +630,8 @@ impl QuerySystem {
         let mut access = HashMap::new();
         for param in params {
             match param {
-                Ty::Query(row) => {
-                    let plan = QueryPlan::link(row, registry)?;
+                Ty::Query(row, filters) => {
+                    let plan = QueryPlan::link(row, filters, registry)?;
                     for term in &plan.terms {
                         if let Some(component) = term.component
                             && let Some(previous_mutable) = access.insert(component, term.mutable)

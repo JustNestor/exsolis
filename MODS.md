@@ -14,7 +14,10 @@ to the world without a snapshot or copy-back:
 
 ```ts
 export function on_tick(
-  query: Query<[Entity, Mut<Position>]>,
+  query: Query<
+    [Entity, Mut<Position>],
+    [With<PlayerTag>, Without<Disabled>]
+  >,
   config: Res<ModConfig>,
 ): void {
   for (const [entity, position] of query) {
@@ -34,9 +37,11 @@ when acquired, even if the mod leaves its fields unchanged.
 
 Query systems execute synchronously during the server's exclusive tick system.
 They cannot add or remove components while query pointers are live. Query
-matching currently supports table-stored components and requires every listed
-term; filters and `Commands` are not exposed yet. Each table chunk is charged
-against the mod's fuel budget before any row in that chunk runs.
+matching supports table-stored component terms and `With<Component>` /
+`Without<Component>` filters (including zero-sized marker components).
+Sparse-set query terms and filters are not supported. `Commands` is not exposed
+yet. Each table chunk is charged against the mod's fuel budget before any row
+in that chunk runs.
 
 Existing zero-argument `on_tick()` mods and event handlers remain supported.
 An export other than `on_tick` cannot take query parameters.

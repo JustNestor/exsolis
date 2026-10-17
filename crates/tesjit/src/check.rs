@@ -20,7 +20,7 @@ use std::sync::Arc;
 use crate::diag::{CompileError, Diagnostics, Src, err};
 use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Local, Module, PlaceExpr, Stmt};
 use crate::host::{FnKind, HostRegistry, HostSig};
-use crate::ty::Ty;
+use crate::ty::{QueryFilter, QueryFilterKind, Ty};
 use miette::{SourceOffset, SourceSpan};
 
 /// Collected pass state for one lowering run.
@@ -1774,6 +1774,11 @@ fn ty_of_in(t: &TSType<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Query<T> requires <T>".to_string()));
                     }
+                    if args.params.len() > 2 {
+                        return Err(crate::diag::plain(
+                            "Query<T, F> accepts at most two type arguments".to_string(),
+                        ));
+                    }
                     let row = ty_of_in(&args.params[0], host)?;
                     let row = match row {
                         Ty::Tuple(mut elements) if elements.len() == 1 => elements.remove(0),
@@ -1803,7 +1808,13 @@ fn ty_of_in(t: &TSType<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {
                             }
                         }
                     }
-                    Ok(Ty::Query(Box::new(row)))
+                    let filters = args
+                        .params
+                        .get(1)
+                        .map(|filter_ty| query_filters_in(filter_ty, host))
+                        .transpose()?
+                        .unwrap_or_default();
+                    Ok(Ty::Query(Box::new(row), filters))
                 }
                 "Res" => {
                     let args = r
@@ -1838,6 +1849,78 @@ fn ty_of_in(t: &TSType<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {
             other.span()
         ))),
     }
+}
+
+fn query_filters_in(
+    ty: &TSType<'_>,
+    host: &HostRegistry,
+) -> Result<Vec<QueryFilter>, CompileError> {
+    match ty {
+        TSType::TSTupleType(tuple) => tuple
+            .element_types
+            .iter()
+            .map(|element| query_filter_element(element, host))
+            .collect(),
+        _ => Ok(vec![query_filter_in(ty, host)?]),
+    }
+}
+
+fn query_filter_element(
+    element: &TSTupleElement<'_>,
+    host: &HostRegistry,
+) -> Result<QueryFilter, CompileError> {
+    match element {
+        TSTupleElement::TSOptionalType(_) | TSTupleElement::TSRestType(_) => Err(
+            crate::diag::plain("optional and rest query filters are not supported".to_string()),
+        ),
+        TSTupleElement::TSNamedTupleMember(named) => {
+            query_filter_element(&named.element_type, host)
+        }
+        _ => element
+            .as_ts_type()
+            .ok_or_else(|| crate::diag::plain("unsupported query filter tuple element".to_string()))
+            .and_then(|filter| query_filter_in(filter, host)),
+    }
+}
+
+fn query_filter_in(ty: &TSType<'_>, host: &HostRegistry) -> Result<QueryFilter, CompileError> {
+    let TSType::TSTypeReference(reference) = ty else {
+        return Err(crate::diag::plain(
+            "query filters must be With<Component> or Without<Component>".to_string(),
+        ));
+    };
+    let TSTypeName::IdentifierReference(identifier) = &reference.type_name else {
+        return Err(crate::diag::plain(
+            "qualified query filter names are not supported".to_string(),
+        ));
+    };
+    let kind = match identifier.name.as_str() {
+        "With" => QueryFilterKind::With,
+        "Without" => QueryFilterKind::Without,
+        other => {
+            return Err(crate::diag::plain(format!(
+                "unknown query filter `{other}`; expected With<T> or Without<T>"
+            )));
+        }
+    };
+    let arguments = reference
+        .type_arguments
+        .as_ref()
+        .ok_or_else(|| crate::diag::plain(format!("{}<T> requires <T>", identifier.name)))?;
+    if arguments.params.len() != 1 {
+        return Err(crate::diag::plain(format!(
+            "{}<T> requires exactly one component type",
+            identifier.name
+        )));
+    }
+    let component = ty_of_in(&arguments.params[0], host)?;
+    let Ty::Struct(component) = component else {
+        return Err(crate::diag::plain(format!(
+            "{} filter must name a registered component",
+            identifier.name
+        )));
+    };
+    Ok(QueryFilter { kind, component })
 }
 
 fn tuple_element_ty(element: &TSTupleElement<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {

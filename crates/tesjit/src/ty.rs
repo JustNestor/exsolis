@@ -24,6 +24,18 @@ pub struct StructLayout {
     pub align: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum QueryFilterKind {
+    With,
+    Without,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct QueryFilter {
+    pub kind: QueryFilterKind,
+    pub component: Arc<StructLayout>,
+}
+
 impl StructLayout {
     /// Build a layout only when every exposed field is naturally aligned,
     /// non-overlapping, and contained in the component's actual byte size.
@@ -125,8 +137,8 @@ pub enum Ty {
     Struct(Arc<StructLayout>),
     /// `Tuple<...>` — positional product, row type of multi-component `Query`.
     Tuple(Vec<Ty>),
-    /// `Query<T>` — signature-only type (never materializes).
-    Query(Box<Ty>),
+    /// `Query<T, F>` — signature-only type (never materializes).
+    Query(Box<Ty>, Vec<QueryFilter>),
     /// `Res<T>` — signature-only read-only resource handle.
     Res(Box<Ty>),
     /// `Mut<T>` — signature-only mutable resource/component handle.
@@ -158,7 +170,7 @@ impl Ty {
             | Ty::Option(_)
             | Ty::Struct(_)
             | Ty::Tuple(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands => types::I64,
@@ -195,7 +207,22 @@ impl Ty {
                 ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
             )
             .into(),
-            Ty::Query(t) => format!("Query<{t}>").into(),
+            Ty::Query(row, filters) if filters.is_empty() => format!("Query<{row}>").into(),
+            Ty::Query(row, filters) => format!(
+                "Query<{row}, [{}]>",
+                filters
+                    .iter()
+                    .map(|filter| {
+                        let name = match filter.kind {
+                            QueryFilterKind::With => "With",
+                            QueryFilterKind::Without => "Without",
+                        };
+                        format!("{name}<{}>", filter.component.name)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into(),
             Ty::Res(t) => format!("Res<{t}>").into(),
             Ty::Mut(t) => format!("Mut<{t}>").into(),
             Ty::Commands => "Commands".into(),
@@ -210,14 +237,14 @@ impl Ty {
     pub fn is_storable(&self) -> bool {
         !matches!(
             self,
-            Ty::Void | Ty::Struct(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
+            Ty::Void | Ty::Struct(_) | Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
         )
     }
 
     /// Types whose *values* never appear in JIT registers: only parameter or
     /// return slots. Codegen never allocates locals for these.
     pub fn is_signature_only(&self) -> bool {
-        matches!(self, Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands)
+        matches!(self, Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands)
     }
 
     /// `Option<T>` element accessor.
@@ -228,10 +255,18 @@ impl Ty {
         }
     }
 
-    /// `Query<T>` row type accessor.
+    /// `Query<T, F>` row type accessor.
     pub fn query_row(&self) -> Option<Ty> {
         match self {
-            Ty::Query(t) => Some((**t).clone()),
+            Ty::Query(t, _) => Some((**t).clone()),
+            _ => None,
+        }
+    }
+
+    /// `Query<T, F>` component filters.
+    pub fn query_filters(&self) -> Option<&[QueryFilter]> {
+        match self {
+            Ty::Query(_, filters) => Some(filters),
             _ => None,
         }
     }
@@ -321,7 +356,7 @@ impl Ty {
             Ty::Struct(layout) => Some(layout.size),
             Ty::Option(_)
             | Ty::Tuple(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands

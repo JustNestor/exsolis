@@ -1036,7 +1036,7 @@ impl TsRuntime {
 }
 
 fn is_ecs_system_param(param: &Ty) -> bool {
-    matches!(param, Ty::Query(_) | Ty::Res(_) | Ty::Mut(_))
+    matches!(param, Ty::Query(..) | Ty::Res(_) | Ty::Mut(_))
 }
 
 /// Run one handler with fuel armed, the runtime entered, and any trap logged.
@@ -1597,6 +1597,12 @@ mod tests {
         #[derive(Component)]
         struct AddedAfterFirstTick;
 
+        #[derive(Component)]
+        struct FilterMarker;
+
+        #[derive(Component)]
+        struct ExtraMarker;
+
         #[derive(Resource)]
         struct RuntimeConfig {
             calls: u64,
@@ -1644,24 +1650,58 @@ mod tests {
                 }),
             },
         );
+        for marker_type_name in [
+            std::any::type_name::<AddedAfterFirstTick>().to_owned(),
+            std::any::type_name::<FilterMarker>().to_owned(),
+            std::any::type_name::<ExtraMarker>().to_owned(),
+        ] {
+            db.types.insert(
+                marker_type_name.clone(),
+                tesjit_dwarf::TypeDef {
+                    name: tesjit_dwarf::TypeName(marker_type_name),
+                    size: 0,
+                    align: 1,
+                    args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                        is_union: false,
+                        fields: vec![],
+                    }),
+                },
+            );
+        }
 
         let mut world = World::new();
         world.insert_resource(RuntimeConfig { calls: 0 });
+        world.register_component::<AddedAfterFirstTick>();
+        world.register_component::<FilterMarker>();
+        world.register_component::<ExtraMarker>();
         let first = world
-            .spawn(QueryFixture {
-                amount: 0.5,
-                entity_bits: 0,
-            })
+            .spawn((
+                QueryFixture {
+                    amount: 0.5,
+                    entity_bits: 0,
+                },
+                FilterMarker,
+            ))
             .id();
         let registry = ComponentRegistry::from_world(&world, Some(&db));
         assert!(registry.layouts().any(|(name, _)| name == "QueryFixture"));
         assert!(registry.layouts().any(|(name, _)| name == "RuntimeConfig"));
+        assert!(
+            registry
+                .layouts()
+                .any(|(name, _)| name == "AddedAfterFirstTick")
+        );
+        assert!(registry.layouts().any(|(name, _)| name == "FilterMarker"));
+        assert!(registry.layouts().any(|(name, _)| name == "ExtraMarker"));
 
         let dir = mods_dir(&[(
             "query.ts",
             r#"
             export function on_tick(
-              query: Query<[Entity, Mut<QueryFixture>]>,
+              query: Query<
+                [Entity, Mut<QueryFixture>],
+                [With<FilterMarker>, Without<AddedAfterFirstTick>]
+              >,
               config: Mut<RuntimeConfig>,
             ): void {
               config.calls += 1;
@@ -1695,15 +1735,28 @@ mod tests {
                     amount: 1.0,
                     entity_bits: 0,
                 },
+                FilterMarker,
                 AddedAfterFirstTick,
+            ))
+            .id();
+        let third = world
+            .spawn((
+                QueryFixture {
+                    amount: 2.0,
+                    entity_bits: 0,
+                },
+                FilterMarker,
+                ExtraMarker,
             ))
             .id();
         runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
         let first_value = world.get::<QueryFixture>(first).unwrap();
         let second_value = world.get::<QueryFixture>(second).unwrap();
+        let third_value = world.get::<QueryFixture>(third).unwrap();
         assert_eq!(first_value.amount, 6.5);
-        assert_eq!(second_value.amount, 4.0);
-        assert_eq!(second_value.entity_bits, second.to_bits());
+        assert_eq!(second_value.amount, 1.0);
+        assert_eq!(third_value.amount, 5.0);
+        assert_eq!(third_value.entity_bits, third.to_bits());
         assert_eq!(world.resource::<RuntimeConfig>().calls, 2);
         world.remove_resource::<RuntimeConfig>();
         runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);

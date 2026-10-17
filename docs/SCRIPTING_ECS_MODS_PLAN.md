@@ -2,8 +2,9 @@
 
 Status: **implementation approved and underway**. The tesjit query-loop
 foundation, Bevy table queries, and typed `Res<T>`/`Mut<T>` system parameters
-are implemented. `Commands`, query filters, the planned builder API, and performance/fuzz
-acceptance work remain outstanding. The initial runtime currently imports
+are implemented, including `With<T>` and `Without<T>` query filters.
+`Commands`, the planned builder API, and performance/fuzz acceptance work
+remain outstanding. The initial runtime currently imports
 component layouts from `types.tdb`; replacing that runtime dependency is now a
 planned migration (see §11).
 
@@ -157,8 +158,13 @@ the function signature at registration to derive a *static* `FilteredAccess`
 schedule.
 
 Representation:
-- `Query<T>` where T is a tuple `(Comp...)` or single component. Static field
-  access (e.g. `q.iter().next().x`) is lowered against the tuple indices.
+- `Query<T, F>` where T is a tuple `(Comp...)` or single component and F is an
+  optional tuple of `With<Comp>` / `Without<Comp>` filters. Query terms and
+  filters currently require table storage; filter-only zero-sized marker
+  components are supported. Archetype matching is cached as new archetypes
+  appear.
+- Static field access (e.g. `q.iter().next().x`) is lowered against tuple
+  indices.
 - `Res<T>` — read-only resource handle.
 - `Mut<T>` is the mutable variant of `Res`.
 - `Commands` — append-only command buffer (spawn, despawn, insert component,

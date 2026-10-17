@@ -1271,7 +1271,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             Ty::Struct(_)
             | Ty::Option(_)
             | Ty::Tuple(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands => {
