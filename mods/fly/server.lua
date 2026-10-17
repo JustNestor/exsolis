@@ -2,21 +2,21 @@
 local aura_active = {}
 
 api.on("player_join", function(_ev)
-    -- api.register_keybind({
-        -- id = "example:fly",
-        -- key = "Space",
-        -- description = "Fly burst",
-        -- category = "Movement",
-    -- })
+    api.register_keybind({
+        id = "example:fly",
+        key = "Space",
+        description = "Fly burst",
+        category = "Movement",
+    })
     api.register_keybind({
         id = "example:aura",
-        key = "Space",
+        key = "KeyF",
         description = "Toggle aura",
         category = "Effects",
     })
     api.register_keybind({
         id = "example:aura_boost",
-        key = "KeyE",
+        key = "KeyQ",
         description = "Boost aura",
         category = "Effects",
     })
