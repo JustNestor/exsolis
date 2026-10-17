@@ -33,6 +33,7 @@
 //! `T[]`, `void`. Every function boundary is fully annotated.
 
 pub mod check;
+pub mod abi;
 pub mod codegen;
 pub mod diag;
 pub mod hir;
@@ -45,7 +46,7 @@ pub use diag::{CompileError, Diagnostics, SyntaxDiag};
 pub use host::{FnKind, FnTable, HostFn, HostRegistry, HostSig};
 pub use jit::{Compiled, Entry, Jit, JitBuilder};
 pub use runtime::{TesjitRuntime, TrapKind};
-pub use ty::Ty;
+pub use ty::{StructField, StructLayout, Ty};
 
 #[cfg(test)]
 mod tests;

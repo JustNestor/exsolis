@@ -9,14 +9,16 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, Declaration, Expression,
-    ForStatementInit, ForStatementLeft, Function, LogicalOperator, SimpleAssignmentTarget, Statement, TSType,
-    TSTypeName, UnaryOperator, UpdateOperator, VariableDeclaration,
+    ForStatementInit, ForStatementLeft, Function, LogicalOperator, SimpleAssignmentTarget,
+    Statement, TSTupleElement, TSType, TSTypeName, UnaryOperator, UpdateOperator,
+    VariableDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use std::sync::Arc;
 
 use crate::diag::{CompileError, Diagnostics, Src, err};
-use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Local, Module, Stmt};
+use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Local, Module, PlaceExpr, Stmt};
 use crate::host::{FnKind, HostRegistry, HostSig};
 use crate::ty::Ty;
 use miette::{SourceOffset, SourceSpan};
@@ -111,7 +113,7 @@ impl<'a> Lowerer<'a> {
                 match p
                     .type_annotation
                     .as_ref()
-                    .map(|a| ty_of(&a.type_annotation))
+                    .map(|a| ty_of_in(&a.type_annotation, self.host))
                 {
                     Some(Ok(ty)) => params.push(ty),
                     Some(Err(e)) => {
@@ -128,7 +130,7 @@ impl<'a> Lowerer<'a> {
                 }
             }
             let ret = match &f.return_type {
-                Some(a) => match ty_of(&a.type_annotation) {
+                Some(a) => match ty_of_in(&a.type_annotation, self.host) {
                     Ok(ty) => ty,
                     Err(e) => {
                         self.push(e);
@@ -145,12 +147,26 @@ impl<'a> Lowerer<'a> {
                     Ty::Void
                 }
             };
+            if params.iter().any(|ty| matches!(ty, Ty::Struct(_))) {
+                self.at(
+                    f.span,
+                    "component types must be borrowed through Query, Res, or Mut",
+                );
+                bad = true;
+            }
+            if matches!(ret, Ty::Struct(_)) {
+                self.at(f.span, "component structs cannot be returned by value");
+                bad = true;
+            }
             if f.declare || f.body.is_none() {
                 // Builtins are runtime symbols, not host functions. Declaring
                 // one is redundant rather than wrong — it happens in `.d.ts`
                 // editor tooling, which must describe them to the editor — so
                 // it is accepted and skipped instead of failing the build.
-                if crate::hir::BUILTINS.iter().any(|(builtin, _)| *builtin == name) {
+                if crate::hir::BUILTINS
+                    .iter()
+                    .any(|(builtin, _)| *builtin == name)
+                {
                     // Skip: the call site is lowered by the builtin path with
                     // the engine's own signature, so whatever a `.d.ts` claims
                     // here is documentation and can never affect codegen.
@@ -389,6 +405,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 let value = match &r.argument {
                     Some(e) => {
                         let v = self.expr(e, Some(self.ret.clone()));
+                        self.reject_struct_value(&v);
                         if v.ty != self.ret {
                             self.at(r.span, format!("returns {}, expected {}", v.ty, self.ret));
                         }
@@ -432,24 +449,93 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     return None;
                 }
                 let binding_decl = match &f.left {
-                    ForStatementLeft::VariableDeclaration(d) if d.declarations.len() == 1 => &d.declarations[0],
+                    ForStatementLeft::VariableDeclaration(d) if d.declarations.len() == 1 => {
+                        &d.declarations[0]
+                    }
                     _ => {
                         self.at(f.span, "for-of requires a single binding");
                         return None;
                     }
                 };
+                let iterable = self.expr(&f.right, None);
+                if let Some(row_ty) = iterable.ty.query_row() {
+                    let query_slot = match iterable.kind {
+                        ExprKind::Local(slot) => slot,
+                        _ => {
+                            self.at(f.right.span(), "query iteration requires a query parameter");
+                            return None;
+                        }
+                    };
+                    let terms = match row_ty {
+                        Ty::Tuple(terms) => terms,
+                        term => vec![term],
+                    };
+                    let names = match &binding_decl.id {
+                        BindingPattern::BindingIdentifier(id) if terms.len() == 1 => {
+                            vec![(id.name.to_string(), id.span)]
+                        }
+                        BindingPattern::ArrayPattern(array) => {
+                            if array.rest.is_some() || array.elements.len() != terms.len() {
+                                self.at(array.span, format!("query row has {} terms", terms.len()));
+                                return None;
+                            }
+                            let mut names = Vec::with_capacity(array.elements.len());
+                            for element in &array.elements {
+                                let Some(BindingPattern::BindingIdentifier(id)) = element else {
+                                    self.at(
+                                        array.span,
+                                        "query destructuring requires simple names",
+                                    );
+                                    return None;
+                                };
+                                names.push((id.name.to_string(), id.span));
+                            }
+                            names
+                        }
+                        _ => {
+                            self.at(
+                                f.span,
+                                "query iteration requires a single name or tuple binding",
+                            );
+                            return None;
+                        }
+                    };
+                    self.push_scope();
+                    let mut bindings = Vec::with_capacity(names.len());
+                    for ((name, span), term) in names.iter().zip(&terms) {
+                        let Some(slot) = self.declare(name, term.clone(), *span) else {
+                            self.pop_scope();
+                            return None;
+                        };
+                        bindings.push(slot);
+                    }
+                    self.loop_depth += 1;
+                    let body = self.stmt_block(&f.body);
+                    self.loop_depth -= 1;
+                    self.pop_scope();
+                    return Some(Stmt::QueryFor {
+                        query: query_slot,
+                        bindings,
+                        terms,
+                        body,
+                        span: f.span,
+                    });
+                }
+
                 let bpat = match &binding_decl.id {
                     BindingPattern::BindingIdentifier(id) => id,
                     _ => {
-                        self.at(f.span, "destructuring is not supported in for-of");
+                        self.at(f.span, "destructuring is only supported for query rows");
                         return None;
                     }
                 };
 
-                // Compute the iterable's elemental type.
-                let iterable = self.expr(&f.right, None);
+                // Compute the array iterable's elemental type.
                 let Some(elem_ty) = iterable.ty.elem() else {
-                    self.at(f.right.span(), format!("cannot iterate over {}", iterable.ty));
+                    self.at(
+                        f.right.span(),
+                        format!("cannot iterate over {}", iterable.ty),
+                    );
                     return None;
                 };
                 let binding_slot = match self.declare(&bpat.name, elem_ty.clone(), bpat.span) {
@@ -459,24 +545,58 @@ impl<'a, 'l> FnCtx<'a, 'l> {
 
                 // Ensure binding initializer absent case: declare gives slot, zero init.
                 self.loop_depth += 1;
-                let index_slot = self.declare("__i", Ty::I32, bpat.span).unwrap_or(binding_slot);
+                let index_slot = self
+                    .declare("__i", Ty::I32, bpat.span)
+                    .unwrap_or(binding_slot);
 
                 // init: index = 0
                 let init_expr = Expr::new(ExprKind::Int(0), Ty::I32, f.span);
-                let init_stmt = Stmt::Let { local: index_slot, init: Some(init_expr), span: f.span };
+                let init_stmt = Stmt::Let {
+                    local: index_slot,
+                    init: Some(init_expr),
+                    span: f.span,
+                };
 
-                let len_expr = Expr::new(ExprKind::Length { target: Box::new(iterable.clone()) }, Ty::I32, f.span);
+                let len_expr = Expr::new(
+                    ExprKind::Length {
+                        target: Box::new(iterable.clone()),
+                    },
+                    Ty::I32,
+                    f.span,
+                );
                 let cond_lhs = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
                 let cond = Expr::new(
-                    ExprKind::Binary { op: BinaryOperator::LessThan, lhs: Box::new(cond_lhs), rhs: Box::new(len_expr) },
+                    ExprKind::Binary {
+                        op: BinaryOperator::LessThan,
+                        lhs: Box::new(cond_lhs),
+                        rhs: Box::new(len_expr),
+                    },
                     Ty::Bool,
                     f.span,
                 );
 
                 // read iterable[index] into binding before body
                 let index_val = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
-                let slice_expr = Expr::new(ExprKind::Index { target: Box::new(iterable.clone()), index: Box::new(index_val.clone()) }, elem_ty.clone(), f.span);
-                let bind_stmt = Stmt::Expr { expr: Expr::new(ExprKind::Assign { local: binding_slot, op: None, value: Box::new(slice_expr) }, Ty::Void, f.span), span: f.span };
+                let slice_expr = Expr::new(
+                    ExprKind::Index {
+                        target: Box::new(iterable.clone()),
+                        index: Box::new(index_val.clone()),
+                    },
+                    elem_ty.clone(),
+                    f.span,
+                );
+                let bind_stmt = Stmt::Expr {
+                    expr: Expr::new(
+                        ExprKind::Assign {
+                            local: binding_slot,
+                            op: None,
+                            value: Box::new(slice_expr),
+                        },
+                        Ty::Void,
+                        f.span,
+                    ),
+                    span: f.span,
+                };
 
                 let body_stmts = self.stmt_block(&f.body);
                 let mut full_body = Vec::with_capacity(body_stmts.len() + 2);
@@ -486,10 +606,29 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 // write binding back to iterable[index] after body
                 let index_val2 = Expr::new(ExprKind::Local(index_slot), Ty::I32, f.span);
                 let binding_val = Expr::new(ExprKind::Local(binding_slot), elem_ty.clone(), f.span);
-                let write_back = Stmt::Expr { expr: Expr::new(ExprKind::SetIndex { target: Box::new(iterable.clone()), index: Box::new(index_val2), value: Box::new(binding_val) }, Ty::Void, f.span ), span: f.span };
+                let write_back = Stmt::Expr {
+                    expr: Expr::new(
+                        ExprKind::SetIndex {
+                            target: Box::new(iterable.clone()),
+                            index: Box::new(index_val2),
+                            value: Box::new(binding_val),
+                        },
+                        Ty::Void,
+                        f.span,
+                    ),
+                    span: f.span,
+                };
                 full_body.push(write_back);
 
-                let update = Expr::new(ExprKind::Update { local: index_slot, inc: true, prefix: false }, Ty::I32, f.span);
+                let update = Expr::new(
+                    ExprKind::Update {
+                        local: index_slot,
+                        inc: true,
+                        prefix: false,
+                    },
+                    Ty::I32,
+                    f.span,
+                );
 
                 let loop_stmt = Stmt::For {
                     init: vec![init_stmt],
@@ -572,7 +711,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 continue;
             };
             let declared = match &decl.type_annotation {
-                Some(a) => match ty_of(&a.type_annotation) {
+                Some(a) => match ty_of_in(&a.type_annotation, self.lowerer.host) {
                     Ok(ty) => Some(ty),
                     Err(e) => {
                         self.at(decl.span, e.to_string());
@@ -584,6 +723,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             let (init, ty) = match &decl.init {
                 Some(init) => {
                     let v = self.expr(init, declared.clone());
+                    if self.reject_struct_value(&v) {
+                        continue;
+                    }
                     let ty = v.ty.clone();
                     if let Some(t) = declared
                         && t != ty
@@ -630,6 +772,47 @@ impl<'a, 'l> FnCtx<'a, 'l> {
         }
     }
 
+    fn field_place(&mut self, target: &Expr, name: &str) -> Result<(PlaceExpr, Ty, bool), String> {
+        let layout = target
+            .ty
+            .struct_layout()
+            .ok_or_else(|| format!("{} has no fields", target.ty))?;
+        let field = layout
+            .field(name)
+            .ok_or_else(|| format!("{} has no field `{name}`", layout.name))?;
+        let (base, base_offset) = match &target.kind {
+            ExprKind::Local(base) => (*base, 0),
+            ExprKind::PlaceRead {
+                place: PlaceExpr::Field { base, offset },
+            } => (*base, *offset),
+            _ => return Err("component fields must be accessed through a component local".into()),
+        };
+        let offset = base_offset
+            .checked_add(field.offset)
+            .ok_or_else(|| format!("field offset overflow for {}.{name}", layout.name))?;
+        if offset > i64::MAX as u64 {
+            return Err(format!("field offset overflow for {}.{name}", layout.name));
+        }
+        let writable = matches!(&self.locals[base].ty, Ty::Mut(_));
+        Ok((
+            PlaceExpr::Field { base, offset },
+            field.ty.clone(),
+            writable,
+        ))
+    }
+
+    fn reject_struct_value(&mut self, expr: &Expr) -> bool {
+        if matches!(&expr.ty, Ty::Struct(_)) {
+            self.at(
+                expr.span,
+                "copying a struct is not supported; assign fields individually",
+            );
+            true
+        } else {
+            false
+        }
+    }
+
     /// Lower a call to a builtin runtime helper.
     ///
     /// Argument/result types come from the intrinsic's runtime signature, so
@@ -667,6 +850,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 return self.poison(c.span, "spread arguments are not supported");
             };
             let v = self.expr(ex, Some(pty.clone()));
+            if self.reject_struct_value(&v) {
+                continue;
+            }
             if v.ty != *pty {
                 self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
             }
@@ -765,6 +951,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         continue;
                     };
                     let v = self.expr(ex, elem_ty.clone().or(declared_elem.clone()));
+                    if self.reject_struct_value(&v) {
+                        continue;
+                    }
                     match &elem_ty {
                         Some(known) => {
                             if v.ty != *known {
@@ -789,7 +978,14 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             }
             Expression::StaticMemberExpression(m) => {
                 let target = self.expr(&m.object, None);
-                self.member_length(&target, m.span)
+                if target.ty.struct_layout().is_some() {
+                    match self.field_place(&target, m.property.name.as_str()) {
+                        Ok((place, ty, _)) => Expr::new(ExprKind::PlaceRead { place }, ty, m.span),
+                        Err(error) => self.poison(m.span, error),
+                    }
+                } else {
+                    self.member_length(&target, m.span)
+                }
             }
             Expression::ComputedMemberExpression(m) => {
                 let target = self.expr(&m.object, None);
@@ -932,6 +1128,57 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 )
             }
             Expression::AssignmentExpression(a) => {
+                if let AssignmentTarget::StaticMemberExpression(member) = &a.left {
+                    let target = self.expr(&member.object, None);
+                    let (place, field_ty, writable) =
+                        match self.field_place(&target, member.property.name.as_str()) {
+                            Ok(place) => place,
+                            Err(error) => return self.poison(a.span, error),
+                        };
+                    if !writable {
+                        self.at(member.span, "cannot write through a read-only component");
+                    }
+                    if matches!(field_ty, Ty::Struct(_)) {
+                        return self.poison(
+                            a.span,
+                            "copying a struct is not supported; assign fields individually",
+                        );
+                    }
+                    let rhs = self.expr(&a.right, Some(field_ty.clone()));
+                    if rhs.ty != field_ty {
+                        self.at(a.span, format!("cannot assign {} to {}", rhs.ty, field_ty));
+                    }
+                    let op = if a.operator == AssignmentOperator::Assign {
+                        None
+                    } else {
+                        match compound_op(a.operator) {
+                            Some(op) => Some(op),
+                            None => {
+                                self.at(a.span, "unsupported compound assignment");
+                                None
+                            }
+                        }
+                    };
+                    if let Some(op) = op {
+                        let current = Expr::new(
+                            ExprKind::PlaceRead {
+                                place: place.clone(),
+                            },
+                            field_ty.clone(),
+                            a.span,
+                        );
+                        self.check_arith(op, &current, &rhs, a.span);
+                    }
+                    return Expr::new(
+                        ExprKind::PlaceWrite {
+                            place,
+                            op,
+                            value: Box::new(rhs),
+                        },
+                        field_ty,
+                        a.span,
+                    );
+                }
                 // `a[i] = v` / `a[i] += v`
                 if let AssignmentTarget::ComputedMemberExpression(m) = &a.left {
                     let target = self.expr(&m.object, None);
@@ -1074,10 +1321,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         }
                         "none" => {
                             let Some(inner) = expect.clone().and_then(|t| t.option_elem()) else {
-                                return self.poison(
-                                    c.span,
-                                    "none() requires an `Option<T>` context",
-                                );
+                                return self
+                                    .poison(c.span, "none() requires an `Option<T>` context");
                             };
                             return Expr::new(
                                 ExprKind::OptionNone { ty: inner },
@@ -1109,7 +1354,9 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                             let recv = self.expr(&m.object, None);
                             let inner = match recv.ty.option_elem() {
                                 Some(t) => t,
-                                None => { return self.poison(c.span, "unwrap() requires Option<T>"); }
+                                None => {
+                                    return self.poison(c.span, "unwrap() requires Option<T>");
+                                }
                             };
                             if c.arguments.is_empty() {
                                 return Expr::new(
@@ -1130,11 +1377,16 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                             let recv = self.expr(&m.object, None);
                             let inner = match recv.ty.option_elem() {
                                 Some(t) => t,
-                                None => { return self.poison(c.span, "unwrapOr() requires Option<T>"); }
+                                None => {
+                                    return self.poison(c.span, "unwrapOr() requires Option<T>");
+                                }
                             };
-                            let default = match c.arguments.first().and_then(|a| a.as_expression()) {
+                            let default = match c.arguments.first().and_then(|a| a.as_expression())
+                            {
                                 Some(ex) => self.expr(ex, Some(inner.clone())),
-                                None => return self.poison(c.span, "unwrapOr() requires a default"),
+                                None => {
+                                    return self.poison(c.span, "unwrapOr() requires a default");
+                                }
                             };
                             return Expr::new(
                                 ExprKind::Call {
@@ -1157,35 +1409,35 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     && m.property.name.as_str() == "push"
                 {
                     let target = self.expr(&m.object, None);
-                        let Some(elem) = target.ty.elem() else {
-                            return self.poison(c.span, "`push` is only available on arrays");
-                        };
-                        if c.arguments.len() != 1 {
-                            return self.poison(c.span, "`push` takes exactly one argument");
-                        }
-                        let Some(arg) = c.arguments.first().and_then(|a| a.as_expression()) else {
-                            return self.poison(c.span, "`push` takes exactly one argument");
-                        };
-                        let value = self.expr(arg, Some(elem.clone()));
-                        if value.ty != elem.clone() {
-                            self.at(
-                                arg.span(),
-                                format!("cannot push {} into {}[]", value.ty, elem),
-                            );
-                        }
-                        let elem_size = Expr::new(
-                            ExprKind::Int(elem.elem_size().unwrap() as i64),
-                            Ty::I32,
-                            c.span,
+                    let Some(elem) = target.ty.elem() else {
+                        return self.poison(c.span, "`push` is only available on arrays");
+                    };
+                    if c.arguments.len() != 1 {
+                        return self.poison(c.span, "`push` takes exactly one argument");
+                    }
+                    let Some(arg) = c.arguments.first().and_then(|a| a.as_expression()) else {
+                        return self.poison(c.span, "`push` takes exactly one argument");
+                    };
+                    let value = self.expr(arg, Some(elem.clone()));
+                    if value.ty != elem.clone() {
+                        self.at(
+                            arg.span(),
+                            format!("cannot push {} into {}[]", value.ty, elem),
                         );
-                        return Expr::new(
-                            ExprKind::Call {
-                                target: CallTarget::Intrinsic(Intrinsic::ArrPush),
-                                args: vec![target, elem_size, value],
-                            },
-                            Ty::Array(Box::new(elem)),
-                            c.span,
-                        );
+                    }
+                    let elem_size = Expr::new(
+                        ExprKind::Int(elem.elem_size().unwrap() as i64),
+                        Ty::I32,
+                        c.span,
+                    );
+                    return Expr::new(
+                        ExprKind::Call {
+                            target: CallTarget::Intrinsic(Intrinsic::ArrPush),
+                            args: vec![target, elem_size, value],
+                        },
+                        Ty::Array(Box::new(elem)),
+                        c.span,
+                    );
                 }
                 // Builtins (`load_f64`, `region_id`, ...) are runtime symbols,
                 // not host functions: no `declare` needed, and the names are
@@ -1207,10 +1459,8 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     // `array.length` is a property, not a call — handled
                     // below (`ExprKind::Length`). Reject it explicitly here.
                     if method == "length" {
-                        return self.poison(
-                            c.span,
-                            "`length` is a property; use `.length` directly",
-                        );
+                        return self
+                            .poison(c.span, "`length` is a property; use `.length` directly");
                     }
                     let kind = self.sigs.kind_of(method).map(|k| k.clone());
                     if let Some(kind) = kind {
@@ -1234,10 +1484,16 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                             );
                         }
                         let receiver = self.expr(&m.object, Some(params[0].clone()));
+                        if self.reject_struct_value(&receiver) {
+                            return self.poison(c.span, "component struct cannot be copied");
+                        }
                         let mut args = vec![receiver.clone()];
                         let mut bad = false;
                         if receiver.ty != params[0] {
-                            self.at(m.object.span(), format!("receiver is {}, expected {}", receiver.ty, params[0]));
+                            self.at(
+                                m.object.span(),
+                                format!("receiver is {}, expected {}", receiver.ty, params[0]),
+                            );
                             bad = true;
                         }
                         for (a, pty) in c.arguments.iter().zip(&params[1..]) {
@@ -1247,8 +1503,15 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                                 continue;
                             };
                             let v = self.expr(ex, Some(pty.clone()));
+                            if self.reject_struct_value(&v) {
+                                bad = true;
+                                continue;
+                            }
                             if v.ty != *pty {
-                                self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
+                                self.at(
+                                    ex.span(),
+                                    format!("argument is {}, expected {}", v.ty, pty),
+                                );
                                 bad = true;
                             }
                             args.push(v);
@@ -1295,6 +1558,10 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         continue;
                     };
                     let v = self.expr(ex, Some(pty.clone()));
+                    if self.reject_struct_value(&v) {
+                        bad = true;
+                        continue;
+                    }
                     if v.ty != *pty {
                         self.at(ex.span(), format!("argument is {}, expected {}", v.ty, pty));
                         bad = true;
@@ -1311,7 +1578,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 Expr::new(ExprKind::Call { target, args }, ret, c.span)
             }
             Expression::TSAsExpression(a) => {
-                let to = match ty_of(&a.type_annotation) {
+                let to = match ty_of_in(&a.type_annotation, self.lowerer.host) {
                     Ok(ty) => ty,
                     Err(e) => {
                         self.at(a.span, e.to_string());
@@ -1373,17 +1640,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                     | BinaryOperator::StrictInequality
             ),
             (Ty::Array(_) | Ty::Ptr, _) => false,
-            (
-                Ty::I8
-                | Ty::I16
-                | Ty::I32
-                | Ty::I64
-                | Ty::U8
-                | Ty::U16
-                | Ty::U32
-                | Ty::U64,
-                _,
-            ) => {
+            (Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64, _) => {
                 matches!(
                     op,
                     BinaryOperator::Addition
@@ -1468,11 +1725,23 @@ fn is_comparison(op: BinaryOperator) -> bool {
 
 /// Resolve a TS type annotation to a [`Ty`].
 pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
+    ty_of_in(t, &HostRegistry::new())
+}
+
+fn ty_of_in(t: &TSType<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {
     match t {
         TSType::TSNumberKeyword(_) => Ok(Ty::F64),
         TSType::TSBooleanKeyword(_) => Ok(Ty::Bool),
         TSType::TSStringKeyword(_) => Ok(Ty::Str),
-        TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of(&arr.element_type)?))),
+        TSType::TSArrayType(arr) => Ok(Ty::Array(Box::new(ty_of_in(&arr.element_type, host)?))),
+        TSType::TSTupleType(tuple) => {
+            let elements = tuple
+                .element_types
+                .iter()
+                .map(|element| tuple_element_ty(element, host))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Ty::Tuple(elements))
+        }
         TSType::TSVoidKeyword(_) => Ok(Ty::Void),
         TSType::TSTypeReference(r) => match &r.type_name {
             TSTypeName::IdentifierReference(id) => match id.name.as_str() {
@@ -1495,7 +1764,7 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Option<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Option(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Option(Box::new(ty_of_in(&args.params[0], host)?)))
                 }
                 "Query" => {
                     let args = r
@@ -1505,7 +1774,36 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Query<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Query(Box::new(ty_of(&args.params[0])?)))
+                    let row = ty_of_in(&args.params[0], host)?;
+                    let row = match row {
+                        Ty::Tuple(mut elements) if elements.len() == 1 => elements.remove(0),
+                        row => row,
+                    };
+                    let terms = match &row {
+                        Ty::Tuple(elements) => elements.as_slice(),
+                        _ => std::slice::from_ref(&row),
+                    };
+                    if terms.is_empty() {
+                        return Err(crate::diag::plain("Query row cannot be empty".to_string()));
+                    }
+                    for term in terms {
+                        match term {
+                            Ty::Entity | Ty::Struct(_) => {}
+                            Ty::Mut(inner) if matches!(inner.as_ref(), Ty::Struct(_)) => {}
+                            Ty::Mut(inner) => {
+                                return Err(crate::diag::plain(format!(
+                                    "Mut<{}> is not a registered component",
+                                    inner
+                                )));
+                            }
+                            other => {
+                                return Err(crate::diag::plain(format!(
+                                    "query terms must be components or Entity, found {other}"
+                                )));
+                            }
+                        }
+                    }
+                    Ok(Ty::Query(Box::new(row)))
                 }
                 "Res" => {
                     let args = r
@@ -1515,7 +1813,7 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Res<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Res(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Res(Box::new(ty_of_in(&args.params[0], host)?)))
                 }
                 "Mut" => {
                     let args = r
@@ -1525,10 +1823,13 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
                     if args.params.is_empty() {
                         return Err(crate::diag::plain("Mut<T> requires <T>".to_string()));
                     }
-                    Ok(Ty::Mut(Box::new(ty_of(&args.params[0])?)))
+                    Ok(Ty::Mut(Box::new(ty_of_in(&args.params[0], host)?)))
                 }
                 "Commands" => Ok(Ty::Commands),
-                other => Err(crate::diag::plain(format!("unknown type `{other}`"))),
+                other => host
+                    .component(other)
+                    .map(|layout| Ty::Struct(Arc::clone(layout)))
+                    .ok_or_else(|| crate::diag::plain(format!("unknown type `{other}`"))),
             },
             _ => Err(crate::diag::plain("qualified type names are not supported")),
         },
@@ -1536,6 +1837,21 @@ pub fn ty_of(t: &TSType<'_>) -> Result<Ty, CompileError> {
             "unsupported type at {:?}",
             other.span()
         ))),
+    }
+}
+
+fn tuple_element_ty(element: &TSTupleElement<'_>, host: &HostRegistry) -> Result<Ty, CompileError> {
+    match element {
+        TSTupleElement::TSOptionalType(_) | TSTupleElement::TSRestType(_) => Err(
+            crate::diag::plain("optional and rest query terms are not supported".to_string()),
+        ),
+        _ => match element.as_ts_type() {
+            Some(TSType::TSNamedTupleMember(named)) => tuple_element_ty(&named.element_type, host),
+            Some(ty) => ty_of_in(ty, host),
+            None => Err(crate::diag::plain(
+                "unsupported query tuple element".to_string(),
+            )),
+        },
     }
 }
 

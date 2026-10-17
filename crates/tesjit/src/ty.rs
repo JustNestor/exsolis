@@ -5,6 +5,85 @@
 //! layer always knows the register class of a value.
 
 use cranelift_codegen::ir::{self, types};
+use std::sync::Arc;
+
+/// A field in a host-provided component layout.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct StructField {
+    pub name: String,
+    pub ty: Ty,
+    pub offset: u64,
+}
+
+/// The verified byte layout of an engine component.
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct StructLayout {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub size: u64,
+    pub align: u64,
+}
+
+impl StructLayout {
+    /// Build a layout only when every exposed field is naturally aligned,
+    /// non-overlapping, and contained in the component's actual byte size.
+    pub fn from_parts(
+        name: impl Into<String>,
+        fields: Vec<StructField>,
+        size: u64,
+        align: u64,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        if align == 0 || !align.is_power_of_two() || size % align != 0 {
+            return Err(format!(
+                "invalid layout for {name}: size {size} must be a multiple of non-zero power-of-two alignment {align}"
+            ));
+        }
+        let mut fields_by_offset: Vec<_> = fields.iter().collect();
+        fields_by_offset.sort_by_key(|field| field.offset);
+        let mut end = 0;
+        for field in fields_by_offset {
+            let Some((field_size, field_align)) = field.ty.value_layout() else {
+                return Err(format!(
+                    "field {}.{} has no supported memory layout",
+                    name, field.name
+                ));
+            };
+            if field.offset % field_align != 0 {
+                return Err(format!(
+                    "field {}.{} at offset {} is not aligned to {field_align}",
+                    name, field.name, field.offset
+                ));
+            }
+            if field.offset < end {
+                return Err(format!(
+                    "field {}.{} overlaps a preceding field",
+                    name, field.name
+                ));
+            }
+            end = field
+                .offset
+                .checked_add(field_size)
+                .ok_or_else(|| format!("field {}.{} overflows layout", name, field.name))?;
+            if end > size {
+                return Err(format!(
+                    "field {}.{} ends at {end}, beyond component size {size}",
+                    name, field.name
+                ));
+            }
+        }
+        Ok(Self {
+            name,
+            fields,
+            size,
+            align,
+        })
+    }
+
+    pub fn field(&self, name: &str) -> Option<&StructField> {
+        self.fields.iter().find(|field| field.name == name)
+    }
+}
 
 /// A statically known value type.
 ///
@@ -42,6 +121,8 @@ pub enum Ty {
     Entity,
     /// `Option<T>` — tagged pointer (heap-allocated `{tag, value}`).
     Option(Box<Ty>),
+    /// A host component. Values are borrowed pointers and cannot be copied.
+    Struct(Arc<StructLayout>),
     /// `Tuple<...>` — positional product, row type of multi-component `Query`.
     Tuple(Vec<Ty>),
     /// `Query<T>` — signature-only type (never materializes).
@@ -71,7 +152,16 @@ impl Ty {
             Ty::I8 | Ty::U8 => types::I8,
             Ty::I16 | Ty::U16 => types::I16,
             Ty::I32 | Ty::U32 => types::I32,
-            Ty::I64 | Ty::U64 | Ty::Entity | Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands => types::I64,
+            Ty::I64
+            | Ty::U64
+            | Ty::Entity
+            | Ty::Option(_)
+            | Ty::Struct(_)
+            | Ty::Tuple(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands => types::I64,
             Ty::F32 => types::F32,
             Ty::F64 => types::F64,
             Ty::Bool => types::I8,
@@ -99,7 +189,12 @@ impl Ty {
             Ty::Bool => "boolean".into(),
             Ty::Entity => "Entity".into(),
             Ty::Option(t) => format!("Option<{t}>").into(),
-            Ty::Tuple(ts) => format!("({})", ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")).into(),
+            Ty::Struct(layout) => layout.name.as_str().into(),
+            Ty::Tuple(ts) => format!(
+                "({})",
+                ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
+            )
+            .into(),
             Ty::Query(t) => format!("Query<{t}>").into(),
             Ty::Res(t) => format!("Res<{t}>").into(),
             Ty::Mut(t) => format!("Mut<{t}>").into(),
@@ -115,7 +210,7 @@ impl Ty {
     pub fn is_storable(&self) -> bool {
         !matches!(
             self,
-            Ty::Void | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
+            Ty::Void | Ty::Struct(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
         )
     }
 
@@ -149,18 +244,32 @@ impl Ty {
         }
     }
 
+    /// Return the host layout of a component or a resource/component borrow.
+    pub fn struct_layout(&self) -> Option<&StructLayout> {
+        match self {
+            Ty::Struct(layout) => Some(layout),
+            Ty::Res(inner) | Ty::Mut(inner) => inner.struct_layout(),
+            _ => None,
+        }
+    }
+
+    /// Byte size and alignment for a scalar or host component value.
+    pub fn value_layout(&self) -> Option<(u64, u64)> {
+        match self {
+            Ty::I8 | Ty::U8 | Ty::Bool => Some((1, 1)),
+            Ty::I16 | Ty::U16 => Some((2, 2)),
+            Ty::I32 | Ty::U32 | Ty::F32 => Some((4, 4)),
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some((8, 8)),
+            Ty::Struct(layout) => Some((layout.size, layout.align)),
+            _ => None,
+        }
+    }
+
     /// Integer types (signed and unsigned, any width).
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
-            Ty::I8
-                | Ty::I16
-                | Ty::I32
-                | Ty::I64
-                | Ty::U8
-                | Ty::U16
-                | Ty::U32
-                | Ty::U64
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
         )
     }
 
@@ -209,7 +318,16 @@ impl Ty {
             Ty::I16 | Ty::U16 => Some(2),
             Ty::I32 | Ty::U32 | Ty::F32 => Some(4),
             Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some(8),
-            Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Str | Ty::Array(_) | Ty::Ptr => Some(8),
+            Ty::Struct(layout) => Some(layout.size),
+            Ty::Option(_)
+            | Ty::Tuple(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands
+            | Ty::Str
+            | Ty::Array(_)
+            | Ty::Ptr => Some(8),
             Ty::Void => None,
         }
     }

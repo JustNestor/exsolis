@@ -34,6 +34,7 @@ mod scripting;
 #[cfg(feature = "advanced_worldgen")]
 mod terrain;
 mod ts_backend;
+mod ts_ecs;
 mod typedb;
 mod ui;
 mod ui_template;

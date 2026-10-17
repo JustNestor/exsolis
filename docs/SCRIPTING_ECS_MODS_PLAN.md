@@ -1,7 +1,9 @@
 # Scripting with ECS for flexible mods — design document
 
-Status: **step 1 type-system additions landed**, step 2 criterion spike landed,
-**full design under review** (phase 1+ implementation gated on approval)
+Status: **implementation approved and underway**. The tesjit query-loop
+foundation and initial Bevy table-query runtime are implemented. Resources,
+`Commands`, query filters, the planned builder API, and performance/fuzz
+acceptance work remain outstanding.
 
 Sources of truth for this document:
 

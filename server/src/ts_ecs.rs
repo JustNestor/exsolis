@@ -1,0 +1,587 @@
+//! Bevy table access for tesjit's zero-copy query ABI.
+
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::Path;
+use std::sync::Arc;
+
+use bevy_ecs::component::{ComponentId, StorageType};
+use bevy_ecs::prelude::World;
+use bevy_ecs::storage::{TableId, TableRow};
+use nonmax::NonMaxU32;
+use tesjit::{StructField, StructLayout, Ty, abi::QueryInput};
+use tesjit_dwarf::{TypeArgs, TypeDb, TypeDef};
+
+#[derive(Clone)]
+struct EngineComponent {
+    id: ComponentId,
+    layout: Arc<StructLayout>,
+}
+
+/// Component names and layouts available to one mod compilation.
+#[derive(Default)]
+pub(crate) struct ComponentRegistry {
+    by_name: HashMap<String, EngineComponent>,
+    ambiguous: HashSet<String>,
+}
+
+pub(crate) fn layout_hash(params: &[Ty]) -> u64 {
+    let mut layouts = Vec::new();
+    for param in params {
+        collect_layouts(param, &mut layouts);
+    }
+    layouts.sort();
+    layouts.dedup();
+    let mut hash = 0xcbf29ce484222325u64;
+    let mut add = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        hash = hash.wrapping_mul(0x100000001b3);
+    };
+    add(&tesjit::abi::QUERY_DESC_VERSION.to_le_bytes());
+    for layout in layouts {
+        add(layout.as_bytes());
+    }
+    hash
+}
+
+fn collect_layouts(ty: &Ty, out: &mut Vec<String>) {
+    match ty {
+        Ty::Struct(layout) => {
+            out.push(format!(
+                "{}:{}:{}:{}",
+                layout.name,
+                layout.size,
+                layout.align,
+                layout
+                    .fields
+                    .iter()
+                    .map(|field| format!("{}:{}@{}", field.name, field.ty.name(), field.offset))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ));
+            for field in &layout.fields {
+                collect_layouts(&field.ty, out);
+            }
+        }
+        Ty::Query(inner) | Ty::Mut(inner) | Ty::Res(inner) => collect_layouts(inner, out),
+        Ty::Tuple(elements) => {
+            for element in elements {
+                collect_layouts(element, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+impl ComponentRegistry {
+    pub(crate) fn from_world(world: &World, db: Option<&TypeDb>) -> Self {
+        let Some(db) = db else {
+            return Self::default();
+        };
+        let mut registry = Self::default();
+        for info in world.components().iter_registered() {
+            if info.storage_type() != StorageType::Table
+                || info.layout().size() == 0
+                || info.type_id().is_none()
+            {
+                continue;
+            }
+            let rust_name = info.name().to_string();
+            let Some(def) = find_type(db, &rust_name) else {
+                continue;
+            };
+            let name = short_name(&def.name.0);
+            if !valid_ts_identifier(&name) {
+                continue;
+            }
+            let Some(layout) = component_layout(db, def, &name) else {
+                continue;
+            };
+            let actual = info.layout();
+            if layout.size != actual.size() as u64 || layout.align != actual.align() as u64 {
+                bevy_log::warn!(
+                    "ts ECS: ignored `{}` because DWARF layout {}:{} differs from Bevy layout {}:{}",
+                    rust_name,
+                    layout.size,
+                    layout.align,
+                    actual.size(),
+                    actual.align()
+                );
+                continue;
+            }
+            if registry.ambiguous.contains(&name) {
+                continue;
+            }
+            let component = EngineComponent {
+                id: info.id(),
+                layout: Arc::new(layout),
+            };
+            if registry.by_name.insert(name.clone(), component).is_some() {
+                registry.by_name.remove(&name);
+                registry.ambiguous.insert(name);
+            }
+        }
+        registry
+    }
+
+    pub(crate) fn layouts(&self) -> impl Iterator<Item = (&str, &Arc<StructLayout>)> {
+        self.by_name
+            .iter()
+            .map(|(name, component)| (name.as_str(), &component.layout))
+    }
+
+    pub(crate) fn write_declarations(&self, root: &Path) -> std::io::Result<()> {
+        let path = root.join("exsolis.generated.d.ts");
+        let mut layouts = BTreeMap::new();
+        let mut components: Vec<_> = self.by_name.iter().collect();
+        components.sort_by_key(|(name, _)| *name);
+        for (name, component) in components {
+            collect_declarations(&component.layout, &mut layouts);
+            layouts.insert(name.clone(), component.layout.clone());
+        }
+        let mut contents =
+            String::from("// Generated from the current server component layouts; do not edit.\n");
+        for (name, layout) in layouts {
+            if !valid_ts_identifier(&name) {
+                continue;
+            }
+            contents.push_str(&format!("interface {name} {{\n"));
+            for field in &layout.fields {
+                if valid_ts_identifier(&field.name) {
+                    contents.push_str(&format!(
+                        "  {}: {};\n",
+                        field.name,
+                        declaration_type(&field.ty)
+                    ));
+                }
+            }
+            contents.push_str("}\n\n");
+        }
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(contents.as_str()) {
+            std::fs::write(path, contents)?;
+        }
+        Ok(())
+    }
+
+    fn get(&self, name: &str) -> Option<&EngineComponent> {
+        self.by_name.get(name)
+    }
+}
+
+fn collect_declarations(layout: &StructLayout, out: &mut BTreeMap<String, Arc<StructLayout>>) {
+    for field in &layout.fields {
+        if let Ty::Struct(nested) = &field.ty {
+            out.entry(nested.name.clone())
+                .or_insert_with(|| Arc::clone(nested));
+            collect_declarations(nested, out);
+        }
+    }
+}
+
+fn declaration_type(ty: &Ty) -> String {
+    match ty {
+        Ty::Tuple(elements) => format!(
+            "[{}]",
+            elements
+                .iter()
+                .map(declaration_type)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        Ty::Struct(layout) => layout.name.clone(),
+        _ => ty.name().into_owned(),
+    }
+}
+
+fn valid_ts_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric())
+}
+
+fn find_type<'a>(db: &'a TypeDb, rust_name: &str) -> Option<&'a TypeDef> {
+    if let Some(def) = db.get(rust_name) {
+        return Some(def);
+    }
+    let leaf = rust_name.rsplit("::").next()?;
+    let mut matching = db
+        .iter()
+        .filter(|(name, _)| name.rsplit("::").next() == Some(leaf));
+    let (name, _) = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    db.get(name)
+}
+
+fn short_name(name: &str) -> String {
+    name.rsplit("::").next().unwrap_or(name).to_owned()
+}
+
+fn component_layout(db: &TypeDb, def: &TypeDef, name: &str) -> Option<StructLayout> {
+    let TypeArgs::Struct(body) = &def.args else {
+        return None;
+    };
+    if body.is_union {
+        return None;
+    }
+    let mut seen = HashSet::new();
+    let fields = body
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let ty = type_layout(db, field.ty.as_str(), &mut seen)?;
+            Some(StructField {
+                name: field.name.clone(),
+                ty,
+                offset: field.offset,
+            })
+        })
+        .collect();
+    StructLayout::from_parts(name, fields, def.size, def.align).ok()
+}
+
+fn type_layout(db: &TypeDb, name: &str, seen: &mut HashSet<String>) -> Option<Ty> {
+    let primitive = match name {
+        "bool" => Some(Ty::Bool),
+        "i8" => Some(Ty::I8),
+        "i16" => Some(Ty::I16),
+        "i32" => Some(Ty::I32),
+        "i64" => Some(Ty::I64),
+        "u8" => Some(Ty::U8),
+        "u16" => Some(Ty::U16),
+        "u32" | "char" => Some(Ty::U32),
+        "u64" => Some(Ty::U64),
+        "f32" => Some(Ty::F32),
+        "f64" => Some(Ty::F64),
+        _ => None,
+    };
+    if primitive.is_some() {
+        return primitive;
+    }
+
+    let def = db.get(name)?;
+    let leaf = short_name(&def.name.0);
+    if leaf == "Entity" && def.size == 8 {
+        return Some(Ty::Entity);
+    }
+    let TypeArgs::Struct(body) = &def.args else {
+        return None;
+    };
+    if body.is_union || !seen.insert(def.name.0.clone()) {
+        return None;
+    }
+    let fields = body
+        .fields
+        .iter()
+        .filter_map(|field| {
+            let ty = type_layout(db, field.ty.as_str(), seen)?;
+            Some(StructField {
+                name: field.name.clone(),
+                ty,
+                offset: field.offset,
+            })
+        })
+        .collect();
+    seen.remove(&def.name.0);
+    let layout = StructLayout::from_parts(leaf, fields, def.size, def.align).ok()?;
+    Some(Ty::Struct(Arc::new(layout)))
+}
+
+#[derive(Clone)]
+struct QueryTerm {
+    component: Option<ComponentId>,
+    mutable: bool,
+}
+
+/// Linked query shape with a cache of tables matching its component set.
+pub(crate) struct QueryPlan {
+    terms: Vec<QueryTerm>,
+    archetypes_seen: usize,
+    tables: Vec<TableId>,
+    table_ids: HashSet<u32>,
+}
+
+impl QueryPlan {
+    fn link(row: &Ty, registry: &ComponentRegistry) -> Result<Self, String> {
+        let terms = match row {
+            Ty::Tuple(terms) => terms.as_slice(),
+            term => std::slice::from_ref(term),
+        };
+        if terms.is_empty() {
+            return Err("query row cannot be empty".to_owned());
+        }
+        let mut linked = Vec::with_capacity(terms.len());
+        let mut used_components = HashSet::new();
+        for term in terms {
+            match term {
+                Ty::Entity => linked.push(QueryTerm {
+                    component: None,
+                    mutable: false,
+                }),
+                Ty::Struct(layout) => {
+                    let component = registry.get(&layout.name).ok_or_else(|| {
+                        format!(
+                            "query component `{}` is not linked to a Bevy component",
+                            layout.name
+                        )
+                    })?;
+                    if component.layout.size == 0 {
+                        return Err(format!(
+                            "zero-sized query component `{}` is unsupported",
+                            layout.name
+                        ));
+                    }
+                    if component.layout.size != layout.size
+                        || component.layout.align != layout.align
+                    {
+                        return Err(format!(
+                            "query component `{}` layout changed since compilation",
+                            layout.name
+                        ));
+                    }
+                    if !used_components.insert(component.id) {
+                        return Err(format!(
+                            "query contains component `{}` more than once",
+                            layout.name
+                        ));
+                    }
+                    linked.push(QueryTerm {
+                        component: Some(component.id),
+                        mutable: false,
+                    });
+                }
+                Ty::Mut(inner) => {
+                    let Ty::Struct(layout) = inner.as_ref() else {
+                        return Err(format!("Mut<{}> is not a linked component", inner));
+                    };
+                    let component = registry.get(&layout.name).ok_or_else(|| {
+                        format!(
+                            "query component `{}` is not linked to a Bevy component",
+                            layout.name
+                        )
+                    })?;
+                    if component.layout.size == 0 {
+                        return Err(format!(
+                            "zero-sized query component `{}` is unsupported",
+                            layout.name
+                        ));
+                    }
+                    if component.layout.size != layout.size
+                        || component.layout.align != layout.align
+                    {
+                        return Err(format!(
+                            "query component `{}` layout changed since compilation",
+                            layout.name
+                        ));
+                    }
+                    if !used_components.insert(component.id) {
+                        return Err(format!(
+                            "query contains component `{}` more than once",
+                            layout.name
+                        ));
+                    }
+                    linked.push(QueryTerm {
+                        component: Some(component.id),
+                        mutable: true,
+                    });
+                }
+                other => return Err(format!("unsupported query term `{other}`")),
+            }
+        }
+        Ok(Self {
+            terms: linked,
+            archetypes_seen: 0,
+            tables: Vec::new(),
+            table_ids: HashSet::new(),
+        })
+    }
+
+    fn refresh(&mut self, world: &World) {
+        let archetypes = world.archetypes();
+        for archetype in archetypes.iter().skip(self.archetypes_seen) {
+            self.archetypes_seen += 1;
+            if self.terms.iter().all(|term| {
+                term.component
+                    .is_none_or(|component| archetype.contains(component))
+            }) {
+                let id = archetype.table_id();
+                if self.table_ids.insert(id.as_u32()) {
+                    self.tables.push(id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn fill(&mut self, world: &mut World, buffer: &mut QueryBuffer) {
+        self.refresh(world);
+        let needs_tick = self.terms.iter().any(|term| term.mutable);
+        let tick = needs_tick.then(|| world.change_tick());
+        let has_entity_term = self.terms.iter().any(|term| term.component.is_none());
+        let total_rows = if has_entity_term {
+            self.tables
+                .iter()
+                .filter_map(|id| world.storages().tables.get(*id))
+                .map(|table| table.entity_count() as usize)
+                .sum()
+        } else {
+            0
+        };
+
+        buffer.chunks.clear();
+        buffer.entity_bits.clear();
+        buffer.columns.clear();
+        buffer.chunk_count = 0;
+        buffer.entity_bits.reserve(total_rows);
+
+        for table_id in &self.tables {
+            let Some(table) = world.storages().tables.get(*table_id) else {
+                continue;
+            };
+            let rows = table.entity_count() as usize;
+            if rows == 0 {
+                continue;
+            }
+            let entity_addr = if has_entity_term {
+                let start = buffer.entity_bits.len();
+                buffer
+                    .entity_bits
+                    .extend(table.entities().iter().map(|entity| entity.to_bits()));
+                unsafe { buffer.entity_bits.as_mut_ptr().add(start) as usize as u64 }
+            } else {
+                0
+            };
+            buffer.columns.clear();
+            for term in &self.terms {
+                if let Some(component) = term.component {
+                    let Some(column) = table.get_column(component) else {
+                        buffer.columns.clear();
+                        break;
+                    };
+                    let ptr = unsafe {
+                        column
+                            .get_data_unchecked(TableRow::new(
+                                NonMaxU32::new(0).expect("zero is not the NonMaxU32 sentinel"),
+                            ))
+                            .as_ptr()
+                    };
+                    buffer.columns.push(ptr as usize as u64);
+                    if term.mutable {
+                        if let Some(tick) = tick {
+                            if let Some(changed) = table.get_changed_ticks_slice_for(component) {
+                                for cell in changed {
+                                    unsafe { *cell.get() = tick };
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    buffer.columns.push(entity_addr);
+                }
+            }
+            if buffer.columns.len() == self.terms.len() {
+                tesjit::abi::write_chunk_addrs(&mut buffer.chunks, rows as u64, &buffer.columns);
+                buffer.chunk_count += 1;
+            }
+        }
+        buffer.input = QueryInput {
+            chunks_addr: if buffer.chunks.is_empty() {
+                0
+            } else {
+                buffer.chunks.as_ptr() as usize as u64
+            },
+            chunk_count: buffer.chunk_count as u64,
+        };
+    }
+}
+
+pub(crate) struct QueryBuffer {
+    chunks: Vec<u64>,
+    entity_bits: Vec<u64>,
+    columns: Vec<u64>,
+    chunk_count: usize,
+    input: QueryInput,
+}
+
+impl Default for QueryBuffer {
+    fn default() -> Self {
+        Self {
+            chunks: Vec::new(),
+            entity_bits: Vec::new(),
+            columns: Vec::new(),
+            chunk_count: 0,
+            input: QueryInput {
+                chunks_addr: 0,
+                chunk_count: 0,
+            },
+        }
+    }
+}
+
+pub(crate) struct QuerySystem {
+    pub(crate) name: String,
+    plans: Vec<QueryPlan>,
+    buffers: Vec<QueryBuffer>,
+    args: Vec<i64>,
+}
+
+impl QuerySystem {
+    pub(crate) fn link(
+        name: &str,
+        params: &[Ty],
+        ret: &Ty,
+        registry: &ComponentRegistry,
+    ) -> Result<Self, String> {
+        if *ret != Ty::Void {
+            return Err(format!("query system `{name}` must return void"));
+        }
+        if params.len() > tesjit::jit::MAX_ARGS {
+            return Err(format!("query system `{name}` exceeds the argument limit"));
+        }
+        let mut plans = Vec::with_capacity(params.len());
+        let mut access = HashMap::new();
+        for param in params {
+            let Ty::Query(row) = param else {
+                return Err(format!(
+                    "query system `{name}` may only take Query<T> parameters"
+                ));
+            };
+            let plan = QueryPlan::link(row, registry)?;
+            for term in &plan.terms {
+                if let Some(component) = term.component
+                    && let Some(previous_mutable) = access.insert(component, term.mutable)
+                    && (previous_mutable || term.mutable)
+                {
+                    return Err(format!(
+                        "query system `{name}` has conflicting access to one component"
+                    ));
+                }
+            }
+            plans.push(plan);
+        }
+        let buffers = (0..plans.len()).map(|_| QueryBuffer::default()).collect();
+        Ok(Self {
+            name: name.to_owned(),
+            plans,
+            buffers,
+            args: Vec::new(),
+        })
+    }
+
+    pub(crate) fn args(&mut self, world: &mut World) -> &[i64] {
+        for (plan, buffer) in self.plans.iter_mut().zip(&mut self.buffers) {
+            plan.fill(world, buffer);
+        }
+        self.args.clear();
+        self.args.extend(
+            self.buffers
+                .iter()
+                .map(|buffer| &buffer.input as *const QueryInput as usize as i64),
+        );
+        &self.args
+    }
+}

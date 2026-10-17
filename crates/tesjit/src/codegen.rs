@@ -26,7 +26,7 @@ const fn mem_flags() -> MachMemFlags {
     MachMemFlags::new()
 }
 
-use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Stmt};
+use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, PlaceExpr, Stmt};
 use crate::ty::Ty;
 
 /// Cranelift function id plus the TS signature it was declared with.
@@ -144,9 +144,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         let trap_block = builder.create_block();
         let fuel = Self::fuel_check(module, sigs, &mut builder);
         let body_block = builder.create_block();
-        builder
-            .ins()
-            .brif(fuel, body_block, &[], trap_block, &[]);
+        builder.ins().brif(fuel, body_block, &[], trap_block, &[]);
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
 
@@ -390,7 +388,129 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 Self::dead_block(b);
             }
             Stmt::ForOf { .. } => {}
+            Stmt::QueryFor {
+                query,
+                bindings,
+                terms,
+                body,
+                ..
+            } => self.query_for(b, *query, bindings, terms, body),
         }
+    }
+
+    fn query_for(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        query: usize,
+        bindings: &[usize],
+        terms: &[Ty],
+        body: &[Stmt],
+    ) {
+        let input = b.use_var(self.vars[query]);
+        let chunks = b.ins().load(types::I64, mem_flags(), input, 0);
+        let chunk_count_ptr = b.ins().iadd_imm_s(input, 8);
+        let chunk_count = b.ins().load(types::I64, mem_flags(), chunk_count_ptr, 0);
+
+        let chunk_index = b.declare_var(types::I64);
+        let row_index = b.declare_var(types::I64);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(chunk_index, zero);
+
+        let chunk_header = b.create_block();
+        let chunk_body = b.create_block();
+        let row_header = b.create_block();
+        let row_body = b.create_block();
+        let row_next = b.create_block();
+        let chunk_next = b.create_block();
+        let exit = b.create_block();
+        b.ins().jump(chunk_header, &[]);
+
+        b.switch_to_block(chunk_header);
+        let chunk_i = b.use_var(chunk_index);
+        let has_chunk = b.ins().icmp(IntCC::UnsignedLessThan, chunk_i, chunk_count);
+        b.ins().brif(has_chunk, chunk_body, &[], exit, &[]);
+
+        b.switch_to_block(chunk_body);
+        b.seal_block(chunk_body);
+        let chunk_i = b.use_var(chunk_index);
+        let desc_stride = b
+            .ins()
+            .iconst(types::I64, (crate::abi::desc_words(terms.len()) * 8) as i64);
+        let desc_offset = b.ins().imul(chunk_i, desc_stride);
+        let desc = b.ins().iadd(chunks, desc_offset);
+        let rows = b.ins().load(types::I64, mem_flags(), desc, 0);
+        let fuel_ok = self.fuel_check_n(b, rows);
+
+        let mut column_vars = Vec::with_capacity(terms.len());
+        let mut strides = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let col_offset = b.ins().iconst(types::I64, ((index + 1) * 8) as i64);
+            let col_addr = b.ins().iadd(desc, col_offset);
+            let col_ptr = b.ins().load(types::I64, mem_flags(), col_addr, 0);
+            let col_var = b.declare_var(types::I64);
+            b.def_var(col_var, col_ptr);
+            column_vars.push(col_var);
+            strides.push(if matches!(term, Ty::Entity) {
+                8
+            } else {
+                term.struct_layout()
+                    .expect("query component has a registered layout")
+                    .size
+            });
+        }
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(row_index, zero);
+        b.ins().brif(fuel_ok, row_header, &[], self.trap_block, &[]);
+
+        b.switch_to_block(row_header);
+        let row_i = b.use_var(row_index);
+        let has_row = b.ins().icmp(IntCC::UnsignedLessThan, row_i, rows);
+        b.ins().brif(has_row, row_body, &[], chunk_next, &[]);
+
+        b.switch_to_block(row_body);
+        b.seal_block(row_body);
+        for ((binding, term), col_var) in bindings.iter().zip(terms).zip(&column_vars) {
+            let ptr = b.use_var(*col_var);
+            let value = if matches!(term, Ty::Entity) {
+                b.ins().load(types::I64, mem_flags(), ptr, 0)
+            } else {
+                ptr
+            };
+            b.def_var(self.vars[*binding], value);
+        }
+        self.loops.push((row_next, exit));
+        for stmt in body {
+            self.stmt(b, stmt);
+        }
+        self.loops.pop();
+        b.ins().jump(row_next, &[]);
+
+        b.switch_to_block(row_next);
+        b.seal_block(row_next);
+        let row_i = b.use_var(row_index);
+        let one = b.ins().iconst(types::I64, 1);
+        let next_row = b.ins().iadd(row_i, one);
+        b.def_var(row_index, next_row);
+        for (col_var, stride) in column_vars.iter().zip(strides) {
+            let ptr = b.use_var(*col_var);
+            let increment = b.ins().iconst(types::I64, stride as i64);
+            let next_ptr = b.ins().iadd(ptr, increment);
+            b.def_var(*col_var, next_ptr);
+        }
+        b.ins().jump(row_header, &[]);
+
+        b.switch_to_block(chunk_next);
+        b.seal_block(chunk_next);
+        let chunk_i = b.use_var(chunk_index);
+        let one = b.ins().iconst(types::I64, 1);
+        let next_chunk = b.ins().iadd(chunk_i, one);
+        b.def_var(chunk_index, next_chunk);
+        b.ins().jump(chunk_header, &[]);
+
+        b.seal_block(row_header);
+        b.seal_block(chunk_header);
+        b.switch_to_block(exit);
+        b.seal_block(exit);
     }
 
     /// Type of local `slot` — the checker already validated it, and the JIT
@@ -689,14 +809,52 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     };
                     b.ins().store(mem_flags(), v, ptr, 8);
                 } else {
-                    let v = if value.ty == Ty::I64 { v } else { self.convert(b, v, &value.ty, &Ty::I64) };
+                    let v = if value.ty == Ty::I64 {
+                        v
+                    } else {
+                        self.convert(b, v, &value.ty, &Ty::I64)
+                    };
                     b.ins().store(mem_flags(), v, ptr, 8);
                 }
                 ptr
             }
-            ExprKind::Iter { .. } | ExprKind::PlaceRead { .. } | ExprKind::PlaceWrite { .. } => {
-                unreachable!("phase 1 scaffold, not yet lowered")
+            ExprKind::PlaceRead { place } => {
+                let ptr = self.place_pointer(b, place);
+                if matches!(e.ty, Ty::Struct(_)) {
+                    ptr
+                } else {
+                    b.ins().load(e.ty.clif(), mem_flags(), ptr, 0)
+                }
             }
+            ExprKind::PlaceWrite { place, op, value } => {
+                let ptr = self.place_pointer(b, place);
+                let mut value = self.expr(b, value);
+                if let Some(op) = op {
+                    let current = b.ins().load(e.ty.clif(), mem_flags(), ptr, 0);
+                    value = self.arith(b, *op, current, value, e.ty.clone());
+                }
+                b.ins().store(mem_flags(), value, ptr, 0);
+                value
+            }
+            ExprKind::Iter { .. } => {
+                unreachable!("query iteration is not lowered yet")
+            }
+        }
+    }
+
+    fn place_pointer(&self, b: &mut FunctionBuilder<'_>, place: &PlaceExpr) -> Value {
+        let (base, offset) = match place {
+            PlaceExpr::Field { base, offset } => (*base, *offset),
+            PlaceExpr::Slot(_) | PlaceExpr::Index { .. } => {
+                unreachable!("unsupported component place")
+            }
+        };
+        let ptr = b.use_var(self.vars[base]);
+        if offset == 0 {
+            ptr
+        } else {
+            let byte_offset = b.ins().iconst(types::I64, offset as i64);
+            b.ins().iadd(ptr, byte_offset)
         }
     }
 
@@ -725,6 +883,18 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         Self::fuel_check(self.module, self.sigs, b)
     }
 
+    fn fuel_check_n(&mut self, b: &mut FunctionBuilder<'_>, rows: Value) -> Value {
+        let sig = self
+            .sigs
+            .iter()
+            .find(|(name, _)| name == Intrinsic::FuelN.symbol())
+            .map(|(_, sig)| sig.clone())
+            .expect("chunk fuel helper declared by Jit");
+        let fref = self.module.declare_func_in_func(sig.id, b.func);
+        let call = b.ins().call(fref, &[rows]);
+        Self::adapt(b, &sig.ret, &Ty::Bool, b.inst_results(call)[0])
+    }
+
     /// Explicit `as` conversion. The checker guarantees the pair is legal;
     /// every combination below is total (wrapping integers, saturating
     /// float↔int, zero-extension from `bool`).
@@ -734,10 +904,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             // Integer ↔ integer: extend or truncate. Signedness only matters
             // for widening (sign- vs zero-extend); narrowing wraps.
             (f, t) if f.is_integer() && t.is_integer() => {
-                let (fw, tw) = (
-                    f.int_width().unwrap_or(32),
-                    t.int_width().unwrap_or(32),
-                );
+                let (fw, tw) = (f.int_width().unwrap_or(32), t.int_width().unwrap_or(32));
                 if fw == tw {
                     v
                 } else if tw < fw {
@@ -842,12 +1009,8 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         match (from, to) {
             // Widening: zero-extend, so a negative index stays a huge unsigned
             // value and the runtime bounds check traps on it.
-            (f, Ty::Ptr) if f.is_integer() || *f == Ty::Bool => {
-                b.ins().uextend(types::I64, v)
-            }
-            (Ty::Ptr, t) if t.is_integer() || *t == Ty::Bool => {
-                b.ins().ireduce(to.clif(), v)
-            }
+            (f, Ty::Ptr) if f.is_integer() || *f == Ty::Bool => b.ins().uextend(types::I64, v),
+            (Ty::Ptr, t) if t.is_integer() || *t == Ty::Bool => b.ins().ireduce(to.clif(), v),
             // Floats cross as words: exact-size bitcast, zero-extended words
             // for `f32` (matching `arr_get`'s zero-padded read).
             (Ty::F64, Ty::Ptr) => b.ins().bitcast(types::I64, mem_flags(), v),
@@ -964,9 +1127,12 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         let ins = b.ins();
         match ty {
             Ty::Str => match op {
-                BinaryOperator::Addition => {
-                    self.call_intrinsic(b, Intrinsic::StrConcat, &[(&Ty::Str, l), (&Ty::Str, r)], &Ty::Str)
-                }
+                BinaryOperator::Addition => self.call_intrinsic(
+                    b,
+                    Intrinsic::StrConcat,
+                    &[(&Ty::Str, l), (&Ty::Str, r)],
+                    &Ty::Str,
+                ),
                 BinaryOperator::Equality | BinaryOperator::StrictEquality => self.call_intrinsic(
                     b,
                     Intrinsic::StrEq,
@@ -1102,7 +1268,13 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 };
                 ins.icmp(cc, l, r)
             }
-            Ty::Option(_) | Ty::Tuple(_) | Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands => {
+            Ty::Struct(_)
+            | Ty::Option(_)
+            | Ty::Tuple(_)
+            | Ty::Query(_)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Commands => {
                 unreachable!("no operators on {}", ty)
             }
             Ty::Void => unreachable!("void has no operands"),

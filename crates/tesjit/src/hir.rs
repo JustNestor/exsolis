@@ -102,6 +102,13 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
+    QueryFor {
+        query: usize,
+        bindings: Vec<usize>,
+        terms: Vec<Ty>,
+        body: Vec<Stmt>,
+        span: Span,
+    },
 }
 
 /// A typed expression. `ty` is always the checker-computed type of the node.
@@ -133,6 +140,8 @@ pub enum CallTarget {
 pub enum Intrinsic {
     /// Fuel guard: `() -> boolean` (false when the budget ran out).
     Fuel,
+    /// Chunk fuel guard: `(row_count: i64) -> boolean`.
+    FuelN,
     /// Wrap `.rodata` bytes as an arena string: `(ptr, len) -> str`.
     StrWrap,
     StrLen,
@@ -202,6 +211,7 @@ impl Intrinsic {
     pub fn symbol(self) -> &'static str {
         match self {
             Intrinsic::Fuel => "__tesjit_fuel",
+            Intrinsic::FuelN => "__tesjit_fuel_n",
             Intrinsic::StrWrap => "__tesjit_str_wrap",
             Intrinsic::StrLen => "__tesjit_str_len",
             Intrinsic::StrConcat => "__tesjit_str_concat",
@@ -305,20 +315,28 @@ pub enum ExprKind {
         elems: Vec<Expr>,
         elem_ty: Ty,
     },
-    PlaceRead { place: PlaceExpr },
+    PlaceRead {
+        place: PlaceExpr,
+    },
     PlaceWrite {
         place: PlaceExpr,
         op: Option<BinaryOperator>,
         value: Box<Expr>,
     },
-    Iter { query: Box<Expr> },
-    OptionSome { value: Box<Expr> },
-    OptionNone { ty: Ty },
+    Iter {
+        query: Box<Expr>,
+    },
+    OptionSome {
+        value: Box<Expr>,
+    },
+    OptionNone {
+        ty: Ty,
+    },
 }
 
 #[derive(Clone, Debug)]
 pub enum PlaceExpr {
     Slot(usize),
-    Field { base: usize, name: String },
+    Field { base: usize, offset: u64 },
     Index { base: usize, index: usize },
 }

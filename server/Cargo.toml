@@ -38,6 +38,7 @@ rayon.workspace = true
 opensimplex2 = { workspace = true, optional = true }
 smallvec.workspace = true
 rustc-hash.workspace = true
+nonmax = "0.5"
 bincode.workspace = true
 serde_json.workspace = true
 roxmltree.workspace = true

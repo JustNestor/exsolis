@@ -19,7 +19,7 @@ use crate::diag::{CompileError, Diagnostics, Src};
 use crate::hir::Module as HirModule;
 use crate::host::{HostFn, HostRegistry};
 use crate::runtime::TesjitRuntime;
-use crate::ty::Ty;
+use crate::ty::{StructLayout, Ty};
 
 /// A finished, callable compilation unit.
 pub struct Compiled {
@@ -126,25 +126,15 @@ impl Compiled {
             "call_i64 supports at most {MAX_ARGS} arguments"
         );
         assert!(
-            e.params
-                .iter()
-                .all(|t| !t.is_float()),
+            e.params.iter().all(|t| !t.is_float()),
             "call_i64 cannot pass f32/f64 parameters; use `get::<F>()`"
         );
         let mut buf = [0i64; MAX_ARGS];
         buf[..args.len()].copy_from_slice(args);
         // Extra argument slots are simply ignored by the callee (System V,
         // caller-cleaned), which keeps this single trampoline for every arity.
-        let f: extern "C" fn(
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) -> i64 = unsafe { std::mem::transmute_copy(&e.ptr) };
+        let f: extern "C" fn(i64, i64, i64, i64, i64, i64, i64, i64) -> i64 =
+            unsafe { std::mem::transmute_copy(&e.ptr) };
         f(
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         )
@@ -208,6 +198,18 @@ impl JitBuilder {
     /// at runtime).
     pub fn host_fn_ref(&mut self, f: HostFn) {
         self.host.insert(f);
+    }
+
+    /// Register a host-provided component type for query and field checking.
+    pub fn component(
+        mut self,
+        name: impl Into<String>,
+        layout: Arc<StructLayout>,
+    ) -> Result<Self, CompileError> {
+        self.host
+            .insert_engine_component(name, layout)
+            .map_err(crate::diag::plain)?;
+        Ok(self)
     }
 
     pub fn build(self) -> Result<Jit, CompileError> {
@@ -330,9 +332,8 @@ impl Jit {
         // Runtime helpers (string/array intrinsics): imported symbols with the
         // signatures declared in `runtime_signatures`.
         for (name, params, ret) in Self::runtime_signatures() {
-            let id =
-                FnLowerer::declare_import(&mut self.module, name, &params, ret.clone())
-                    .map_err(|e| Diagnostics::from(CompileError::Plain(e)))?;
+            let id = FnLowerer::declare_import(&mut self.module, name, &params, ret.clone())
+                .map_err(|e| Diagnostics::from(CompileError::Plain(e)))?;
             self.sigs.push((name.to_owned(), FnSig { id, params, ret }));
         }
 
@@ -408,6 +409,7 @@ impl Jit {
         use Ty::{Ptr, Str};
         vec![
             ("__tesjit_fuel", vec![], Ty::Ptr),
+            ("__tesjit_fuel_n", vec![Ty::I64], Ty::Ptr),
             ("__tesjit_alloc", vec![Ptr], Ptr),
             ("__tesjit_str_wrap", vec![Ptr, Ptr], Str),
             ("__tesjit_str_len", vec![Str], Ptr),
@@ -429,8 +431,16 @@ impl Jit {
             ("__tesjit_opt_is_some", vec![Ty::Ptr], Ty::Ptr),
             ("__tesjit_opt_unwrap_i64", vec![Ty::Ptr], Ty::Ptr),
             ("__tesjit_opt_unwrap_f64", vec![Ty::Ptr], Ty::F64),
-            ("__tesjit_opt_unwrap_or_i64", vec![Ty::Ptr, Ty::Ptr], Ty::Ptr),
-            ("__tesjit_opt_unwrap_or_f64", vec![Ty::Ptr, Ty::F64], Ty::F64),
+            (
+                "__tesjit_opt_unwrap_or_i64",
+                vec![Ty::Ptr, Ty::Ptr],
+                Ty::Ptr,
+            ),
+            (
+                "__tesjit_opt_unwrap_or_f64",
+                vec![Ty::Ptr, Ty::F64],
+                Ty::F64,
+            ),
             ("__tesjit_arr_get", vec![Ptr, Ptr, Ptr], Ptr),
             ("__tesjit_arr_set", vec![Ptr, Ptr, Ptr, Ptr], Ptr),
         ]
