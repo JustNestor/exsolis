@@ -3,10 +3,11 @@
 Status: **implementation approved and underway**. The tesjit query-loop
 foundation, Bevy table queries, and typed `Res<T>`/`Mut<T>` system parameters
 are implemented, including `With<T>` and `Without<T>` query filters.
-`Commands`, the planned builder API, and performance/fuzz acceptance work
-remain outstanding. The initial runtime currently imports
-component layouts from `types.tdb`; replacing that runtime dependency is now a
-planned migration (see §11).
+`Commands.spawn` with typed component values is implemented and defers entity
+insertion until all mods finish the tick. The broader `Commands` API, planned
+builder API, and performance/fuzz acceptance work remain outstanding. The
+initial runtime currently imports component layouts from `types.tdb`; replacing
+that runtime dependency is a planned migration (see §11).
 
 Sources of truth for this document:
 
@@ -167,8 +168,12 @@ Representation:
   indices.
 - `Res<T>` — read-only resource handle.
 - `Mut<T>` is the mutable variant of `Res`.
-- `Commands` — append-only command buffer (spawn, despawn, insert component,
-  add resource). No direct world mutation from mod code.
+- `Commands` — append-only command buffer; currently supports
+  `spawn(component1, component2, ...)` for registered components with supported
+  layouts. Typed object literals initialize components, and spawned entities
+  become visible on the next tick after all mods have run. It returns `void`;
+  `despawn`, `insert`, and resource operations are not implemented. No direct
+  world mutation from mod code.
 
 Because they are signature-only, attempts to construct them (`new Query<T>()`,
 bind them to locals, store them in arrays) are rejected by the checker.
@@ -181,7 +186,8 @@ bind them to locals, store them in arrays) are rejected by the checker.
 - Methods on `Array<T>`: `a.length`, `a.push(x)`, `a[i]` already use this.
 - Methods on `Query<T>`: `.iter()`, `.single()`, `.get(entity)`.
 - Methods on `Iter<T>`: `.next()`, `.skip`, exhaustiveness.
-- Methods on `Commands`: `.spawn(c)`, `.despawn(e)`, `.insert(e, c)`.
+- Methods on `Commands`: `.spawn(c1, c2, ...)` (implemented); `.despawn(e)` and
+  `.insert(e, c)` remain planned.
 - Resolution order: module-local → host namespace (`world`, `q`) → builtins.
   No `Self`/trait confusion.
 
@@ -437,21 +443,20 @@ Each phase ends in a testable, revertible deliverable.
 
 ---
 
-## 10. Open questions (input to approval)
+## 10. Open questions and resolved decisions
 
 1. Should mods have read access to component *metadata* (which Components
    exist) via a host call — constant-cost `component::id::<T>` — or should
    the set be fixed compile-time by the host registry? Proposed: fixed
    compile-time, with a host test listing every registered T.
+   The component set is currently fixed at compile time.
 2. Are mod-spawned entities visible to *other* mods in the same tick?
-   Proposed: no, writes commit at end of tick (commands buffer) — matches
-   Lua's `ScriptRequest` model.
+   Resolved: no. Commands are applied after all mods run, and the entities are
+   queryable on the following tick.
 3. Should the spawn path take an explicit `Archetype` or infer from the
-   `T` tuple? Proposed: infer from a typed spawn command `.spawn((C1, C2))`.
-
-The component set is currently fixed at compile time. The two spawn semantics
-remain open and should be confirmed before `Commands` is implemented; the
-proposals above are the recommended defaults.
+   `T` tuple? Resolved: infer from typed component values passed as
+   `.spawn(c1, c2, ...)`; component object literals require an explicit
+   component type annotation.
 
 ---
 

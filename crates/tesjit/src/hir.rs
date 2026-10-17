@@ -12,7 +12,8 @@
 use oxc_ast::ast::{BinaryOperator, LogicalOperator, UnaryOperator};
 use oxc_span::Span;
 
-use crate::ty::Ty;
+use crate::ty::{StructLayout, Ty};
+use std::sync::Arc;
 
 /// A whole compilation unit.
 pub struct Module {
@@ -314,6 +315,16 @@ pub enum ExprKind {
     ArrayLit {
         elems: Vec<Expr>,
         elem_ty: Ty,
+    },
+    /// `{ field: value }` — a stack-backed value of a registered component.
+    StructLit {
+        layout: Arc<StructLayout>,
+        fields: Vec<(u64, Expr)>,
+    },
+    /// `commands.spawn(component1, component2, ...)`.
+    CommandsSpawn {
+        commands: Box<Expr>,
+        components: Vec<Expr>,
     },
     PlaceRead {
         place: PlaceExpr,

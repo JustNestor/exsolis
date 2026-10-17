@@ -89,6 +89,9 @@ impl ComponentRegistry {
             return Self::default();
         };
         let mut registry = Self::default();
+        registry
+            .resources
+            .extend(world.iter_resources().map(|(info, _)| info.id()));
         for info in world.components().iter_registered() {
             if info.type_id().is_none() {
                 continue;
@@ -101,9 +104,18 @@ impl ComponentRegistry {
             if !valid_ts_identifier(&name) {
                 continue;
             }
-            let Some(layout) = component_layout(db, def, &name) else {
+            let Some(mut layout) = component_layout(db, def, &name) else {
                 continue;
             };
+            if !registry.resources.contains(&info.id()) {
+                let Ok(component_id) = u32::try_from(info.id().index()) else {
+                    bevy_log::warn!(
+                        "ts ECS: ignored `{rust_name}` because its component id does not fit u32"
+                    );
+                    continue;
+                };
+                layout.component_id = Some(component_id);
+            }
             let actual = info.layout();
             if layout.size != actual.size() as u64 || layout.align != actual.align() as u64 {
                 bevy_log::warn!(
@@ -129,9 +141,6 @@ impl ComponentRegistry {
                 registry.ambiguous.insert(name);
             }
         }
-        registry
-            .resources
-            .extend(world.iter_resources().map(|(info, _)| info.id()));
         registry
     }
 
@@ -245,7 +254,7 @@ fn component_layout(db: &TypeDb, def: &TypeDef, name: &str) -> Option<StructLayo
         return None;
     }
     let mut seen = HashSet::new();
-    let fields = body
+    let fields: Vec<_> = body
         .fields
         .iter()
         .filter_map(|field| {
@@ -257,7 +266,14 @@ fn component_layout(db: &TypeDb, def: &TypeDef, name: &str) -> Option<StructLayo
             })
         })
         .collect();
-    StructLayout::from_parts(name, fields, def.size, def.align).ok()
+    let spawnable = fields.len() == body.fields.len()
+        && body
+            .fields
+            .iter()
+            .all(|field| spawnable_type(db, field.ty.as_str(), &mut HashSet::new()));
+    let mut layout = StructLayout::from_parts(name, fields, def.size, def.align).ok()?;
+    layout.spawnable = spawnable;
+    Some(layout)
 }
 
 fn type_layout(db: &TypeDb, name: &str, seen: &mut HashSet<String>) -> Option<Ty> {
@@ -290,7 +306,7 @@ fn type_layout(db: &TypeDb, name: &str, seen: &mut HashSet<String>) -> Option<Ty
     if body.is_union || !seen.insert(def.name.0.clone()) {
         return None;
     }
-    let fields = body
+    let fields: Vec<_> = body
         .fields
         .iter()
         .filter_map(|field| {
@@ -302,9 +318,43 @@ fn type_layout(db: &TypeDb, name: &str, seen: &mut HashSet<String>) -> Option<Ty
             })
         })
         .collect();
+    let spawnable = fields.len() == body.fields.len()
+        && body
+            .fields
+            .iter()
+            .all(|field| spawnable_type(db, field.ty.as_str(), &mut HashSet::new()));
     seen.remove(&def.name.0);
-    let layout = StructLayout::from_parts(leaf, fields, def.size, def.align).ok()?;
+    let mut layout = StructLayout::from_parts(leaf, fields, def.size, def.align).ok()?;
+    layout.spawnable = spawnable;
     Some(Ty::Struct(Arc::new(layout)))
+}
+
+fn spawnable_type(db: &TypeDb, name: &str, seen: &mut HashSet<String>) -> bool {
+    match name {
+        "bool" | "i8" | "i16" | "i32" | "i64" | "u8" | "u16" | "u32" | "u64" | "f32" | "f64" => {
+            return true;
+        }
+        "char" => return false,
+        _ => {}
+    }
+    let Some(def) = db.get(name) else {
+        return false;
+    };
+    if short_name(&def.name.0) == "Entity" && def.size == 8 {
+        return true;
+    }
+    let TypeArgs::Struct(body) = &def.args else {
+        return false;
+    };
+    if body.is_union || !seen.insert(def.name.0.clone()) {
+        return false;
+    }
+    let spawnable = body
+        .fields
+        .iter()
+        .all(|field| spawnable_type(db, field.ty.as_str(), seen));
+    seen.remove(&def.name.0);
+    spawnable
 }
 
 #[derive(Clone)]
@@ -596,6 +646,169 @@ impl Default for QueryBuffer {
     }
 }
 
+#[derive(Clone, Copy)]
+struct SpawnableComponent {
+    id: ComponentId,
+    size: usize,
+    align: usize,
+}
+
+struct SpawnValue {
+    component: ComponentId,
+    bytes: Vec<u8>,
+    align: usize,
+}
+
+pub(crate) struct CommandBuffer {
+    components: HashMap<u32, SpawnableComponent>,
+    spawns: Vec<Vec<SpawnValue>>,
+    error: Option<String>,
+}
+
+impl CommandBuffer {
+    fn new(registry: &ComponentRegistry) -> Self {
+        let components = registry
+            .by_name
+            .values()
+            .filter_map(|component| {
+                let id = component.layout.component_id?;
+                Some((
+                    id,
+                    SpawnableComponent {
+                        id: component.id,
+                        size: component.layout.size as usize,
+                        align: component.layout.align as usize,
+                    },
+                ))
+            })
+            .collect();
+        Self {
+            components,
+            spawns: Vec::new(),
+            error: None,
+        }
+    }
+
+    fn fail(&mut self, message: impl Into<String>) {
+        if self.error.is_none() {
+            self.error = Some(message.into());
+        }
+    }
+
+    fn apply(&mut self, world: &mut World) {
+        if let Some(error) = self.error.take() {
+            bevy_log::error!("ts ECS command buffer rejected a spawn: {error}");
+        }
+        for spawn in self.spawns.drain(..) {
+            let mut allocated = Vec::with_capacity(spawn.len());
+            let mut allocation_failed = false;
+            for value in spawn {
+                let Ok(layout) =
+                    std::alloc::Layout::from_size_align(value.bytes.len().max(1), value.align)
+                else {
+                    bevy_log::error!("ts ECS command buffer has an invalid component layout");
+                    allocation_failed = true;
+                    break;
+                };
+                let ptr = unsafe { std::alloc::alloc(layout) };
+                if ptr.is_null() {
+                    bevy_log::error!("ts ECS command buffer could not allocate component data");
+                    allocation_failed = true;
+                    break;
+                }
+                if !value.bytes.is_empty() {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(value.bytes.as_ptr(), ptr, value.bytes.len());
+                    }
+                }
+                allocated.push((value.component, ptr, layout));
+            }
+            if allocation_failed {
+                for (_, ptr, layout) in allocated {
+                    unsafe { std::alloc::dealloc(ptr, layout) };
+                }
+                continue;
+            }
+
+            let mut entity = world.spawn_empty();
+            for (component, ptr, layout) in allocated {
+                let owning = unsafe {
+                    bevy_ecs::ptr::OwningPtr::new(
+                        std::ptr::NonNull::new(ptr).expect("component allocation is non-null"),
+                    )
+                };
+                unsafe { entity.insert_by_id(component, owning) };
+                unsafe { std::alloc::dealloc(ptr, layout) };
+            }
+        }
+    }
+}
+
+pub(crate) extern "C" fn host_commands_spawn(buffer: i64, input: i64) {
+    if buffer == 0 || input == 0 {
+        bevy_log::error!("ts ECS spawn received a null command buffer or descriptor");
+        return;
+    }
+    let buffer = unsafe { &mut *(buffer as usize as *mut CommandBuffer) };
+    let input = unsafe { &*(input as usize as *const tesjit::abi::SpawnInput) };
+    let Ok(count) = usize::try_from(input.component_count) else {
+        buffer.fail("component count does not fit usize");
+        return;
+    };
+    if count == 0 || count > tesjit::abi::MAX_SPAWN_COMPONENTS || input.components_addr == 0 {
+        buffer.fail("invalid spawn descriptor size");
+        return;
+    }
+    let descriptors = unsafe {
+        std::slice::from_raw_parts(
+            input.components_addr as usize as *const tesjit::abi::SpawnComponent,
+            count,
+        )
+    };
+    let mut values = Vec::with_capacity(count);
+    let mut used = HashSet::new();
+    for descriptor in descriptors {
+        let Ok(id) = u32::try_from(descriptor.component_id) else {
+            buffer.fail("component id does not fit u32");
+            return;
+        };
+        let Some(component) = buffer.components.get(&id).copied() else {
+            buffer.fail(format!("component id {id} is not spawnable"));
+            return;
+        };
+        let (Ok(size), Ok(align)) = (
+            usize::try_from(descriptor.size),
+            usize::try_from(descriptor.align),
+        ) else {
+            buffer.fail("component layout does not fit usize");
+            return;
+        };
+        if size != component.size
+            || align != component.align
+            || !used.insert(id)
+            || descriptor.data_addr == 0
+            || descriptor.data_addr % descriptor.align.max(1) != 0
+        {
+            buffer.fail("component layout or address does not match the registered type");
+            return;
+        }
+        let bytes = if size == 0 {
+            Vec::new()
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(descriptor.data_addr as usize as *const u8, size)
+                    .to_vec()
+            }
+        };
+        values.push(SpawnValue {
+            component: component.id,
+            bytes,
+            align,
+        });
+    }
+    buffer.spawns.push(values);
+}
+
 pub(crate) struct QuerySystem {
     pub(crate) name: String,
     params: Vec<LinkedParam>,
@@ -610,6 +823,9 @@ enum LinkedParam {
     Resource {
         component: ComponentId,
         mutable: bool,
+    },
+    Commands {
+        buffer: CommandBuffer,
     },
 }
 
@@ -681,6 +897,9 @@ impl QuerySystem {
                         mutable,
                     });
                 }
+                Ty::Commands => linked.push(LinkedParam::Commands {
+                    buffer: CommandBuffer::new(registry),
+                }),
                 other => {
                     return Err(format!(
                         "query system `{name}` parameters must be Query<T>, Res<T>, or Mut<T>; found {other}"
@@ -719,8 +938,19 @@ impl QuerySystem {
                     let ptr = value.as_mut().as_ptr();
                     self.args.push(ptr as usize as i64);
                 }
+                LinkedParam::Commands { buffer } => {
+                    self.args.push(buffer as *mut CommandBuffer as usize as i64);
+                }
             }
         }
         Some(&self.args)
+    }
+
+    pub(crate) fn apply_commands(&mut self, world: &mut World) {
+        for param in &mut self.params {
+            if let LinkedParam::Commands { buffer } = param {
+                buffer.apply(world);
+            }
+        }
     }
 }

@@ -9,12 +9,13 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     AssignmentOperator, AssignmentTarget, BinaryOperator, BindingPattern, Declaration, Expression,
-    ForStatementInit, ForStatementLeft, Function, LogicalOperator, SimpleAssignmentTarget,
-    Statement, TSTupleElement, TSType, TSTypeName, UnaryOperator, UpdateOperator,
-    VariableDeclaration,
+    ForStatementInit, ForStatementLeft, Function, LogicalOperator, ObjectPropertyKind, PropertyKey,
+    PropertyKind, SimpleAssignmentTarget, Statement, TSTupleElement, TSType, TSTypeName,
+    UnaryOperator, UpdateOperator, VariableDeclaration,
 };
 use oxc_parser::Parser;
 use oxc_span::{GetSpan, SourceType, Span};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::diag::{CompileError, Diagnostics, Src, err};
@@ -723,12 +724,12 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             let (init, ty) = match &decl.init {
                 Some(init) => {
                     let v = self.expr(init, declared.clone());
-                    if self.reject_struct_value(&v) {
+                    if !matches!(v.ty, Ty::OwnedStruct(_)) && self.reject_struct_value(&v) {
                         continue;
                     }
                     let ty = v.ty.clone();
                     if let Some(t) = declared
-                        && t != ty
+                        && !compatible_value(&ty, &t)
                     {
                         self.at(decl.span, format!("cannot assign {ty} to {t} (use `as`)"));
                     }
@@ -739,6 +740,13 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         self.at(decl.span, "variable needs a type annotation or initializer");
                         continue;
                     };
+                    if matches!(t, Ty::Struct(_)) {
+                        self.at(
+                            decl.span,
+                            "component values must be initialized with an object literal",
+                        );
+                        continue;
+                    }
                     (None, t)
                 }
             };
@@ -793,7 +801,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
         if offset > i64::MAX as u64 {
             return Err(format!("field offset overflow for {}.{name}", layout.name));
         }
-        let writable = matches!(&self.locals[base].ty, Ty::Mut(_));
+        let writable = matches!(&self.locals[base].ty, Ty::Mut(_) | Ty::OwnedStruct(_));
         Ok((
             PlaceExpr::Field { base, offset },
             field.ty.clone(),
@@ -802,7 +810,7 @@ impl<'a, 'l> FnCtx<'a, 'l> {
     }
 
     fn reject_struct_value(&mut self, expr: &Expr) -> bool {
-        if matches!(&expr.ty, Ty::Struct(_)) {
+        if matches!(&expr.ty, Ty::Struct(_) | Ty::OwnedStruct(_)) {
             self.at(
                 expr.span,
                 "copying a struct is not supported; assign fields individually",
@@ -935,6 +943,85 @@ impl<'a, 'l> FnCtx<'a, 'l> {
             Expression::BooleanLiteral(l) => Expr::new(ExprKind::Bool(l.value), Ty::Bool, l.span),
             Expression::StringLiteral(l) => {
                 Expr::new(ExprKind::Str(l.value.to_string()), Ty::Str, l.span)
+            }
+            Expression::ObjectExpression(object) => {
+                let Some(layout) = expect.as_ref().and_then(Ty::struct_layout) else {
+                    return self.poison(
+                        object.span,
+                        "component object literals need a registered component type annotation",
+                    );
+                };
+                let layout = Arc::new(layout.clone());
+                if !layout.spawnable {
+                    self.at(
+                        object.span,
+                        format!(
+                            "component `{}` has fields that cannot be initialized by a mod",
+                            layout.name
+                        ),
+                    );
+                }
+                let mut seen = HashSet::new();
+                let mut fields = Vec::with_capacity(object.properties.len());
+                for property in &object.properties {
+                    let ObjectPropertyKind::ObjectProperty(property) = property else {
+                        self.at(property.span(), "component object spread is not supported");
+                        continue;
+                    };
+                    if property.method || property.computed || property.kind != PropertyKind::Init {
+                        self.at(property.span, "component fields must be plain properties");
+                        continue;
+                    }
+                    let PropertyKey::StaticIdentifier(key) = &property.key else {
+                        self.at(
+                            property.key.span(),
+                            "component field names must be identifiers",
+                        );
+                        continue;
+                    };
+                    let field_name = key.name.as_str();
+                    let Some(field) = layout.field(field_name) else {
+                        self.at(
+                            property.key.span(),
+                            format!("{} has no field `{field_name}`", layout.name),
+                        );
+                        continue;
+                    };
+                    if !seen.insert(field_name.to_owned()) {
+                        self.at(
+                            property.key.span(),
+                            format!("duplicate field `{field_name}`"),
+                        );
+                        continue;
+                    }
+                    let value = self.expr(&property.value, Some(field.ty.clone()));
+                    if !compatible_value(&value.ty, &field.ty) {
+                        self.at(
+                            property.value.span(),
+                            format!(
+                                "field {}.{} expects {}, found {}",
+                                layout.name, field_name, field.ty, value.ty
+                            ),
+                        );
+                    }
+                    fields.push((field.offset, value));
+                }
+                for field in &layout.fields {
+                    if !seen.contains(&field.name) {
+                        self.at(
+                            object.span,
+                            format!("component literal is missing field `{}`", field.name),
+                        );
+                    }
+                }
+                Expr::new(
+                    ExprKind::StructLit {
+                        layout: Arc::clone(&layout),
+                        fields,
+                    },
+                    Ty::OwnedStruct(layout),
+                    object.span,
+                )
             }
             Expression::ArrayExpression(arr) => {
                 let span = arr.span;
@@ -1299,6 +1386,82 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                 )
             }
             Expression::CallExpression(c) => {
+                if let Expression::StaticMemberExpression(member) = &c.callee
+                    && member.property.name.as_str() == "spawn"
+                {
+                    let commands = self.expr(&member.object, None);
+                    if commands.ty == Ty::Commands {
+                        if c.arguments.is_empty()
+                            || c.arguments.len() > crate::abi::MAX_SPAWN_COMPONENTS
+                        {
+                            return self.poison(
+                                c.span,
+                                format!(
+                                    "commands.spawn takes 1..={} component values",
+                                    crate::abi::MAX_SPAWN_COMPONENTS
+                                ),
+                            );
+                        }
+                        let mut components = Vec::with_capacity(c.arguments.len());
+                        let mut ids = HashSet::new();
+                        for argument in &c.arguments {
+                            let Some(argument) = argument.as_expression() else {
+                                return self
+                                    .poison(c.span, "spread spawn arguments are unsupported");
+                            };
+                            let value = self.expr(argument, None);
+                            let layout = match &value.ty {
+                                Ty::Struct(_) | Ty::OwnedStruct(_) => value.ty.struct_layout(),
+                                Ty::Mut(inner) if matches!(inner.as_ref(), Ty::Struct(_)) => {
+                                    value.ty.struct_layout()
+                                }
+                                _ => None,
+                            };
+                            let Some(layout) = layout else {
+                                return self.poison(
+                                    argument.span(),
+                                    format!(
+                                        "commands.spawn expects component values, found {}",
+                                        value.ty
+                                    ),
+                                );
+                            };
+                            if !layout.spawnable {
+                                return self.poison(
+                                    argument.span(),
+                                    format!(
+                                        "component `{}` cannot be copied into a spawn command",
+                                        layout.name
+                                    ),
+                                );
+                            }
+                            let Some(id) = layout.component_id else {
+                                return self.poison(
+                                    argument.span(),
+                                    format!("`{}` is not a spawnable Bevy component", layout.name),
+                                );
+                            };
+                            if !ids.insert(id) {
+                                return self.poison(
+                                    argument.span(),
+                                    format!(
+                                        "commands.spawn contains `{}` more than once",
+                                        layout.name
+                                    ),
+                                );
+                            }
+                            components.push(value);
+                        }
+                        return Expr::new(
+                            ExprKind::CommandsSpawn {
+                                commands: Box::new(commands),
+                                components,
+                            },
+                            Ty::Void,
+                            c.span,
+                        );
+                    }
+                }
                 // Option<T> constructors.
                 if let Expression::Identifier(id) = &c.callee {
                     match id.name.as_str() {
@@ -1585,6 +1748,11 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         Ty::I32
                     }
                 };
+                if matches!(&a.expression, Expression::ObjectExpression(_))
+                    && matches!(&to, Ty::Struct(_))
+                {
+                    return self.expr(&a.expression, Some(to));
+                }
                 let v = self.expr(&a.expression, None);
                 let cast_ty = to.clone();
                 // Same type: no-op. Integers convert freely (wrap on
@@ -1936,6 +2104,18 @@ fn tuple_element_ty(element: &TSTupleElement<'_>, host: &HostRegistry) -> Result
             )),
         },
     }
+}
+
+fn compatible_value(actual: &Ty, expected: &Ty) -> bool {
+    if actual == expected {
+        return true;
+    }
+    matches!(
+        (actual, expected),
+        (Ty::OwnedStruct(actual), Ty::Struct(expected))
+            | (Ty::OwnedStruct(actual), Ty::OwnedStruct(expected))
+            if actual == expected
+    )
 }
 
 /// A function signature collected in pass 1.

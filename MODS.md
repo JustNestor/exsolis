@@ -39,9 +39,24 @@ Query systems execute synchronously during the server's exclusive tick system.
 They cannot add or remove components while query pointers are live. Query
 matching supports table-stored component terms and `With<Component>` /
 `Without<Component>` filters (including zero-sized marker components).
-Sparse-set query terms and filters are not supported. `Commands` is not exposed
-yet. Each table chunk is charged against the mod's fuel budget before any row
-in that chunk runs.
+Sparse-set query terms and filters are not supported. `Commands.spawn` accepts
+registered, supported component values and stages a new entity:
+
+```ts
+export function on_tick(commands: Commands): void {
+  const position: Position = { x: 1.5, y: 9 };
+  const marker: PlayerTag = {};
+  commands.spawn(position, marker);
+}
+```
+
+Component object literals need an explicit component type. Spawned entities are
+added after every mod has run, so they are visible to queries on the next tick,
+not later in the current tick. `spawn` returns `void`; `despawn`, `insert`, and
+other command operations are not implemented. Components must have a registered
+layout with supported fields; sparse-set components and fields with unsupported
+representations cannot be spawned. Each table chunk is charged against the
+mod's fuel budget before any row in that chunk runs.
 
 Existing zero-argument `on_tick()` mods and event handlers remain supported.
 An export other than `on_tick` cannot take query parameters.

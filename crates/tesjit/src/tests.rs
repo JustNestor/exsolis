@@ -1,12 +1,31 @@
 //! Tests: compile→run behaviour, host calls, and diagnostics batching.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{CompileError, Jit, JitBuilder, StructField, StructLayout, Ty};
 
 static LAST: AtomicU64 = AtomicU64::new(0);
+static SPAWN_CAPTURE: Mutex<Option<(u64, u64, f64, i32, [u8; 4])>> = Mutex::new(None);
 extern "C" fn test_log(x: f64) {
     LAST.store(x.to_bits(), Ordering::SeqCst);
+}
+
+extern "C" fn capture_spawn(_commands: i64, input: i64) {
+    let input = unsafe { &*(input as usize as *const crate::abi::SpawnInput) };
+    let descriptors = unsafe {
+        std::slice::from_raw_parts(
+            input.components_addr as usize as *const crate::abi::SpawnComponent,
+            input.component_count as usize,
+        )
+    };
+    let component = &descriptors[0];
+    let data = component.data_addr as usize as *const u8;
+    let x = unsafe { data.cast::<f64>().read() };
+    let y = unsafe { data.add(8).cast::<i32>().read() };
+    let padding = unsafe { data.add(12).cast::<[u8; 4]>().read() };
+    *SPAWN_CAPTURE.lock().unwrap() =
+        Some((input.component_count, component.component_id, x, y, padding));
 }
 
 /// Compile `src` with a single `log(host)` registered.
@@ -117,6 +136,55 @@ fn query_component_filters_are_typed() {
     assert_eq!(filters.len(), 2);
     assert_eq!(filters[0].kind, crate::ty::QueryFilterKind::With);
     assert_eq!(filters[1].kind, crate::ty::QueryFilterKind::Without);
+}
+
+#[test]
+fn component_literals_stage_typed_spawn_values() {
+    let mut position = StructLayout::from_parts(
+        "Position",
+        vec![
+            StructField {
+                name: "x".to_owned(),
+                ty: Ty::F64,
+                offset: 0,
+            },
+            StructField {
+                name: "y".to_owned(),
+                ty: Ty::I32,
+                offset: 8,
+            },
+        ],
+        16,
+        8,
+    )
+    .unwrap();
+    position.component_id = Some(42);
+    let src = r#"
+      export function on_tick(commands: Commands): void {
+        const position: Position = { x: 1.5, y: 9 };
+        position.x += 1.0;
+        position.y += 2;
+        commands.spawn(position);
+      }
+    "#;
+    let mut jit = JitBuilder::new("<spawn>", std::sync::Arc::from(src))
+        .component("Position", std::sync::Arc::new(position))
+        .unwrap()
+        .host_fn(
+            "__tesjit_commands_spawn",
+            vec![Ty::Commands, Ty::Ptr],
+            Ty::Void,
+            capture_spawn as *const u8,
+        )
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    unsafe { compiled.call_void("on_tick", &[1]) };
+    assert_eq!(
+        *SPAWN_CAPTURE.lock().unwrap(),
+        Some((1, 42, 2.5, 11, [0; 4]))
+    );
 }
 
 #[test]

@@ -11,7 +11,9 @@
 
 use cranelift_codegen::ir::MachMemFlags;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, Value, types};
+use cranelift_codegen::ir::{
+    self, AbiParam, BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value, types,
+};
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::JITModule;
@@ -786,6 +788,86 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 let _ = &mut arr;
                 arr
             }
+            ExprKind::StructLit { layout, fields } => {
+                let slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    layout.size.max(1) as u32,
+                    layout.align.trailing_zeros() as u8,
+                ));
+                let ptr = b.ins().stack_addr(types::I64, slot, 0);
+                for (offset, value) in fields {
+                    let value_ty = value.ty.clone();
+                    let value_ptr = self.offset_pointer(b, ptr, *offset);
+                    let value = self.expr(b, value);
+                    if let Some(nested) = value_ty.struct_layout() {
+                        self.copy_struct_fields(b, value, value_ptr, nested);
+                    } else {
+                        b.ins().store(mem_flags(), value, value_ptr, 0);
+                    }
+                }
+                ptr
+            }
+            ExprKind::CommandsSpawn {
+                commands,
+                components,
+            } => {
+                let descriptor_size =
+                    (components.len() * std::mem::size_of::<crate::abi::SpawnComponent>()) as u32;
+                let descriptor_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    descriptor_size.max(1),
+                    3,
+                ));
+                let descriptor_ptr = b.ins().stack_addr(types::I64, descriptor_slot, 0);
+                for (index, component) in components.iter().enumerate() {
+                    let layout = component
+                        .ty
+                        .struct_layout()
+                        .expect("checker validated spawn component");
+                    let source_ptr = self.expr(b, component);
+                    let component_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        layout.size.max(1) as u32,
+                        layout.align.trailing_zeros() as u8,
+                    ));
+                    let component_ptr = b.ins().stack_addr(types::I64, component_slot, 0);
+                    self.zero_struct_padding(b, component_ptr, layout);
+                    self.copy_struct_fields(b, source_ptr, component_ptr, layout);
+                    let base_offset =
+                        (index * std::mem::size_of::<crate::abi::SpawnComponent>()) as u64;
+                    let fields = [
+                        layout.component_id.expect("checker validated component id") as u64,
+                        layout.size,
+                        layout.align,
+                    ];
+                    for (field_index, value) in fields.into_iter().enumerate() {
+                        let offset = base_offset + (field_index * 8) as u64;
+                        let field_ptr = self.offset_pointer(b, descriptor_ptr, offset);
+                        let value = b.ins().iconst(types::I64, value as i64);
+                        b.ins().store(mem_flags(), value, field_ptr, 0);
+                    }
+                    let data_ptr = self.offset_pointer(b, descriptor_ptr, base_offset + 24);
+                    b.ins().store(mem_flags(), component_ptr, data_ptr, 0);
+                }
+                let input_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    std::mem::size_of::<crate::abi::SpawnInput>() as u32,
+                    3,
+                ));
+                let input_ptr = b.ins().stack_addr(types::I64, input_slot, 0);
+                let count = b.ins().iconst(types::I64, components.len() as i64);
+                b.ins().store(mem_flags(), count, input_ptr, 0);
+                let components_addr = self.offset_pointer(b, input_ptr, 8);
+                b.ins()
+                    .store(mem_flags(), descriptor_ptr, components_addr, 0);
+                let commands = self.expr(b, commands);
+                let sig = self
+                    .sig_of("__tesjit_commands_spawn")
+                    .expect("Commands host function registered");
+                let fref = self.module.declare_func_in_func(sig.id, b.func);
+                b.ins().call(fref, &[commands, input_ptr]);
+                b.ins().iconst(types::I32, 0)
+            }
             ExprKind::OptionNone { ty: _ } => {
                 use crate::hir::Intrinsic;
                 let size = b.ins().iconst(types::I64, 16);
@@ -820,7 +902,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             }
             ExprKind::PlaceRead { place } => {
                 let ptr = self.place_pointer(b, place);
-                if matches!(e.ty, Ty::Struct(_)) {
+                if matches!(e.ty, Ty::Struct(_) | Ty::OwnedStruct(_)) {
                     ptr
                 } else {
                     b.ins().load(e.ty.clif(), mem_flags(), ptr, 0)
@@ -855,6 +937,66 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         } else {
             let byte_offset = b.ins().iconst(types::I64, offset as i64);
             b.ins().iadd(ptr, byte_offset)
+        }
+    }
+
+    fn offset_pointer(&self, b: &mut FunctionBuilder<'_>, ptr: Value, offset: u64) -> Value {
+        if offset == 0 {
+            ptr
+        } else {
+            let offset = b.ins().iconst(types::I64, offset as i64);
+            b.ins().iadd(ptr, offset)
+        }
+    }
+
+    fn copy_struct_fields(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        source: Value,
+        target: Value,
+        layout: &crate::ty::StructLayout,
+    ) {
+        for field in &layout.fields {
+            let source_ptr = self.offset_pointer(b, source, field.offset);
+            let target_ptr = self.offset_pointer(b, target, field.offset);
+            if let Some(nested) = field.ty.struct_layout() {
+                self.copy_struct_fields(b, source_ptr, target_ptr, nested);
+            } else {
+                let value = b.ins().load(field.ty.clif(), mem_flags(), source_ptr, 0);
+                b.ins().store(mem_flags(), value, target_ptr, 0);
+            }
+        }
+    }
+
+    fn zero_struct_padding(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        ptr: Value,
+        layout: &crate::ty::StructLayout,
+    ) {
+        let mut fields: Vec<_> = layout.fields.iter().collect();
+        fields.sort_by_key(|field| field.offset);
+        let mut end = 0;
+        for field in fields {
+            self.zero_bytes(b, ptr, end, field.offset);
+            let field_ptr = self.offset_pointer(b, ptr, field.offset);
+            if let Some(nested) = field.ty.struct_layout() {
+                self.zero_struct_padding(b, field_ptr, nested);
+            }
+            let (size, _) = field
+                .ty
+                .value_layout()
+                .expect("checker validated component field layout");
+            end = field.offset + size;
+        }
+        self.zero_bytes(b, ptr, end, layout.size);
+    }
+
+    fn zero_bytes(&self, b: &mut FunctionBuilder<'_>, ptr: Value, start: u64, end: u64) {
+        let zero = b.ins().iconst(types::I8, 0);
+        for offset in start..end {
+            let byte_ptr = self.offset_pointer(b, ptr, offset);
+            b.ins().store(mem_flags(), zero, byte_ptr, 0);
         }
     }
 
@@ -971,6 +1113,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     }
                 }
             }
+
             // `f32` ↔ `f64`.
             (Ty::F32, Ty::F64) => b.ins().fpromote(types::F64, v),
             (Ty::F64, Ty::F32) => b.ins().fdemote(types::F32, v),
@@ -1269,6 +1412,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 ins.icmp(cc, l, r)
             }
             Ty::Struct(_)
+            | Ty::OwnedStruct(_)
             | Ty::Option(_)
             | Ty::Tuple(_)
             | Ty::Query(..)

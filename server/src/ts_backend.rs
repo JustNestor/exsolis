@@ -386,6 +386,12 @@ fn host_fns() -> Vec<HostFn> {
             Ty::I32,
             host_query_row_count as *const u8,
         ),
+        HostFn::new(
+            "__tesjit_commands_spawn",
+            vec![Ty::Commands, Ty::Ptr],
+            Ty::Void,
+            crate::ts_ecs::host_commands_spawn as *const u8,
+        ),
         HostFn::new("row_stride", vec![], Ty::I32, host_row_stride as *const u8),
         HostFn::new(
             "row_offset",
@@ -978,6 +984,11 @@ impl TsRuntime {
                 });
             }
         }
+        for module in &mut self.mods {
+            for system in &mut module.systems {
+                system.apply_commands(world);
+            }
+        }
         OUTBOX.with(|outbox| *outbox.borrow_mut() = None);
     }
 
@@ -1036,7 +1047,10 @@ impl TsRuntime {
 }
 
 fn is_ecs_system_param(param: &Ty) -> bool {
-    matches!(param, Ty::Query(..) | Ty::Res(_) | Ty::Mut(_))
+    matches!(
+        param,
+        Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
+    )
 }
 
 /// Run one handler with fuel armed, the runtime entered, and any trap logged.
@@ -1094,7 +1108,7 @@ fn compile_mod(
             }
             if name != "on_tick" {
                 return Err(vec![tesjit::CompileError::Plain(format!(
-                    "only `on_tick` may take ECS query parameters; `{name}` has Query<T>"
+                    "only `on_tick` may take ECS system parameters; found them on `{name}`"
                 ))]);
             }
             query_params.extend_from_slice(params);
@@ -1787,6 +1801,135 @@ mod tests {
         assert_eq!(runtime.mods[0].layout_hash, old_layout_hash);
         runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
         assert_eq!(world.get::<QueryFixture>(first).unwrap().amount, 9.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commands_spawn_typed_components_after_all_mods_run() {
+        #[derive(Component)]
+        struct SpawnFixture {
+            value: f64,
+        }
+
+        #[derive(Component)]
+        struct SpawnMarker;
+
+        #[derive(Resource)]
+        struct RuntimeConfig {
+            seen: u64,
+        }
+
+        fn add_struct(
+            db: &mut tesjit_dwarf::TypeDb,
+            rust_name: String,
+            size: u64,
+            align: u64,
+            fields: Vec<tesjit_dwarf::Field>,
+        ) {
+            db.types.insert(
+                rust_name.clone(),
+                tesjit_dwarf::TypeDef {
+                    name: tesjit_dwarf::TypeName(rust_name),
+                    size,
+                    align,
+                    args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                        is_union: false,
+                        fields,
+                    }),
+                },
+            );
+        }
+
+        let mut db = tesjit_dwarf::TypeDb::new();
+        add_struct(
+            &mut db,
+            std::any::type_name::<SpawnFixture>().to_owned(),
+            8,
+            8,
+            vec![tesjit_dwarf::Field {
+                name: "value".to_owned(),
+                ty: tesjit_dwarf::TypeName::from("f64"),
+                offset: 0,
+            }],
+        );
+        add_struct(
+            &mut db,
+            std::any::type_name::<SpawnMarker>().to_owned(),
+            0,
+            1,
+            vec![],
+        );
+        add_struct(
+            &mut db,
+            std::any::type_name::<RuntimeConfig>().to_owned(),
+            8,
+            8,
+            vec![tesjit_dwarf::Field {
+                name: "seen".to_owned(),
+                ty: tesjit_dwarf::TypeName::from("u64"),
+                offset: 0,
+            }],
+        );
+
+        let mut world = World::new();
+        world.register_component::<SpawnFixture>();
+        world.register_component::<SpawnMarker>();
+        world.insert_resource(RuntimeConfig { seen: 0 });
+        let registry = ComponentRegistry::from_world(&world, Some(&db));
+        let dir = mods_dir(&[
+            (
+                "a-spawner.ts",
+                r#"
+                export function on_tick(commands: Commands): void {
+                  const value: SpawnFixture = { value: 42.5 };
+                  const marker: SpawnMarker = {};
+                  commands.spawn(value, marker);
+                }
+                "#,
+            ),
+            (
+                "b-observer.ts",
+                r#"
+                export function on_tick(
+                  query: Query<SpawnFixture, [With<SpawnMarker>]>,
+                  config: Mut<RuntimeConfig>,
+                ): void {
+                  for (const value of query) {
+                    config.seen += 1;
+                  }
+                }
+                "#,
+            ),
+        ]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 2);
+
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.resource::<RuntimeConfig>().seen, 0);
+        let values: Vec<_> = world
+            .query::<&SpawnFixture>()
+            .iter(&world)
+            .map(|fixture| fixture.value)
+            .collect();
+        assert_eq!(values, [42.5]);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<SpawnMarker>>()
+                .iter(&world)
+                .count(),
+            1
+        );
+
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.resource::<RuntimeConfig>().seen, 1);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<SpawnMarker>>()
+                .iter(&world)
+                .count(),
+            2
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

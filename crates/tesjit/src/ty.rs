@@ -22,6 +22,8 @@ pub struct StructLayout {
     pub fields: Vec<StructField>,
     pub size: u64,
     pub align: u64,
+    pub component_id: Option<u32>,
+    pub spawnable: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -89,6 +91,8 @@ impl StructLayout {
             fields,
             size,
             align,
+            component_id: None,
+            spawnable: true,
         })
     }
 
@@ -135,6 +139,8 @@ pub enum Ty {
     Option(Box<Ty>),
     /// A host component. Values are borrowed pointers and cannot be copied.
     Struct(Arc<StructLayout>),
+    /// An owned, stack-backed component value constructed by a mod.
+    OwnedStruct(Arc<StructLayout>),
     /// `Tuple<...>` — positional product, row type of multi-component `Query`.
     Tuple(Vec<Ty>),
     /// `Query<T, F>` — signature-only type (never materializes).
@@ -169,6 +175,7 @@ impl Ty {
             | Ty::Entity
             | Ty::Option(_)
             | Ty::Struct(_)
+            | Ty::OwnedStruct(_)
             | Ty::Tuple(_)
             | Ty::Query(..)
             | Ty::Res(_)
@@ -202,6 +209,7 @@ impl Ty {
             Ty::Entity => "Entity".into(),
             Ty::Option(t) => format!("Option<{t}>").into(),
             Ty::Struct(layout) => layout.name.as_str().into(),
+            Ty::OwnedStruct(layout) => layout.name.as_str().into(),
             Ty::Tuple(ts) => format!(
                 "({})",
                 ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
@@ -282,7 +290,7 @@ impl Ty {
     /// Return the host layout of a component or a resource/component borrow.
     pub fn struct_layout(&self) -> Option<&StructLayout> {
         match self {
-            Ty::Struct(layout) => Some(layout),
+            Ty::Struct(layout) | Ty::OwnedStruct(layout) => Some(layout),
             Ty::Res(inner) | Ty::Mut(inner) => inner.struct_layout(),
             _ => None,
         }
@@ -353,7 +361,7 @@ impl Ty {
             Ty::I16 | Ty::U16 => Some(2),
             Ty::I32 | Ty::U32 | Ty::F32 => Some(4),
             Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some(8),
-            Ty::Struct(layout) => Some(layout.size),
+            Ty::Struct(layout) | Ty::OwnedStruct(layout) => Some(layout.size),
             Ty::Option(_)
             | Ty::Tuple(_)
             | Ty::Query(..)
