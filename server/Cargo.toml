@@ -16,6 +16,7 @@ exsolis_common.workspace = true
 fastpack.workspace = true
 tesjit-dwarf.workspace = true
 tesjit.workspace = true
+tesjit-schema = { path = "../crates/tesjit-schema" }
 axum.workspace = true
 bytes.workspace = true
 tokio.workspace = true
@@ -38,6 +39,7 @@ rayon.workspace = true
 opensimplex2 = { workspace = true, optional = true }
 smallvec.workspace = true
 rustc-hash.workspace = true
+nonmax = "0.5"
 bincode.workspace = true
 serde_json.workspace = true
 roxmltree.workspace = true

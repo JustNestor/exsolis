@@ -4,42 +4,58 @@
 //! what makes the JIT boundary safe: there is no dynamic tagging, the codegen
 //! layer always knows the register class of a value.
 //!
-//! Phase 2 adds named structs with `repr(C)` layouts, `Component<T>` /
-//! `Resource<T>` aliases, and keeps `Query`/`Res`/`Mut`/`Commands` as
-//! signature-only types that never materialise as locals.
+//! Structs come in two flavors: mod-defined `repr(C)` POD structs
+//! (`Component<T>` / `Resource<T>`) and host-registered engine component
+//! layouts (`from_parts`, used by the zero-copy query path). `Query`/`Res`/
+//! `Mut`/`Commands` stay signature-only types that never materialise as locals.
 
 use cranelift_codegen::ir::{self, types};
 use std::sync::Arc;
 
-/// A single field of a `repr(C)` struct.
+/// A single field of a struct layout (offset is already aligned).
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
-pub struct Field {
+pub struct StructField {
     pub name: String,
     pub ty: Ty,
-    /// Byte offset from the start of the struct (already aligned).
-    pub offset: u32,
+    /// Byte offset from the start of the struct.
+    pub offset: u64,
 }
 
-/// Layout of a named or anonymous struct. Offsets are `repr(C)`:
-/// each field is aligned to its natural alignment, and the whole
-/// struct is padded to a multiple of its maximum field alignment.
+/// Layout of a struct, either computed `repr(C)` for a mod-defined POD type
+/// or verified against a host-provided engine component layout.
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub struct StructLayout {
     pub name: String,
-    pub fields: Vec<Field>,
-    pub size: u32,
-    pub align: u32,
+    pub fields: Vec<StructField>,
+    pub size: u64,
+    pub align: u64,
+    /// Bevy component id for host-registered layouts (set at bind time).
+    pub component_id: Option<u32>,
+    /// Whether `Commands.spawn` may construct this component from a literal.
+    pub spawnable: bool,
     /// True when every leaf is a POD scalar (no strings, arrays, Options…).
-    /// Only POD structs may be components or resources.
+    /// Only POD structs may be mod-defined components or resources.
     pub is_pod: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum QueryFilterKind {
+    With,
+    Without,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
+pub struct QueryFilter {
+    pub kind: QueryFilterKind,
+    pub component: Arc<StructLayout>,
 }
 
 impl StructLayout {
     /// Build a `repr(C)` layout from ordered `(name, Ty)` pairs.
     pub fn repr_c(name: impl Into<String>, fields: Vec<(String, Ty)>) -> Result<Self, String> {
         let mut out = Vec::with_capacity(fields.len());
-        let mut offset: u32 = 0;
-        let mut max_align: u32 = 1;
+        let mut offset: u64 = 0;
+        let mut max_align: u64 = 1;
         let mut is_pod = true;
 
         for (fname, fty) in fields {
@@ -50,15 +66,15 @@ impl StructLayout {
                 is_pod = false;
             }
             // Align offset up to field alignment.
-            let align_mask = al - 1;
+            let align_mask = al as u64 - 1;
             offset = (offset + align_mask) & !align_mask;
-            out.push(Field {
+            out.push(StructField {
                 name: fname,
                 ty: fty,
                 offset,
             });
-            offset = offset.saturating_add(sz);
-            max_align = max_align.max(al);
+            offset = offset.saturating_add(sz as u64);
+            max_align = max_align.max(al as u64);
         }
         // Pad struct size to multiple of max alignment.
         let align_mask = max_align - 1;
@@ -69,11 +85,71 @@ impl StructLayout {
             fields: out,
             size,
             align: max_align,
+            component_id: None,
+            spawnable: true,
             is_pod,
         })
     }
 
-    pub fn field(&self, name: &str) -> Option<&Field> {
+    /// Build a layout only when every exposed field is naturally aligned,
+    /// non-overlapping, and contained in the component's actual byte size.
+    pub fn from_parts(
+        name: impl Into<String>,
+        fields: Vec<StructField>,
+        size: u64,
+        align: u64,
+    ) -> Result<Self, String> {
+        let name = name.into();
+        if align == 0 || !align.is_power_of_two() || size % align != 0 {
+            return Err(format!(
+                "invalid layout for {name}: size {size} must be a multiple of non-zero power-of-two alignment {align}"
+            ));
+        }
+        let mut fields_by_offset: Vec<_> = fields.iter().collect();
+        fields_by_offset.sort_by_key(|field| field.offset);
+        let mut end = 0;
+        for field in fields_by_offset {
+            let Some((field_size, field_align)) = field.ty.value_layout() else {
+                return Err(format!(
+                    "field {}.{} has no supported memory layout",
+                    name, field.name
+                ));
+            };
+            if field.offset % field_align != 0 {
+                return Err(format!(
+                    "field {}.{} at offset {} is not aligned to {field_align}",
+                    name, field.name, field.offset
+                ));
+            }
+            if field.offset < end {
+                return Err(format!(
+                    "field {}.{} overlaps a preceding field",
+                    name, field.name
+                ));
+            }
+            end = field
+                .offset
+                .checked_add(field_size)
+                .ok_or_else(|| format!("field {}.{} overflows layout", name, field.name))?;
+            if end > size {
+                return Err(format!(
+                    "field {}.{} ends at {end}, beyond component size {size}",
+                    name, field.name
+                ));
+            }
+        }
+        Ok(Self {
+            name,
+            fields,
+            size,
+            align,
+            component_id: None,
+            spawnable: true,
+            is_pod: true,
+        })
+    }
+
+    pub fn field(&self, name: &str) -> Option<&StructField> {
         self.fields.iter().find(|f| f.name == name)
     }
 
@@ -94,10 +170,10 @@ impl StructLayout {
                 h ^= b as u64;
                 h = h.wrapping_mul(0x100000001b3);
             }
-            h ^= f.offset as u64;
+            h ^= f.offset;
             h = h.wrapping_mul(0x100000001b3);
         }
-        h ^= self.size as u64;
+        h ^= self.size;
         h = h.wrapping_mul(0x100000001b3);
         h
     }
@@ -139,18 +215,21 @@ pub enum Ty {
     Entity,
     /// `Option<T>` — tagged pointer (heap-allocated `{tag, value}`).
     Option(Box<Ty>),
+    /// A host component. Values are borrowed pointers and cannot be copied.
+    Struct(Arc<StructLayout>),
+    /// An owned, stack-backed component value constructed by a mod.
+    OwnedStruct(Arc<StructLayout>),
     /// `Tuple<...>` — positional product, row type of multi-component `Query`.
     Tuple(Vec<Ty>),
-    /// Named `repr(C)` struct. Shared via `Arc` so clones are cheap.
-    Struct(Arc<StructLayout>),
     /// `Component<T>` — marks a POD struct (or scalar) as a mod-defined
     /// component. Signature-only when used as a query term; the layout is
     /// carried for offset/size queries and hot-reload hashing.
     Component(Box<Ty>),
     /// `Resource<T>` — marks a POD type as a mod-defined resource.
     Resource(Box<Ty>),
-    /// `Query<T>` — signature-only type (never materializes).
-    Query(Box<Ty>),
+    /// `Query<T, F>` — signature-only type (never materializes). F is an
+    /// optional list of `With<Comp>` / `Without<Comp>` component filters.
+    Query(Box<Ty>, Vec<QueryFilter>),
     /// `Res<T>` — signature-only read-only resource handle.
     Res(Box<Ty>),
     /// `Mut<T>` — signature-only mutable resource/component handle.
@@ -180,11 +259,12 @@ impl Ty {
             | Ty::U64
             | Ty::Entity
             | Ty::Option(_)
-            | Ty::Tuple(_)
             | Ty::Struct(_)
+            | Ty::OwnedStruct(_)
+            | Ty::Tuple(_)
             | Ty::Component(_)
             | Ty::Resource(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands => types::I64,
@@ -215,18 +295,31 @@ impl Ty {
             Ty::Bool => "boolean".into(),
             Ty::Entity => "Entity".into(),
             Ty::Option(t) => format!("Option<{t}>").into(),
+            Ty::Struct(layout) => layout.name.clone().into(),
+            Ty::OwnedStruct(layout) => layout.name.clone().into(),
+            Ty::Component(t) => format!("Component<{t}>").into(),
+            Ty::Resource(t) => format!("Resource<{t}>").into(),
             Ty::Tuple(ts) => format!(
                 "({})",
-                ts.iter()
-                    .map(|t| t.name())
+                ts.iter().map(|t| t.name()).collect::<Vec<_>>().join(", ")
+            )
+            .into(),
+            Ty::Query(row, filters) if filters.is_empty() => format!("Query<{row}>").into(),
+            Ty::Query(row, filters) => format!(
+                "Query<{row}, [{}]>",
+                filters
+                    .iter()
+                    .map(|filter| {
+                        let name = match filter.kind {
+                            QueryFilterKind::With => "With",
+                            QueryFilterKind::Without => "Without",
+                        };
+                        format!("{name}<{}>", filter.component.name)
+                    })
                     .collect::<Vec<_>>()
                     .join(", ")
             )
             .into(),
-            Ty::Struct(layout) => layout.name.clone().into(),
-            Ty::Component(t) => format!("Component<{t}>").into(),
-            Ty::Resource(t) => format!("Resource<{t}>").into(),
-            Ty::Query(t) => format!("Query<{t}>").into(),
             Ty::Res(t) => format!("Res<{t}>").into(),
             Ty::Mut(t) => format!("Mut<{t}>").into(),
             Ty::Commands => "Commands".into(),
@@ -242,7 +335,8 @@ impl Ty {
         !matches!(
             self,
             Ty::Void
-                | Ty::Query(_)
+                | Ty::Struct(_)
+                | Ty::Query(..)
                 | Ty::Res(_)
                 | Ty::Mut(_)
                 | Ty::Commands
@@ -256,7 +350,7 @@ impl Ty {
     pub fn is_signature_only(&self) -> bool {
         matches!(
             self,
-            Ty::Query(_)
+            Ty::Query(..)
                 | Ty::Res(_)
                 | Ty::Mut(_)
                 | Ty::Commands
@@ -273,10 +367,18 @@ impl Ty {
         }
     }
 
-    /// `Query<T>` row type accessor.
+    /// `Query<T, F>` row type accessor.
     pub fn query_row(&self) -> Option<Ty> {
         match self {
-            Ty::Query(t) => Some((**t).clone()),
+            Ty::Query(t, _) => Some((**t).clone()),
+            _ => None,
+        }
+    }
+
+    /// `Query<T, F>` component filters.
+    pub fn query_filters(&self) -> Option<&[QueryFilter]> {
+        match self {
+            Ty::Query(_, filters) => Some(filters),
             _ => None,
         }
     }
@@ -297,12 +399,25 @@ impl Ty {
         }
     }
 
-    /// If this is a struct (or Component/Resource wrapping a struct), return
-    /// the layout.
+    /// Return the host layout of a struct (including `Component`/`Resource`
+    /// of one, or a `Res`/`Mut` borrow of one).
     pub fn struct_layout(&self) -> Option<Arc<StructLayout>> {
         match self {
-            Ty::Struct(l) => Some(Arc::clone(l)),
+            Ty::Struct(l) | Ty::OwnedStruct(l) => Some(Arc::clone(l)),
             Ty::Component(inner) | Ty::Resource(inner) => inner.struct_layout(),
+            Ty::Res(inner) | Ty::Mut(inner) => inner.struct_layout(),
+            _ => None,
+        }
+    }
+
+    /// Byte size and alignment for a scalar or host component value.
+    pub fn value_layout(&self) -> Option<(u64, u64)> {
+        match self {
+            Ty::I8 | Ty::U8 | Ty::Bool => Some((1, 1)),
+            Ty::I16 | Ty::U16 => Some((2, 2)),
+            Ty::I32 | Ty::U32 | Ty::F32 => Some((4, 4)),
+            Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some((8, 8)),
+            Ty::Struct(layout) | Ty::OwnedStruct(layout) => Some((layout.size, layout.align)),
             _ => None,
         }
     }
@@ -311,14 +426,7 @@ impl Ty {
     pub fn is_integer(&self) -> bool {
         matches!(
             self,
-            Ty::I8
-                | Ty::I16
-                | Ty::I32
-                | Ty::I64
-                | Ty::U8
-                | Ty::U16
-                | Ty::U32
-                | Ty::U64
+            Ty::I8 | Ty::I16 | Ty::I32 | Ty::I64 | Ty::U8 | Ty::U16 | Ty::U32 | Ty::U64
         )
     }
 
@@ -367,12 +475,12 @@ impl Ty {
             Ty::I16 | Ty::U16 => Some(2),
             Ty::I32 | Ty::U32 | Ty::F32 => Some(4),
             Ty::I64 | Ty::U64 | Ty::F64 | Ty::Entity => Some(8),
+            Ty::Struct(layout) | Ty::OwnedStruct(layout) => Some(layout.size),
             Ty::Option(_)
             | Ty::Tuple(_)
-            | Ty::Struct(_)
             | Ty::Component(_)
             | Ty::Resource(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands
@@ -394,7 +502,7 @@ impl Ty {
                 Some((8, 8))
             }
             Ty::Option(_) => Some((8, 8)),
-            Ty::Struct(l) => Some((l.size, l.align)),
+            Ty::Struct(l) | Ty::OwnedStruct(l) => Some((l.size as u32, l.align as u32)),
             Ty::Component(inner) | Ty::Resource(inner) => inner.size_align(),
             Ty::Tuple(ts) => {
                 // Treat tuple as an anonymous struct for sizing.
@@ -405,9 +513,9 @@ impl Ty {
                     .collect();
                 StructLayout::repr_c("", fields)
                     .ok()
-                    .map(|l| (l.size, l.align))
+                    .map(|l| (l.size as u32, l.align as u32))
             }
-            Ty::Query(_) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Void => None,
+            Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Void => None,
         }
     }
 
@@ -427,7 +535,7 @@ impl Ty {
             | Ty::F64
             | Ty::Bool
             | Ty::Entity => true,
-            Ty::Struct(l) => l.is_pod,
+            Ty::Struct(l) | Ty::OwnedStruct(l) => l.is_pod,
             Ty::Component(inner) | Ty::Resource(inner) => inner.is_pod_leaf(),
             Ty::Tuple(ts) => ts.iter().all(|t| t.is_pod_leaf()),
             _ => false,
@@ -455,7 +563,7 @@ impl Ty {
     }
 
     /// Look up a field by name when this is a struct (or Component/Resource of one).
-    pub fn field(&self, name: &str) -> Option<(u32, Ty)> {
+    pub fn field(&self, name: &str) -> Option<(u64, Ty)> {
         let layout = self.struct_layout()?;
         let f = layout.field(name)?;
         Some((f.offset, f.ty.clone()))

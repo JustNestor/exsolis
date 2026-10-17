@@ -54,7 +54,8 @@ use exsolis_common::{AIR_ID, BlockId, BlockPos, PlayerId};
 
 use crate::assets::mods_directory;
 use crate::chunks::{ChunkWorld, PlayerPosition};
-use crate::scripting::{apply_script_requests, LuaScalar, ScriptRequest, world_to_chunk_index};
+use crate::scripting::{LuaScalar, ScriptRequest, apply_script_requests, world_to_chunk_index};
+use crate::ts_ecs::{ComponentRegistry, QuerySystem, TsSchemaRegistry};
 
 /// Fuel handed to each handler invocation: room for a per-tick hook worth of
 /// work (tens of thousands of statements), small enough that a spin loop dies
@@ -69,8 +70,14 @@ const PER_CALL_FUEL: u64 = 2_000_000;
 pub const EVENTS: &[(&str, &[Ty])] = &[
     ("player_join", &[Ty::Str]),
     ("player_leave", &[Ty::Str]),
-    ("place_block", &[Ty::Str, Ty::I32, Ty::I32, Ty::I32, Ty::I32]),
-    ("break_block", &[Ty::Str, Ty::I32, Ty::I32, Ty::I32, Ty::I32]),
+    (
+        "place_block",
+        &[Ty::Str, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
+    ),
+    (
+        "break_block",
+        &[Ty::Str, Ty::I32, Ty::I32, Ty::I32, Ty::I32],
+    ),
     ("select_hotbar", &[Ty::Str, Ty::I32]),
     ("ui_action", &[Ty::Str, Ty::Str, Ty::Str, Ty::Str, Ty::Str]),
     ("ui_drag", &[Ty::Str, Ty::Str, Ty::Str, Ty::Str, Ty::Str]),
@@ -141,7 +148,7 @@ struct RowsView {
 /// export only works with `debug = 2` (see the workspace profile).
 #[derive(Debug, Clone, Copy, Default)]
 #[repr(C)]
-struct PlayerRow {
+pub(crate) struct PlayerRow {
     /// `PlayerId` as u64. First, so the common lookup is at offset 0 and no
     /// padding is needed between it and the floats — the id word decides the
     /// row's alignment either way.
@@ -517,11 +524,12 @@ fn host_fns() -> Vec<HostFn> {
             host_query_row_count as *const u8,
         ),
         HostFn::new(
-            "row_stride",
-            vec![],
-            Ty::I32,
-            host_row_stride as *const u8,
+            "__tesjit_commands_spawn",
+            vec![Ty::Commands, Ty::Ptr],
+            Ty::Void,
+            crate::ts_ecs::host_commands_spawn as *const u8,
         ),
+        HostFn::new("row_stride", vec![], Ty::I32, host_row_stride as *const u8),
         HostFn::new(
             "row_offset",
             vec![Ty::Str],
@@ -1099,6 +1107,8 @@ struct TsMod {
     /// Display name (source path).
     name: String,
     compiled: Compiled,
+    systems: Vec<QuerySystem>,
+    layout_hash: u64,
 }
 
 /// All TS mods, with the same reload contract as the Lua runtime: a mod that
@@ -1147,12 +1157,34 @@ impl TsRuntime {
         Arc::clone(&self.outbox)
     }
 
+    fn has_pending_reload(&self) -> bool {
+        if !self.root.is_dir() {
+            return false;
+        }
+        let Ok(sources) = discover_ts_files(&self.root) else {
+            return true;
+        };
+        if sources.len() != self.stamps.len() {
+            return true;
+        }
+        sources.iter().any(|path| {
+            let Ok(stamp) = std::fs::metadata(path).and_then(|metadata| metadata.modified()) else {
+                return true;
+            };
+            self.stamps.get(path) != Some(&stamp)
+        })
+    }
+
     /// Load (or reload) every `*.ts` mod.
     ///
     /// Unchanged files keep their compiled module (JIT memory is *not*
     /// re-allocated just because a sibling mod changed); new/changed files are
     /// recompiled; a failing mod keeps its previous build and logs the errors.
     pub fn reload(&mut self) {
+        self.reload_with_registry(None);
+    }
+
+    fn reload_with_registry(&mut self, registry: Option<&ComponentRegistry>) {
         if !self.root.is_dir() {
             return;
         }
@@ -1181,6 +1213,10 @@ impl TsRuntime {
                 .map(|at| *at == stamp)
                 .unwrap_or(false);
             if !changed && already_failed {
+                if let Some(index) = self.mods.iter().position(|m| m.name == display(&path)) {
+                    next_mods.push(self.mods.swap_remove(index));
+                }
+                failures.insert(path.clone(), stamp);
                 continue;
             }
             if !changed {
@@ -1190,23 +1226,20 @@ impl TsRuntime {
                     continue;
                 }
             }
-            match compile_mod(&path) {
-                Ok(compiled) => {
-                    // §7: reject-on-layout-change. If this path already had a
-                    // live mod and the new component layout hash differs,
-                    // keep the old Compiled and log the rejection.
-                    if let Some(index) = self.mods.iter().position(|m| m.name == display(&path)) {
-                        let old_hash = self.mods[index].compiled.component_layout_hash;
-                        let new_hash = compiled.component_layout_hash;
-                        if old_hash != 0 && new_hash != 0 && old_hash != new_hash {
-                            error!(
-                                "[ts mod] {} rejected: component layout hash changed ({old_hash:#x} → {new_hash:#x}); keeping previous build",
-                                path.display()
-                            );
-                            next_mods.push(self.mods.swap_remove(index));
-                            failures.insert(path.clone(), stamp);
-                            continue;
-                        }
+            match compile_mod(&path, registry) {
+                Ok((compiled, systems, layout_hash)) => {
+                    if let Some(index) = self.mods.iter().position(|m| m.name == display(&path))
+                        && self.mods[index].layout_hash != layout_hash
+                    {
+                        error!(
+                            "[ts mod] {} rejected reload: ECS component layout changed (old {:016x}, new {:016x})",
+                            path.display(),
+                            self.mods[index].layout_hash,
+                            layout_hash
+                        );
+                        failures.insert(path.clone(), stamp);
+                        next_mods.push(self.mods.swap_remove(index));
+                        continue;
                     }
                     info!("[ts mod] loaded {}", path.display());
                     // A successful build supersedes any earlier failure.
@@ -1214,6 +1247,8 @@ impl TsRuntime {
                     next_mods.push(TsMod {
                         name: display(&path),
                         compiled,
+                        systems,
+                        layout_hash,
                     });
                 }
                 Err(diags) => {
@@ -1284,6 +1319,20 @@ impl TsRuntime {
             // buffer the caller owns, not a copy.
             set_rows_view(rows);
             for m in &self.mods {
+                let Some(entry) = m.compiled.entry("on_tick") else {
+                    continue;
+                };
+                if entry.params.iter().any(is_ecs_system_param) {
+                    continue;
+                }
+                if entry.ret != Ty::Void || !entry.params.is_empty() {
+                    warn!(
+                        "[ts mod] {} exported `on_tick` with the wrong shape",
+                        m.name
+                    );
+                    continue;
+                }
+
                 // Region ids are per module (every mod has its own runtime), so
                 // the same row buffer is registered under each module's id and
                 // that id is what the pull API hands out for this mod.
@@ -1314,6 +1363,49 @@ impl TsRuntime {
         });
     }
 
+    /// Run legacy hooks and linked ECS-query systems while the exclusive
+    /// Bevy world borrow keeps every table pointer valid.
+    pub(crate) fn tick_ecs(
+        &mut self,
+        positions: &HashMap<String, (f32, f32, f32)>,
+        chunk_world: *const ChunkWorld,
+        rows: &[PlayerRow],
+        world: &mut World,
+    ) {
+        self.tick(positions, chunk_world, rows);
+        OUTBOX.with(|outbox| *outbox.borrow_mut() = Some(Arc::clone(&self.outbox)));
+        for m in &mut self.mods {
+            let TsMod {
+                name: mod_name,
+                compiled,
+                systems,
+                ..
+            } = m;
+            if systems.iter().any(|system| system.name == "on_tick") {
+                set_rows_region(compiled.register_region(
+                    "players",
+                    rows.as_ptr() as *mut u8,
+                    rows.len() * std::mem::size_of::<PlayerRow>(),
+                ));
+            }
+            for system in systems {
+                let name = system.name.clone();
+                let Some(args) = system.args(world) else {
+                    continue;
+                };
+                run_guarded_parts(compiled, mod_name, &name, |compiled| unsafe {
+                    compiled.call_void(&name, args)
+                });
+            }
+        }
+        for module in &mut self.mods {
+            for system in &mut module.systems {
+                system.apply_commands(world);
+            }
+        }
+        OUTBOX.with(|outbox| *outbox.borrow_mut() = None);
+    }
+
     /// Forward one event to the mods that export the matching handler.
     pub fn dispatch(&self, event: &str, args: &[HostArg]) {
         let Some((_, shape)) = EVENTS.iter().find(|(name, _)| *name == event) else {
@@ -1321,7 +1413,11 @@ impl TsRuntime {
             return;
         };
         if args.len() != shape.len() {
-            warn!("ts mod: event {event} got {} args, want {}", args.len(), shape.len());
+            warn!(
+                "ts mod: event {event} got {} args, want {}",
+                args.len(),
+                shape.len()
+            );
             return;
         }
         let handler = handler_for(event);
@@ -1354,9 +1450,7 @@ impl TsRuntime {
                             HostArg::I32(v) => i64::from(*v),
                             HostArg::F64(v) => *v as i64,
                             HostArg::Bool(v) => i64::from(*v),
-                            HostArg::Str(text) => {
-                                tesjit::runtime::host_string(text)
-                            }
+                            HostArg::Str(text) => tesjit::runtime::host_string(text),
                         });
                     }
                     unsafe { compiled.call_void(&handler, &slots) };
@@ -1369,7 +1463,7 @@ impl TsRuntime {
 /// Invoke every system scheduled on the `"update"` stage.
 ///
 /// Frame ABI (matches codegen `declare_framed` / `define`):
-/// - `Query` → two i64 slots: `chunks_ptr`, `chunk_count`
+/// - `Query` → one i64 slot: pointer to `QueryInput { chunks_addr, chunk_count }`
 /// - `Res`/`Mut` → pointer into a tick-local resource slot
 /// - `Commands` → `COMMANDS_HANDLE` (tick-local `TsCommands`)
 fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
@@ -1388,6 +1482,15 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
         };
         if entry.ret != Ty::Void {
             warn!("[ts mod] {} system `{}` must return void", m.name, name);
+            continue;
+        }
+        if entry.frame_loads.len() != entry.params.len() {
+            // Ordinary params can't be packed by the frame ABI; such systems
+            // run through the linked QuerySystem path instead.
+            warn!(
+                "[ts mod] {} system `{}` has ordinary parameters; skipping frame invocation",
+                m.name, name
+            );
             continue;
         }
 
@@ -1411,11 +1514,16 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
                         pack_query_generic(rows, shape, &ctx.packers)
                     })
                     .unwrap_or_else(|| pack_query_generic(rows, shape, &QueryPackRegistry::engine_defaults()));
-                    let ptr = desc_buf.as_ptr() as i64;
+                    let ptr = desc_buf.as_ptr() as u64;
                     live_bufs.push(desc_buf);
                     col_storage.extend(cols);
-                    slots.push(ptr);
-                    slots.push(count as i64);
+                    // One machine word: a pointer to QueryInput { chunks_addr,
+                    // chunk_count } the JIT's query_for loop reads.
+                    let mut input = Vec::with_capacity(16);
+                    input.extend_from_slice(&ptr.to_le_bytes());
+                    input.extend_from_slice(&(count as u64).to_le_bytes());
+                    live_bufs.push(input);
+                    slots.push(live_bufs.last().unwrap().as_ptr() as i64);
                 }
                 tesjit::hir::FrameLoadKind::Resource { type_name, mutable } => {
                     let mut ptr = resource_ptr(type_name, *mutable);
@@ -1519,19 +1627,26 @@ fn player_rows_as_query_chunks(rows: &[PlayerRow], n_cols: usize) -> (Vec<u8>, u
     (desc, count)
 }
 
+fn is_ecs_system_param(param: &Ty) -> bool {
+    matches!(
+        param,
+        Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands
+    )
+}
+
 /// Run one handler with fuel armed, the runtime entered, and any trap logged.
 fn run_guarded(m: &TsMod, handler: &str, call: impl Fn(&Compiled)) {
-    m.compiled.runtime().reset_fuel(PER_CALL_FUEL);
-    let guard = m.compiled.enter();
-    call(&m.compiled);
+    run_guarded_parts(&m.compiled, &m.name, handler, call);
+}
+
+fn run_guarded_parts(compiled: &Compiled, mod_name: &str, handler: &str, call: impl Fn(&Compiled)) {
+    compiled.runtime().reset_fuel(PER_CALL_FUEL);
+    let guard = compiled.enter();
+    call(compiled);
     drop(guard);
-    if let Some(trap) = m.compiled.trap() {
-        error!(
-            "[ts mod] {} {handler} trapped: {}",
-            m.name,
-            trap.message()
-        );
-        m.compiled.clear_trap();
+    if let Some(trap) = compiled.trap() {
+        error!("[ts mod] {mod_name} {handler} trapped: {}", trap.message());
+        compiled.clear_trap();
     }
 }
 
@@ -1539,7 +1654,10 @@ fn display(path: &Path) -> String {
     path.display().to_string()
 }
 
-fn compile_mod(path: &Path) -> Result<Compiled, Vec<tesjit::CompileError>> {
+fn compile_mod(
+    path: &Path,
+    registry: Option<&ComponentRegistry>,
+) -> Result<(Compiled, Vec<QuerySystem>, u64), Vec<tesjit::CompileError>> {
     let src = std::fs::read_to_string(path).map_err(|e| {
         vec![tesjit::CompileError::Plain(format!(
             "read {}: {e}",
@@ -1551,9 +1669,38 @@ fn compile_mod(path: &Path) -> Result<Compiled, Vec<tesjit::CompileError>> {
     for f in host_fns() {
         builder.host_fn_ref(f);
     }
+    if let Some(registry) = registry {
+        for (name, layout) in registry.layouts() {
+            builder = builder
+                .component(name, Arc::clone(layout))
+                .map_err(|e| vec![e])?;
+        }
+    }
     let mut jit = builder.build().map_err(|e| vec![e])?;
-    jit.compile(&src).map_err(|d| d.into_iter().collect::<Vec<_>>())?;
-    jit.finish().map_err(|e| vec![e])
+    jit.compile(&src)
+        .map_err(|d| d.into_iter().collect::<Vec<_>>())?;
+    let compiled = jit.finish().map_err(|e| vec![e])?;
+    let mut systems = Vec::new();
+    let mut query_params = Vec::new();
+    if let Some(registry) = registry {
+        for (name, params, ret) in compiled.exports() {
+            if !params.iter().any(is_ecs_system_param) {
+                continue;
+            }
+            if name != "on_tick" {
+                return Err(vec![tesjit::CompileError::Plain(format!(
+                    "only `on_tick` may take ECS system parameters; found them on `{name}`"
+                ))]);
+            }
+            query_params.extend_from_slice(params);
+            systems.push(
+                QuerySystem::link(name, params, &ret, registry)
+                    .map_err(|error| vec![tesjit::CompileError::Plain(error)])?,
+            );
+        }
+    }
+    let layout_hash = crate::ts_ecs::layout_hash(&query_params);
+    Ok((compiled, systems, layout_hash))
 }
 
 /// Every `*.ts` file under `root`, in a stable order (directory order would
@@ -1679,9 +1826,35 @@ impl Plugin for TsScriptingPlugin {
     }
 }
 
-/// Hot reload: recompile mods whose source changed.
-pub fn ts_reload_system(mut runtime: ResMut<TsRuntime>) {
-    runtime.reload();
+/// Hot reload: recompile mods whose source changed, linking component types
+/// against the current world's registered table components.
+pub fn ts_reload_system(world: &mut World) {
+    let Some(mut runtime) = world.remove_resource::<TsRuntime>() else {
+        return;
+    };
+    if !runtime.has_pending_reload() {
+        world.insert_resource(runtime);
+        return;
+    }
+    let types = world
+        .get_resource::<crate::typedb::ServerTypes>()
+        .map(|types| Arc::clone(&types.0));
+    let schemas = match crate::ts_ecs::server_ts_schemas() {
+        Ok(schemas) => schemas,
+        Err(error) => {
+            error!("ts ECS: failed to build registered component schemas: {error}");
+            TsSchemaRegistry::default()
+        }
+    };
+    let registry = ComponentRegistry::from_world_with_schemas(world, types.as_deref(), &schemas);
+    if let Err(error) = registry.write_declarations(&runtime.root) {
+        warn!(
+            "ts ECS: could not update declarations in {}: {error}",
+            runtime.root.display()
+        );
+    }
+    runtime.reload_with_registry(Some(&registry));
+    world.insert_resource(runtime);
 }
 
 /// Snapshot of every connected player's position for this tick.
@@ -1703,7 +1876,7 @@ fn player_positions(world: &mut World) -> HashMap<String, (f32, f32, f32)> {
 /// any request is applied, so JIT code can never outlive it.
 pub fn ts_tick_system(world: &mut World) {
     let positions = player_positions(world);
-    let Some(runtime) = world.remove_resource::<TsRuntime>() else {
+    let Some(mut runtime) = world.remove_resource::<TsRuntime>() else {
         return;
     };
     // The type database comes from the resource the server inserted at startup,
@@ -1775,7 +1948,7 @@ pub fn ts_tick_system(world: &mut World) {
     install_resources(res_slots);
     reset_commands();
 
-    runtime.tick(&positions, world_ptr, &rows.players);
+    runtime.tick_ecs(&positions, world_ptr, &rows.players, world);
 
     // Q2: structural commands commit at end of tick.
     flush_commands();
@@ -1787,7 +1960,7 @@ pub fn ts_tick_system(world: &mut World) {
     // in `rows`. Applying it here (once per tick, after every handler ran)
     // keeps the ECS the single source of truth — mods never hold a `&mut
     // PlayerPosition` across a call.
-    let moved = apply_player_positions(world, &rows.players);
+    let moved = apply_player_positions(world, &positions, &rows.players);
     if moved > 0 {
         debug!("[ts mod] applied {moved} player position(s) from query rows");
     }
@@ -1806,15 +1979,24 @@ impl PullCtx {
 /// Only the position is written back: query rows are a *view* of the world, and
 /// a mod that wants to change anything else still goes through the request
 /// outbox (`set_block`, ...), which is the same rule the Lua bridge follows.
-fn apply_player_positions(world: &mut World, rows: &[PlayerRow]) -> usize {
+fn apply_player_positions(
+    world: &mut World,
+    snapshot: &HashMap<String, (f32, f32, f32)>,
+    rows: &[PlayerRow],
+) -> usize {
     let mut query = world.query::<(&crate::Player, &mut PlayerPosition)>();
     let mut applied = 0;
     for (player, mut position) in query.iter_mut(world) {
         let Some(row) = rows.iter().find(|row| row.id == player.0) else {
             continue;
         };
-        let moved = (position.0.x, position.0.y, position.0.z) != (row.x, row.y, row.z);
-        if moved {
+        let key = player.0.to_string();
+        let Some(original) = snapshot.get(&key) else {
+            continue;
+        };
+        let mod_changed = (row.x, row.y, row.z) != *original;
+        let world_changed = (position.0.x, position.0.y, position.0.z) != *original;
+        if mod_changed && !world_changed {
             position.0.x = row.x;
             position.0.y = row.y;
             position.0.z = row.z;
@@ -1997,7 +2179,7 @@ mod tests {
     use super::*;
 
     /// A unique temp directory with the given mod files.
-        fn mods_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
+    fn mods_dir(files: &[(&str, &str)]) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "ts-backend-test-{}-{}",
             std::process::id(),
@@ -2067,7 +2249,10 @@ mod tests {
         // `exsolis.d.ts` lives inside `mods/` because that is where mod authors
         // look for it; it must not be compiled as a module.
         let dir = mods_dir(&[
-            ("exsolis.d.ts", "declare function load_f64(region: i32, offset: i32): f64;\n"),
+            (
+                "exsolis.d.ts",
+                "declare function load_f64(region: i32, offset: i32): f64;\n",
+            ),
             (
                 "real.ts",
                 "export function on_tick(): void {}\ndeclare function load_f64(r: i32, o: i32): f64;\n",
@@ -2100,8 +2285,464 @@ mod tests {
         // u64 alignment — 24 bytes, and every field at an offset the host
         // reports rather than one a mod had to guess.
         assert_eq!(std::mem::size_of::<PlayerRow>(), 24);
-        assert_eq!((std::mem::align_of::<PlayerRow>(), PlayerRow::offset_of("x")), (8, 8));
+        assert_eq!(
+            (std::mem::align_of::<PlayerRow>(), PlayerRow::offset_of("x")),
+            (8, 8)
+        );
         assert_eq!(PlayerRow::offset_of("nope"), -1, "unknown fields report -1");
+    }
+
+    #[test]
+    fn built_in_component_schemas_validate_without_types_db() {
+        #[derive(tesjit_schema::TsSchema)]
+        struct NestedSchemaFixture {
+            look: crate::movement::PlayerLook,
+        }
+
+        let nested = <NestedSchemaFixture as crate::ts_ecs::TsSchema>::ts_schema().unwrap();
+        assert!(matches!(
+            nested.fields[0].ty,
+            Ty::Struct(ref schema) if schema.fields.len() == 2
+        ));
+
+        let mut world = World::new();
+        world.register_component::<crate::movement::PlayerLook>();
+        world.register_component::<PlayerPosition>();
+        let schemas = crate::ts_ecs::server_ts_schemas().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        let layouts: HashMap<_, _> = registry
+            .layouts()
+            .map(|(name, layout)| (name.to_owned(), Arc::clone(layout)))
+            .collect();
+        assert!(layouts.contains_key("PlayerLook"));
+        let position = layouts.get("PlayerPosition").unwrap();
+        assert_eq!(position.fields[0].name, "position");
+        assert!(matches!(
+            position.fields[0].ty,
+            Ty::Struct(ref nested) if nested.fields.len() == 3
+        ));
+    }
+
+    #[test]
+    fn registered_component_schemas_work_without_types_db() {
+        #[derive(Component)]
+        struct SchemaFixture {
+            amount: f64,
+        }
+
+        impl crate::ts_ecs::TsSchema for SchemaFixture {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SchemaFixture",
+                    vec![tesjit::StructField {
+                        name: "amount".to_owned(),
+                        ty: Ty::F64,
+                        offset: std::mem::offset_of!(Self, amount) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component::<SchemaFixture>();
+        let entity = world.spawn(SchemaFixture { amount: 2.5 }).id();
+        let mut schemas = TsSchemaRegistry::default();
+        schemas.register::<SchemaFixture>().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        let dir = mods_dir(&[(
+            "schema.ts",
+            r#"
+            export function on_tick(query: Query<Mut<SchemaFixture>>): void {
+              for (const value of query) {
+                value.amount += 1.0;
+              }
+            }
+            "#,
+        )]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 1);
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.get::<SchemaFixture>(entity).unwrap().amount, 3.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn query_systems_mutate_bevy_tables_and_discover_new_archetypes() {
+        #[derive(Component)]
+        struct QueryFixture {
+            amount: f64,
+            entity_bits: u64,
+        }
+
+        #[derive(Component)]
+        struct AddedAfterFirstTick;
+
+        #[derive(Component)]
+        struct FilterMarker;
+
+        #[derive(Component)]
+        struct ExtraMarker;
+
+        #[derive(Resource)]
+        struct RuntimeConfig {
+            calls: u64,
+        }
+
+        let type_name = std::any::type_name::<QueryFixture>().to_owned();
+        let config_type_name = std::any::type_name::<RuntimeConfig>().to_owned();
+        let mut db = tesjit_dwarf::TypeDb::new();
+        db.types.insert(
+            type_name.clone(),
+            tesjit_dwarf::TypeDef {
+                name: tesjit_dwarf::TypeName(type_name.clone()),
+                size: 16,
+                align: 8,
+                args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                    is_union: false,
+                    fields: vec![
+                        tesjit_dwarf::Field {
+                            name: "amount".to_owned(),
+                            ty: tesjit_dwarf::TypeName::from("f64"),
+                            offset: 0,
+                        },
+                        tesjit_dwarf::Field {
+                            name: "entity_bits".to_owned(),
+                            ty: tesjit_dwarf::TypeName::from("u64"),
+                            offset: 8,
+                        },
+                    ],
+                }),
+            },
+        );
+        db.types.insert(
+            config_type_name.clone(),
+            tesjit_dwarf::TypeDef {
+                name: tesjit_dwarf::TypeName(config_type_name.clone()),
+                size: 8,
+                align: 8,
+                args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                    is_union: false,
+                    fields: vec![tesjit_dwarf::Field {
+                        name: "calls".to_owned(),
+                        ty: tesjit_dwarf::TypeName::from("u64"),
+                        offset: 0,
+                    }],
+                }),
+            },
+        );
+        for marker_type_name in [
+            std::any::type_name::<AddedAfterFirstTick>().to_owned(),
+            std::any::type_name::<FilterMarker>().to_owned(),
+            std::any::type_name::<ExtraMarker>().to_owned(),
+        ] {
+            db.types.insert(
+                marker_type_name.clone(),
+                tesjit_dwarf::TypeDef {
+                    name: tesjit_dwarf::TypeName(marker_type_name),
+                    size: 0,
+                    align: 1,
+                    args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                        is_union: false,
+                        fields: vec![],
+                    }),
+                },
+            );
+        }
+
+        let mut world = World::new();
+        world.insert_resource(RuntimeConfig { calls: 0 });
+        world.register_component::<AddedAfterFirstTick>();
+        world.register_component::<FilterMarker>();
+        world.register_component::<ExtraMarker>();
+        let first = world
+            .spawn((
+                QueryFixture {
+                    amount: 0.5,
+                    entity_bits: 0,
+                },
+                FilterMarker,
+            ))
+            .id();
+        let registry = ComponentRegistry::from_world_with_schemas(
+            &world,
+            Some(&db),
+            &TsSchemaRegistry::default(),
+        );
+        assert!(registry.layouts().any(|(name, _)| name == "QueryFixture"));
+        assert!(registry.layouts().any(|(name, _)| name == "RuntimeConfig"));
+        assert!(
+            registry
+                .layouts()
+                .any(|(name, _)| name == "AddedAfterFirstTick")
+        );
+        assert!(registry.layouts().any(|(name, _)| name == "FilterMarker"));
+        assert!(registry.layouts().any(|(name, _)| name == "ExtraMarker"));
+
+        let dir = mods_dir(&[(
+            "query.ts",
+            r#"
+            export function on_tick(
+              query: Query<
+                [Entity, Mut<QueryFixture>],
+                [With<FilterMarker>, Without<AddedAfterFirstTick>]
+              >,
+              config: Mut<RuntimeConfig>,
+            ): void {
+              config.calls += 1;
+              for (const [entity, value] of query) {
+                value.amount += 3.0;
+                value.entity_bits = entity as u64;
+              }
+            }
+            "#,
+        )]);
+        registry.write_declarations(&dir).unwrap();
+        let declarations = std::fs::read_to_string(dir.join("exsolis.generated.d.ts")).unwrap();
+        assert!(declarations.contains("interface QueryFixture"));
+        assert!(declarations.contains("amount: f64;"));
+        let compilation = compile_mod(&dir.join("query.ts"), Some(&registry));
+        assert!(compilation.is_ok(), "{:?}", compilation.err());
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 1);
+        assert_eq!(runtime.mods[0].systems.len(), 1);
+
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        let first_value = world.get::<QueryFixture>(first).unwrap();
+        assert_eq!(first_value.amount, 3.5);
+        assert_eq!(first_value.entity_bits, first.to_bits());
+        assert_eq!(world.resource::<RuntimeConfig>().calls, 1);
+
+        let second = world
+            .spawn((
+                QueryFixture {
+                    amount: 1.0,
+                    entity_bits: 0,
+                },
+                FilterMarker,
+                AddedAfterFirstTick,
+            ))
+            .id();
+        let third = world
+            .spawn((
+                QueryFixture {
+                    amount: 2.0,
+                    entity_bits: 0,
+                },
+                FilterMarker,
+                ExtraMarker,
+            ))
+            .id();
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        let first_value = world.get::<QueryFixture>(first).unwrap();
+        let second_value = world.get::<QueryFixture>(second).unwrap();
+        let third_value = world.get::<QueryFixture>(third).unwrap();
+        assert_eq!(first_value.amount, 6.5);
+        assert_eq!(second_value.amount, 1.0);
+        assert_eq!(third_value.amount, 5.0);
+        assert_eq!(third_value.entity_bits, third.to_bits());
+        assert_eq!(world.resource::<RuntimeConfig>().calls, 2);
+        world.remove_resource::<RuntimeConfig>();
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.get::<QueryFixture>(first).unwrap().amount, 6.5);
+        world.insert_resource(RuntimeConfig { calls: 2 });
+        let old_layout_hash = runtime.mods[0].layout_hash;
+        let source_path = dir.join("query.ts");
+        let source = std::fs::read_to_string(&source_path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(
+            &source_path,
+            source.replace("value.amount", "value.measure"),
+        )
+        .unwrap();
+        let def = db.types.get_mut(&type_name).unwrap();
+        let tesjit_dwarf::TypeArgs::Struct(fields) = &mut def.args else {
+            unreachable!()
+        };
+        fields.fields[0].name = "measure".to_owned();
+        let changed_registry = ComponentRegistry::from_world_with_schemas(
+            &world,
+            Some(&db),
+            &TsSchemaRegistry::default(),
+        );
+        runtime.reload_with_registry(Some(&changed_registry));
+        runtime.reload_with_registry(Some(&changed_registry));
+        assert_eq!(
+            runtime.mods.len(),
+            1,
+            "a rejected mod keeps its last-good build"
+        );
+        assert_eq!(runtime.mods[0].layout_hash, old_layout_hash);
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.get::<QueryFixture>(first).unwrap().amount, 9.5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commands_spawn_typed_components_after_all_mods_run() {
+        #[derive(Component)]
+        struct SpawnFixture {
+            value: f64,
+        }
+
+        #[derive(Component)]
+        struct SpawnMarker;
+
+        #[derive(Resource)]
+        struct RuntimeConfig {
+            seen: u64,
+        }
+
+        impl crate::ts_ecs::TsSchema for SpawnFixture {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SpawnFixture",
+                    vec![tesjit::StructField {
+                        name: "value".to_owned(),
+                        ty: Ty::F64,
+                        offset: std::mem::offset_of!(Self, value) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
+        }
+
+        impl crate::ts_ecs::TsSchema for SpawnMarker {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                let mut layout = tesjit::StructLayout::from_parts(
+                    "SpawnMarker",
+                    vec![],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )?;
+                layout.spawnable = true;
+                Ok(layout)
+            }
+        }
+
+        impl crate::ts_ecs::TsSchema for RuntimeConfig {
+            fn ts_schema() -> Result<tesjit::StructLayout, String> {
+                tesjit::StructLayout::from_parts(
+                    "RuntimeConfig",
+                    vec![tesjit::StructField {
+                        name: "seen".to_owned(),
+                        ty: Ty::U64,
+                        offset: std::mem::offset_of!(Self, seen) as u64,
+                    }],
+                    std::mem::size_of::<Self>() as u64,
+                    std::mem::align_of::<Self>() as u64,
+                )
+            }
+        }
+
+        let mut world = World::new();
+        world.register_component::<SpawnFixture>();
+        world.register_component::<SpawnMarker>();
+        world.insert_resource(RuntimeConfig { seen: 0 });
+        let mut schemas = TsSchemaRegistry::default();
+        schemas.register::<SpawnFixture>().unwrap();
+        schemas.register::<SpawnMarker>().unwrap();
+        schemas.register::<RuntimeConfig>().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        let dir = mods_dir(&[
+            (
+                "a-spawner.ts",
+                r#"
+                export function on_tick(commands: Commands): void {
+                  const value: SpawnFixture = { value: 42.5 };
+                  const marker: SpawnMarker = {};
+                  commands.spawn(value, marker);
+                }
+                "#,
+            ),
+            (
+                "b-observer.ts",
+                r#"
+                export function on_tick(
+                  query: Query<SpawnFixture, [With<SpawnMarker>]>,
+                  config: Mut<RuntimeConfig>,
+                ): void {
+                  for (const value of query) {
+                    config.seen += 1;
+                  }
+                }
+                "#,
+            ),
+        ]);
+        let mut runtime = TsRuntime::with_root(dir.clone());
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 2);
+
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.resource::<RuntimeConfig>().seen, 0);
+        let values: Vec<_> = world
+            .query::<&SpawnFixture>()
+            .iter(&world)
+            .map(|fixture| fixture.value)
+            .collect();
+        assert_eq!(values, [42.5]);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<SpawnMarker>>()
+                .iter(&world)
+                .count(),
+            1
+        );
+
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.resource::<RuntimeConfig>().seen, 1);
+        assert_eq!(
+            world
+                .query_filtered::<Entity, With<SpawnMarker>>()
+                .iter(&world)
+                .count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_position_writeback_does_not_replay_unchanged_snapshot_rows() {
+        let snapshot = HashMap::from([("7".to_owned(), (1.0, 2.0, 3.0))]);
+        let mut world = World::new();
+        let entity = world
+            .spawn((
+                crate::Player(7),
+                PlayerPosition(glam::Vec3::new(1.0, 2.0, 3.0)),
+            ))
+            .id();
+        let rows = [PlayerRow {
+            id: 7,
+            x: 1.0,
+            y: 2.0,
+            z: 3.0,
+        }];
+
+        // A zero-copy system may already have changed the ECS value; an
+        // unchanged legacy snapshot row must not restore its old value.
+        world.get_mut::<PlayerPosition>(entity).unwrap().0.x = 9.0;
+        assert_eq!(apply_player_positions(&mut world, &snapshot, &rows), 0);
+        assert_eq!(world.get::<PlayerPosition>(entity).unwrap().0.x, 9.0);
+
+        // A direct ECS query write wins over a conflicting legacy snapshot
+        // edit, because query systems run after the legacy on_tick hook.
+        let edited = [PlayerRow { x: 5.0, ..rows[0] }];
+        assert_eq!(apply_player_positions(&mut world, &snapshot, &edited), 0);
+        assert_eq!(world.get::<PlayerPosition>(entity).unwrap().0.x, 9.0);
+
+        // Legacy row edits still write back when no direct system changed
+        // the corresponding ECS value.
+        world.get_mut::<PlayerPosition>(entity).unwrap().0.x = 1.0;
+        assert_eq!(apply_player_positions(&mut world, &snapshot, &edited), 1);
+        assert_eq!(world.get::<PlayerPosition>(entity).unwrap().0.x, 5.0);
     }
 
     #[test]
@@ -2188,14 +2829,18 @@ mod tests {
             "fixture build failed"
         );
         let data = std::fs::read(&bin).unwrap();
-        let (db, _) = tesjit_dwarf::export_with_dwo(&data, "fixture", &dir)
-            .expect("export with dwo");
+        let (db, _) =
+            tesjit_dwarf::export_with_dwo(&data, "fixture", &dir).expect("export with dwo");
 
         // The host's own view of the layout, from DWARF.
         let db_seq = host_field_offset_str(&db, "fixture::Packet", "seq");
         let db_flag = host_field_offset_str(&db, "fixture::Packet", "flag");
         let db_scale = host_field_offset_str(&db, "fixture::Packet", "scale");
-        assert!(db_seq.is_some() && db_flag.is_some() && db_scale.is_some(), "{:?}", db.get("fixture::Packet"));
+        assert!(
+            db_seq.is_some() && db_flag.is_some() && db_scale.is_some(),
+            "{:?}",
+            db.get("fixture::Packet")
+        );
         // `seq` is the only u64, so it is aligned to 8 and comes first — but the
         // two smaller fields are reordered *relative to the source*: rustc puts
         // the 4-byte `scale` before the 1-byte `flag`, so neither source order
@@ -2484,7 +3129,7 @@ mod ts_mod_compile_tests {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.parent().unwrap(); // /home/nestor/prj/exsolis
         let p = root.join("mods").join("ts").join("demo_option.ts");
-        match compile_mod(&p) {
+        match compile_mod(&p, None) {
             Ok(_) => {}
             Err(es) => panic!("demo_option.ts failed: {:#?}", es),
         }
@@ -2499,7 +3144,7 @@ mod phase2_smoke_compile_test {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.parent().unwrap();
         let p = root.join("mods").join("ts").join("phase2_smoke.ts");
-        match compile_mod(&p) {
+        match compile_mod(&p, None) {
             Ok(_) => {}
             Err(es) => panic!("phase2_smoke.ts failed: {:#?}", es),
         }
@@ -2514,7 +3159,7 @@ mod component_access_compile_test {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.parent().unwrap();
         let p = root.join("mods").join("ts").join("component_access.ts");
-        match compile_mod(&p) {
+        match compile_mod(&p, None) {
             Ok(_) => {}
             Err(es) => panic!("component_access.ts failed: {:#?}", es),
         }
@@ -2529,7 +3174,7 @@ mod typed_rows_compile_test {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let root = manifest.parent().unwrap();
         let p = root.join("mods").join("ts").join("typed_rows.ts");
-        match compile_mod(&p) {
+        match compile_mod(&p, None) {
             Ok(_) => {}
             Err(es) => panic!("typed_rows.ts failed: {:#?}", es),
         }

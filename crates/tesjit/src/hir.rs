@@ -201,43 +201,13 @@ pub enum Stmt {
         body: Vec<Stmt>,
         span: Span,
     },
-    /// `for (const [a, b] of query)` over Bevy column chunks.
-    ///
-    /// Codegen emits:
-    /// ```text
-    /// for chunk_i in 0..chunk_count:
-    ///   load column pointers + row count from QueryChunkDesc[chunk_i]
-    ///   for row_i in 0..row_count:
-    ///     bind each column[row_i] into the binding locals (indirect)
-    ///     body
-    ///     write back dirty mutable columns
-    /// ```
     QueryFor {
-        /// Local holding the pointer to the `QueryChunkDesc` array.
-        chunks_ptr: usize,
-        /// Local holding the chunk count.
-        chunk_count: usize,
-        /// Per-term column binding: (local slot, mutable, field offset inside
-        /// the component if the binding is a field projection, else 0).
-        columns: Vec<QueryForCol>,
+        query: usize,
+        bindings: Vec<usize>,
+        terms: Vec<Ty>,
         body: Vec<Stmt>,
         span: Span,
     },
-}
-
-/// One column binding inside a [`Stmt::QueryFor`].
-#[derive(Clone, Debug)]
-pub struct QueryForCol {
-    /// Local that receives the *pointer* to the element (or the element
-    /// itself for scalar components).
-    pub local: usize,
-    pub mutable: bool,
-    /// Byte offset within the component when the binding is a field of a
-    /// multi-field component; 0 for whole-component bindings.
-    pub field_offset: u32,
-    /// Size of the bound value in bytes (for write-back).
-    pub size: u32,
-    pub ty: Ty,
 }
 
 /// A typed expression. `ty` is always the checker-computed type of the node.
@@ -269,6 +239,8 @@ pub enum CallTarget {
 pub enum Intrinsic {
     /// Fuel guard: `() -> boolean` (false when the budget ran out).
     Fuel,
+    /// Chunk fuel guard: `(row_count: i64) -> boolean`.
+    FuelN,
     /// Wrap `.rodata` bytes as an arena string: `(ptr, len) -> str`.
     StrWrap,
     StrLen,
@@ -337,6 +309,7 @@ impl Intrinsic {
     pub fn symbol(self) -> &'static str {
         match self {
             Intrinsic::Fuel => "__tesjit_fuel",
+            Intrinsic::FuelN => "__tesjit_fuel_n",
             Intrinsic::StrWrap => "__tesjit_str_wrap",
             Intrinsic::StrLen => "__tesjit_str_len",
             Intrinsic::StrConcat => "__tesjit_str_concat",
@@ -440,18 +413,34 @@ pub enum ExprKind {
         elems: Vec<Expr>,
         elem_ty: Ty,
     },
-    /// Read through a resolved place (slot / field / index).
-    PlaceRead { place: Place },
-    /// Write through a resolved place. `op` is `None` for plain `=`.
+    /// `{ field: value }` — a stack-backed value of a registered component.
+    StructLit {
+        layout: Arc<StructLayout>,
+        fields: Vec<(u64, Expr)>,
+    },
+    /// `commands.spawn(component1, component2, ...)`.
+    CommandsSpawn {
+        commands: Box<Expr>,
+        components: Vec<Expr>,
+    },
+    /// Read through a resolved place (field projection off a component local).
+    PlaceRead {
+        place: PlaceExpr,
+    },
     PlaceWrite {
-        place: Place,
+        place: PlaceExpr,
         op: Option<BinaryOperator>,
         value: Box<Expr>,
     },
-    /// Placeholder for query iteration (kept for phase-1 scaffolding).
-    Iter { query: Box<Expr> },
-    OptionSome { value: Box<Expr> },
-    OptionNone { ty: Ty },
+    Iter {
+        query: Box<Expr>,
+    },
+    OptionSome {
+        value: Box<Expr>,
+    },
+    OptionNone {
+        ty: Ty,
+    },
 }
 
 /// A fully resolved place expression.
@@ -479,6 +468,6 @@ pub struct Place {
 #[derive(Clone, Debug)]
 pub enum PlaceExpr {
     Slot(usize),
-    Field { base: usize, name: String },
+    Field { base: usize, offset: u64 },
     Index { base: usize, index: usize },
 }

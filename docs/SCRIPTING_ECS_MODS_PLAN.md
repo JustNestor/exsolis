@@ -1,7 +1,14 @@
 # Scripting with ECS for flexible mods — design document
 
-Status: **step 1 type-system additions landed**, step 2 criterion spike landed,
-**full design under review** (phase 1+ implementation gated on approval)
+Status: **implementation approved and underway**. The tesjit query-loop
+foundation, Bevy table queries, and typed `Res<T>`/`Mut<T>` system parameters
+are implemented, including `With<T>` and `Without<T>` query filters.
+`Commands.spawn` with typed component values is implemented and defers entity
+insertion until all mods finish the tick. The broader `Commands` API, planned
+builder API, and performance/fuzz acceptance work remain outstanding. The
+runtime now prefers offset-checked registered schemas for `PlayerLook` and
+`PlayerPosition`; `types.tdb` remains a fallback while more types are migrated
+(see §11).
 
 Sources of truth for this document:
 
@@ -153,12 +160,21 @@ the function signature at registration to derive a *static* `FilteredAccess`
 schedule.
 
 Representation:
-- `Query<T>` where T is a tuple `(Comp...)` or single component. Static field
-  access (e.g. `q.iter().next().x`) is lowered against the tuple indices.
+- `Query<T, F>` where T is a tuple `(Comp...)` or single component and F is an
+  optional tuple of `With<Comp>` / `Without<Comp>` filters. Query terms and
+  filters currently require table storage; filter-only zero-sized marker
+  components are supported. Archetype matching is cached as new archetypes
+  appear.
+- Static field access (e.g. `q.iter().next().x`) is lowered against tuple
+  indices.
 - `Res<T>` — read-only resource handle.
 - `Mut<T>` is the mutable variant of `Res`.
-- `Commands` — append-only command buffer (spawn, despawn, insert component,
-  add resource). No direct world mutation from mod code.
+- `Commands` — append-only command buffer; currently supports
+  `spawn(component1, component2, ...)` for registered components with supported
+  layouts. Typed object literals initialize components, and spawned entities
+  become visible on the next tick after all mods have run. It returns `void`;
+  `despawn`, `insert`, and resource operations are not implemented. No direct
+  world mutation from mod code.
 
 Because they are signature-only, attempts to construct them (`new Query<T>()`,
 bind them to locals, store them in arrays) are rejected by the checker.
@@ -171,7 +187,8 @@ bind them to locals, store them in arrays) are rejected by the checker.
 - Methods on `Array<T>`: `a.length`, `a.push(x)`, `a[i]` already use this.
 - Methods on `Query<T>`: `.iter()`, `.single()`, `.get(entity)`.
 - Methods on `Iter<T>`: `.next()`, `.skip`, exhaustiveness.
-- Methods on `Commands`: `.spawn(c)`, `.despawn(e)`, `.insert(e, c)`.
+- Methods on `Commands`: `.spawn(c1, c2, ...)` (implemented); `.despawn(e)` and
+  `.insert(e, c)` remain planned.
 - Resolution order: module-local → host namespace (`world`, `q`) → builtins.
   No `Self`/trait confusion.
 
@@ -427,19 +444,72 @@ Each phase ends in a testable, revertible deliverable.
 
 ---
 
-## 10. Open questions (input to approval)
+## 10. Open questions and resolved decisions
 
 1. Should mods have read access to component *metadata* (which Components
    exist) via a host call — constant-cost `component::id::<T>` — or should
    the set be fixed compile-time by the host registry? Proposed: fixed
    compile-time, with a host test listing every registered T.
+   The component set is currently fixed at compile time.
 2. Are mod-spawned entities visible to *other* mods in the same tick?
-   Proposed: no, writes commit at end of tick (commands buffer) — matches
-   Lua's `ScriptRequest` model.
+   Resolved: no. Commands are applied after all mods run, and the entities are
+   queryable on the following tick.
 3. Should the spawn path take an explicit `Archetype` or infer from the
-   `T` tuple? Proposed: infer from a typed spawn command `.spawn((C1, C2))`.
+   `T` tuple? Resolved: infer from typed component values passed as
+   `.spawn(c1, c2, ...)`; component object literals require an explicit
+   component type annotation.
 
-These correspond to v1 design choices this doc leaves for explicit sign-off.
-Please answer and close the doc before phase 1 starts.
+---
+
+## 11. Runtime layout metadata without `types.tdb`
+
+It is possible, and preferred, to remove `types.tdb` as a runtime prerequisite
+for mod ECS access. `types.tdb` is a DWARF export for broad inspection of Rust
+types; using it as the source of a live JIT ABI ties mod loading to a separate
+binary-export step and can leave the server without typed queries when the
+database is missing or stale.
+
+Migration status: a server-side `TsSchema` registry now accepts explicitly
+registered schemas and checks each schema's `size_of` / `align_of` against
+Bevy's registered component layout. The production registry currently covers
+`PlayerLook` and `PlayerPosition`; a derive is available for named-field
+structs using supported scalar or nested schema fields. ECS linking can use
+registered schemas with no `types.tdb`. The database remains a fallback for
+unmigrated types and is still used by the legacy `field_offset` / `type_size`
+host functions.
+
+Recommended replacement: an explicit, compile-time schema for opted-in
+components and resources. A `TsComponent`/`TsResource` derive (or equivalent
+registration macro) emits each exposed type's field names, field types,
+`size_of`, `align_of`, and `offset_of!` values from the same Rust compilation
+that builds the server. The server registers those schemas with Bevy's runtime
+component/resource IDs; the JIT consumes the schema directly. Nested types
+must also provide an exposed schema, and unsupported layouts (unions,
+zero-sized table components, opaque fields, or recursive by-value types) are
+rejected rather than guessed.
+
+This keeps the hot path zero-copy and avoids a generic reflection lookup per
+field. It does mean schemas are an explicit allowlist: only registered types
+are available to mods, which is a useful safety boundary and makes generated
+editor declarations deterministic. Do not derive offsets from Bevy reflection:
+reflection describes logical fields, not necessarily their physical Rust
+offsets. Keep `types.tdb` as an optional debugging/inspection tool and
+temporary migration fallback, not as the source of production JIT layouts.
+
+Migration steps:
+
+1. Extend `TsSchema` registrations to the supported components/resources and
+   cover primitive and nested fields, including `repr(Rust)` structs using
+   compiler-provided `offset_of!`. The derive and primitive/nested field
+   machinery are implemented; registration coverage remains limited.
+2. Generate declarations from the explicit registry and require an exact match
+   between schema and Bevy's runtime size/alignment before linking. The initial
+   explicit registry and layout checks are implemented; declaration generation
+   still merges the temporary TypeDB fallback.
+3. Move remaining production query tests and supported server components off
+   `types.tdb`; keep the no-database schema fixture and production-schema tests.
+4. Remove `ServerTypes` from mod compilation/linking and replace or retire the
+   TypeDB-dependent host layout helpers. Retain the exporter crate only for
+   developer diagnostics if still useful.
 """, "path">
 /home/nestor/prj/exsolis/docs/SCRIPTING_ECS_MODS_PLAN.md

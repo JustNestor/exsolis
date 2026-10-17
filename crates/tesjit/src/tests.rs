@@ -1,12 +1,31 @@
 //! Tests: compile→run behaviour, host calls, and diagnostics batching.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::{CompileError, Jit, JitBuilder, Ty};
+use super::{CompileError, Jit, JitBuilder, StructField, StructLayout, Ty};
 
 static LAST: AtomicU64 = AtomicU64::new(0);
+static SPAWN_CAPTURE: Mutex<Option<(u64, u64, f64, i32, [u8; 4])>> = Mutex::new(None);
 extern "C" fn test_log(x: f64) {
     LAST.store(x.to_bits(), Ordering::SeqCst);
+}
+
+extern "C" fn capture_spawn(_commands: i64, input: i64) {
+    let input = unsafe { &*(input as usize as *const crate::abi::SpawnInput) };
+    let descriptors = unsafe {
+        std::slice::from_raw_parts(
+            input.components_addr as usize as *const crate::abi::SpawnComponent,
+            input.component_count as usize,
+        )
+    };
+    let component = &descriptors[0];
+    let data = component.data_addr as usize as *const u8;
+    let x = unsafe { data.cast::<f64>().read() };
+    let y = unsafe { data.add(8).cast::<i32>().read() };
+    let padding = unsafe { data.add(12).cast::<[u8; 4]>().read() };
+    *SPAWN_CAPTURE.lock().unwrap() =
+        Some((input.component_count, component.component_id, x, y, padding));
 }
 
 /// Compile `src` with a single `log(host)` registered.
@@ -33,6 +52,410 @@ fn errors(src: &str) -> Vec<CompileError> {
 }
 
 #[test]
+fn component_layouts_are_validated_and_query_types_resolve() {
+    let velocity = std::sync::Arc::new(
+        StructLayout::from_parts(
+            "Velocity",
+            vec![StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: 0,
+            }],
+            4,
+            4,
+        )
+        .unwrap(),
+    );
+    let transform = std::sync::Arc::new(
+        StructLayout::from_parts(
+            "Transform",
+            vec![StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: 0,
+            }],
+            4,
+            4,
+        )
+        .unwrap(),
+    );
+    assert!(
+        StructLayout::from_parts(
+            "Bad",
+            vec![StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: 1,
+            }],
+            8,
+            4,
+        )
+        .is_err()
+    );
+
+    let src = "export function move(q: Query<[Mut<Transform>, Velocity]>): void {}";
+    let builder = JitBuilder::new("<components>", std::sync::Arc::from(src))
+        .component("Transform", transform)
+        .unwrap()
+        .component("Velocity", velocity)
+        .unwrap();
+    let mut jit = builder.build().unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    let entry = compiled.entry("move").unwrap();
+    assert_eq!(entry.params.len(), 1);
+    let Ty::Query(row, filters) = &entry.params[0] else {
+        panic!("expected a Query parameter");
+    };
+    assert!(filters.is_empty());
+    let Ty::Tuple(terms) = row.as_ref() else {
+        panic!("expected tuple query row");
+    };
+    assert!(matches!(&terms[0], Ty::Mut(inner) if matches!(inner.as_ref(), Ty::Struct(_))));
+    assert!(matches!(&terms[1], Ty::Struct(_)));
+}
+
+#[test]
+fn query_component_filters_are_typed() {
+    let component = std::sync::Arc::new(StructLayout::from_parts("Marker", vec![], 0, 1).unwrap());
+    let excluded = std::sync::Arc::new(StructLayout::from_parts("Excluded", vec![], 0, 1).unwrap());
+    let src = "export function tick(q: Query<Entity, [With<Marker>, Without<Excluded>]>): void {}";
+    let mut jit = JitBuilder::new("<query-filters>", std::sync::Arc::from(src))
+        .component("Marker", component)
+        .unwrap()
+        .component("Excluded", excluded)
+        .unwrap()
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    let entry = compiled.entry("tick").unwrap();
+    let Ty::Query(_, filters) = &entry.params[0] else {
+        panic!("expected a Query parameter");
+    };
+    assert_eq!(filters.len(), 2);
+    assert_eq!(filters[0].kind, crate::ty::QueryFilterKind::With);
+    assert_eq!(filters[1].kind, crate::ty::QueryFilterKind::Without);
+}
+
+#[test]
+fn component_literals_stage_typed_spawn_values() {
+    let mut position = StructLayout::from_parts(
+        "Position",
+        vec![
+            StructField {
+                name: "x".to_owned(),
+                ty: Ty::F64,
+                offset: 0,
+            },
+            StructField {
+                name: "y".to_owned(),
+                ty: Ty::I32,
+                offset: 8,
+            },
+        ],
+        16,
+        8,
+    )
+    .unwrap();
+    position.component_id = Some(42);
+    let src = r#"
+      export function on_tick(commands: Commands): void {
+        const position: Position = { x: 1.5, y: 9 };
+        position.x += 1.0;
+        position.y += 2;
+        commands.spawn(position);
+      }
+    "#;
+    let mut jit = JitBuilder::new("<spawn>", std::sync::Arc::from(src))
+        .component("Position", std::sync::Arc::new(position))
+        .unwrap()
+        .host_fn(
+            "__tesjit_commands_spawn",
+            vec![Ty::Commands, Ty::Ptr],
+            Ty::Void,
+            capture_spawn as *const u8,
+        )
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    unsafe { compiled.call_void("on_tick", &[1]) };
+    assert_eq!(
+        *SPAWN_CAPTURE.lock().unwrap(),
+        Some((1, 42, 2.5, 11, [0; 4]))
+    );
+}
+
+#[test]
+fn query_rejects_scalar_component_terms() {
+    let src = "export function bad(q: Query<[i32, Entity]>): void {}";
+    let jit = JitBuilder::new("<bad-query>", std::sync::Arc::from(src))
+        .build()
+        .unwrap();
+    let diagnostics = jit.check(src);
+    assert!(
+        diagnostics.0.iter().any(|error| error
+            .to_string()
+            .contains("query terms must be components or Entity")),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn component_fields_read_and_write_through_borrowed_pointers() {
+    let layout = std::sync::Arc::new(
+        StructLayout::from_parts(
+            "Vector",
+            vec![
+                StructField {
+                    name: "x".to_owned(),
+                    ty: Ty::F32,
+                    offset: 0,
+                },
+                StructField {
+                    name: "y".to_owned(),
+                    ty: Ty::F32,
+                    offset: 4,
+                },
+            ],
+            8,
+            4,
+        )
+        .unwrap(),
+    );
+    let src = r#"
+      export function move(v: Mut<Vector>): void { v.x += v.y; }
+      export function read(v: Res<Vector>): f32 { return v.x; }
+    "#;
+    let builder = JitBuilder::new("<component-fields>", std::sync::Arc::from(src))
+        .component("Vector", layout)
+        .unwrap();
+    let mut jit = builder.build().unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+
+    #[repr(C)]
+    struct Vector {
+        x: f32,
+        y: f32,
+    }
+    let mut vector = Vector { x: 1.0, y: 2.0 };
+    let guard = compiled.enter();
+    unsafe {
+        let move_vector: extern "C" fn(i64) = compiled.get("move").unwrap();
+        let read_x: extern "C" fn(i64) -> f32 = compiled.get("read").unwrap();
+        let ptr = (&mut vector as *mut Vector as usize) as i64;
+        move_vector(ptr);
+        assert_eq!(vector.x, 3.0);
+        assert_eq!(read_x(ptr), 3.0);
+    }
+    drop(guard);
+}
+
+#[test]
+fn readonly_component_fields_cannot_be_written() {
+    let layout = std::sync::Arc::new(
+        StructLayout::from_parts(
+            "Vector",
+            vec![StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: 0,
+            }],
+            4,
+            4,
+        )
+        .unwrap(),
+    );
+    let src = "export function bad(v: Res<Vector>): void { v.x = 1.0; }";
+    let builder = JitBuilder::new("<readonly-component>", std::sync::Arc::from(src))
+        .component("Vector", layout)
+        .unwrap();
+    let jit = builder.build().unwrap();
+    let diagnostics = jit.check(src);
+    assert!(
+        diagnostics.0.iter().any(|error| {
+            error
+                .to_string()
+                .contains("cannot write through a read-only component")
+        }),
+        "unexpected diagnostics: {diagnostics:?}"
+    );
+}
+
+#[test]
+fn query_loop_updates_component_columns_without_copyback() {
+    let component_layout = |name: &str| {
+        std::sync::Arc::new(
+            StructLayout::from_parts(
+                name,
+                vec![StructField {
+                    name: "x".to_owned(),
+                    ty: Ty::F32,
+                    offset: 0,
+                }],
+                4,
+                4,
+            )
+            .unwrap(),
+        )
+    };
+    let src = r#"
+      export function move(q: Query<[Mut<Position>, Velocity]>): void {
+        for (const [p, v] of q) { p.x += v.x; }
+      }
+    "#;
+    let builder = JitBuilder::new("<query-loop>", std::sync::Arc::from(src))
+        .component("Position", component_layout("Position"))
+        .unwrap()
+        .component("Velocity", component_layout("Velocity"))
+        .unwrap();
+    let mut jit = builder.build().unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+
+    let mut positions = [1.0f32, 2.0, 3.0];
+    let velocities = [0.5f32, 1.0, 1.5];
+    let mut descriptors = Vec::new();
+    super::abi::write_chunk(
+        &mut descriptors,
+        positions.len() as u64,
+        &[
+            positions.as_mut_ptr().cast(),
+            velocities.as_ptr().cast_mut().cast(),
+        ],
+    );
+    let input = super::abi::QueryInput {
+        chunks_addr: descriptors.as_ptr() as usize as u64,
+        chunk_count: 1,
+    };
+    let guard = compiled.enter();
+    compiled.runtime().reset_fuel(100);
+    unsafe {
+        let run: extern "C" fn(i64) = compiled.get("move").unwrap();
+        run((&input as *const super::abi::QueryInput as usize) as i64);
+    }
+    drop(guard);
+    assert_eq!(positions, [1.5, 3.0, 4.5]);
+    assert_eq!(compiled.runtime().fuel(), 96);
+}
+
+#[test]
+fn query_entity_terms_are_loaded_by_value_across_chunks() {
+    let src = r#"
+      export function sum(q: Query<Entity>): u64 {
+        let total: u64 = 0;
+        for (const entity of q) { total += entity as u64; }
+        return total;
+      }
+    "#;
+    let mut jit = JitBuilder::new("<entity-query>", std::sync::Arc::from(src))
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+
+    let first = [7u64, 11];
+    let second = [13u64];
+    let mut descriptors = Vec::new();
+    super::abi::write_chunk(
+        &mut descriptors,
+        first.len() as u64,
+        &[first.as_ptr().cast_mut().cast()],
+    );
+    super::abi::write_chunk(
+        &mut descriptors,
+        second.len() as u64,
+        &[second.as_ptr().cast_mut().cast()],
+    );
+    let input = super::abi::QueryInput {
+        chunks_addr: descriptors.as_ptr() as usize as u64,
+        chunk_count: 2,
+    };
+    let guard = compiled.enter();
+    let sum = unsafe {
+        let run: extern "C" fn(i64) -> u64 = compiled.get("sum").unwrap();
+        run((&input as *const super::abi::QueryInput as usize) as i64)
+    };
+    drop(guard);
+    assert_eq!(sum, 31);
+}
+
+#[test]
+fn query_break_continue_and_chunk_fuel_are_correct() {
+    let layout = std::sync::Arc::new(
+        StructLayout::from_parts(
+            "Position",
+            vec![StructField {
+                name: "x".to_owned(),
+                ty: Ty::F32,
+                offset: 0,
+            }],
+            4,
+            4,
+        )
+        .unwrap(),
+    );
+    let src = r#"
+      export function edit(q: Query<[Entity, Mut<Position>]>, skip: Entity): void {
+        for (const [entity, position] of q) {
+          if (entity == skip) { continue; }
+          position.x += 1.0;
+          if (entity == (3 as u64 as Entity)) { break; }
+        }
+      }
+    "#;
+    let builder = JitBuilder::new("<query-control-flow>", std::sync::Arc::from(src))
+        .component("Position", layout)
+        .unwrap();
+    let mut jit = builder.build().unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+
+    let entities = [1u64, 2, 3, 4];
+    let mut positions = [0.0f32; 4];
+    let mut descriptors = Vec::new();
+    super::abi::write_chunk(
+        &mut descriptors,
+        4,
+        &[
+            entities.as_ptr().cast_mut().cast(),
+            positions.as_mut_ptr().cast(),
+        ],
+    );
+    let input = super::abi::QueryInput {
+        chunks_addr: descriptors.as_ptr() as usize as u64,
+        chunk_count: 1,
+    };
+    let guard = compiled.enter();
+    compiled.runtime().reset_fuel(100);
+    unsafe {
+        let edit: extern "C" fn(i64, i64) = compiled.get("edit").unwrap();
+        edit((&input as *const super::abi::QueryInput as usize) as i64, 2);
+    }
+    assert_eq!(positions, [1.0, 0.0, 1.0, 0.0]);
+
+    positions.fill(0.0);
+    compiled.runtime().reset_fuel(2);
+    unsafe {
+        let edit: extern "C" fn(i64, i64) = compiled.get("edit").unwrap();
+        edit(
+            (&input as *const super::abi::QueryInput as usize) as i64,
+            99,
+        );
+    }
+    assert_eq!(positions, [0.0; 4], "the chunk must not run partially");
+    assert_eq!(
+        compiled.trap(),
+        Some(super::TrapKind::FuelExhausted),
+        "fuel charge must scale with the number of rows"
+    );
+    compiled.clear_trap();
+    drop(guard);
+}
+
+#[test]
 fn fib_and_loop() {
     let c = build(
         r#"
@@ -54,7 +477,8 @@ fn fib_and_loop() {
         assert_eq!(fib(20), 6765);
         assert_eq!(sum(100), 4950.0);
     }
-    drop(guard);}
+    drop(guard);
+}
 
 #[test]
 fn host_call() {
@@ -298,10 +722,7 @@ fn string_index_is_bounds_checked() {
         assert_eq!(at(alloc_str("abc"), 1), b'b' as i32);
         // Out of bounds traps instead of reading foreign memory.
         assert_eq!(at(alloc_str("abc"), 99), 0);
-        assert_eq!(
-            c.trap().map(|t| t.message()),
-            Some("index out of bounds")
-        );
+        assert_eq!(c.trap().map(|t| t.message()), Some("index out of bounds"));
         c.clear_trap();
     }
     drop(guard);
@@ -566,12 +987,13 @@ fn host_region_read_write_roundtrip() {
     c.unregister_region("row");
     unsafe {
         let peek: extern "C" fn(i64) -> f64 = c.get("peek").unwrap();
-        assert_eq!(peek(i64::from(id as u32)), 0.0, "unregistered region must not read");
+        assert_eq!(
+            peek(i64::from(id as u32)),
+            0.0,
+            "unregistered region must not read"
+        );
     }
-    assert_eq!(
-        c.trap().map(|t| t.message()),
-        Some("unknown memory region")
-    );
+    assert_eq!(c.trap().map(|t| t.message()), Some("unknown memory region"));
     c.clear_trap();
 
     // Out-of-bounds offsets inside a *known* region trap too.
@@ -685,7 +1107,11 @@ fn declaring_a_builtin_is_accepted_not_an_error() {
     let guard = c.enter();
     unsafe {
         let go: extern "C" fn() -> f64 = c.get("go").unwrap();
-        assert_eq!(go(), 0.0, "an unregistered region reads as zero, not an error");
+        assert_eq!(
+            go(),
+            0.0,
+            "an unregistered region reads as zero, not an error"
+        );
     }
     drop(guard);
 }
@@ -710,9 +1136,13 @@ fn a_stale_dts_signature_does_not_block_the_module() {
 
     // But a genuinely wrong call is still an error — the engine's signature,
     // not the `.d.ts`, is what the checker enforces.
-    let diags = errors("declare function load_f64(region: i32): f64;\nexport function go(): f64 { return load_f64(1); }");
+    let diags = errors(
+        "declare function load_f64(region: i32): f64;\nexport function go(): f64 { return load_f64(1); }",
+    );
     assert!(
-        diags.iter().any(|d| format!("{d:?}").contains("expects 2 arguments")),
+        diags
+            .iter()
+            .any(|d| format!("{d:?}").contains("expects 2 arguments")),
         "{diags:?}"
     );
 }
@@ -924,7 +1354,7 @@ fn phase1_types_parse_compile_clean() {
     let _c = build(
         r#"
         export function noop(x: Option<i32>): void { }
-        export function systems(q: Query<i32>, r: Res<i32>, c: Commands): void { }
+        export function systems(q: Query<Entity>, r: Res<i32>, c: Commands): void { }
         "#,
     );
 }
@@ -966,7 +1396,6 @@ fn option_unwrapor() {
     }
     drop(guard);
 }
-
 
 #[test]
 fn for_of_arrays_sum() {

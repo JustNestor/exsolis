@@ -250,12 +250,7 @@ impl TesjitRuntime {
             return existing.id;
         }
         let id = regions.len() as u64 + 1;
-        regions.push(Region {
-            id,
-            name,
-            ptr,
-            len,
-        });
+        regions.push(Region { id, name, ptr, len });
         id
     }
 
@@ -302,6 +297,16 @@ impl TesjitRuntime {
             return false;
         }
         self.fuel.set(left - 1);
+        true
+    }
+
+    fn spend_fuel_n(&self, amount: u64) -> bool {
+        let left = self.fuel.get();
+        if amount > left {
+            *self.trap.borrow_mut() = Some(TrapKind::FuelExhausted);
+            return false;
+        }
+        self.fuel.set(left - amount);
         true
     }
 
@@ -589,6 +594,15 @@ extern "C" fn fuel() -> i64 {
     i64::from(current().spend_fuel())
 }
 
+/// Charge one fuel unit for each row in a query chunk.
+extern "C" fn fuel_n(rows: i64) -> i64 {
+    let Ok(rows) = u64::try_from(rows) else {
+        trap(TrapKind::FuelExhausted);
+        return 0;
+    };
+    i64::from(current().spend_fuel_n(rows))
+}
+
 // ───────────────────────── host memory regions ─────────────────────────
 //
 // A Bevy system (or any embedder) hands the module a pointer to real Rust data
@@ -629,7 +643,11 @@ extern "C" fn load_i32(id: i64, offset: i64) -> i64 {
         trap(TrapKind::IndexOutOfBounds);
         return 0;
     }
-    unsafe { i64::from(std::ptr::read_unaligned(ptr.add(offset as usize) as *const i32)) }
+    unsafe {
+        i64::from(std::ptr::read_unaligned(
+            ptr.add(offset as usize) as *const i32
+        ))
+    }
 }
 
 extern "C" fn store_f64(id: i64, offset: i64, value: f64) -> f64 {
@@ -653,7 +671,11 @@ extern "C" fn load_f32(id: i64, offset: i64) -> f64 {
         trap(TrapKind::IndexOutOfBounds);
         return 0.0;
     }
-    unsafe { f64::from(std::ptr::read_unaligned(ptr.add(offset as usize) as *const f32)) }
+    unsafe {
+        f64::from(std::ptr::read_unaligned(
+            ptr.add(offset as usize) as *const f32
+        ))
+    }
 }
 
 /// Read a full machine word.
@@ -786,6 +808,7 @@ extern "C" fn opt_unwrap_f64(p: i64) -> f64 {
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
         ("__tesjit_fuel", fuel as *const u8),
+        ("__tesjit_fuel_n", fuel_n as *const u8),
         ("__tesjit_opt_is_some", opt_is_some as *const u8),
         ("__tesjit_opt_unwrap_i64", opt_unwrap_i64 as *const u8),
         ("__tesjit_opt_unwrap_f64", opt_unwrap_f64 as *const u8),
@@ -817,6 +840,8 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
 
 /// Reserved names: host modules cannot define these.
 pub const RESERVED: &[&str] = &[
+    "__tesjit_fuel",
+    "__tesjit_fuel_n",
     "__tesjit_alloc",
     "__tesjit_str_wrap",
     "__tesjit_str_len",

@@ -2570,6 +2570,7 @@ dependencies = [
  "image 0.25.10",
  "mimalloc",
  "mlua",
+ "nonmax",
  "opensimplex2",
  "rand",
  "rayon",
@@ -2579,6 +2580,7 @@ dependencies = [
  "smallvec",
  "tesjit",
  "tesjit-dwarf",
+ "tesjit-schema",
  "tokio",
 ]
 
@@ -5927,6 +5929,15 @@ dependencies = [
  "rustc-demangle",
  "serde",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tesjit-schema"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

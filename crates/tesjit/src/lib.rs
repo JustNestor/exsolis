@@ -34,6 +34,7 @@
 //! `Query<T>` / `Res<T>` / `Mut<T>` / `Commands`, `void`.
 //! Every function boundary is fully annotated.
 
+pub mod abi;
 pub mod check;
 pub mod codegen;
 pub mod diag;
@@ -47,7 +48,7 @@ pub use diag::{CompileError, Diagnostics, SyntaxDiag};
 pub use host::{FnKind, FnTable, HostFn, HostRegistry, HostSig};
 pub use jit::{Compiled, Entry, Jit, JitBuilder};
 pub use runtime::{TesjitRuntime, TrapKind};
-pub use ty::{Field, StructLayout, Ty};
+pub use ty::{QueryFilter, QueryFilterKind, StructField, StructLayout, Ty};
 
 #[cfg(test)]
 mod tests;

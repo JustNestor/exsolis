@@ -11,7 +11,9 @@
 
 use cranelift_codegen::ir::MachMemFlags;
 use cranelift_codegen::ir::condcodes::{FloatCC, IntCC};
-use cranelift_codegen::ir::{self, AbiParam, BlockArg, InstBuilder, Value, types};
+use cranelift_codegen::ir::{
+    self, AbiParam, BlockArg, InstBuilder, StackSlotData, StackSlotKind, Value, types,
+};
 use cranelift_codegen::isa::TargetFrontendConfig;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::JITModule;
@@ -26,7 +28,7 @@ const fn mem_flags() -> MachMemFlags {
     MachMemFlags::new()
 }
 
-use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, Stmt};
+use crate::hir::{CallTarget, Expr, ExprKind, FnDef, Intrinsic, PlaceExpr, Stmt};
 use crate::ty::Ty;
 
 /// Cranelift function id plus the TS signature it was declared with.
@@ -39,12 +41,9 @@ pub struct FnSig {
 
 /// How a Cranelift entry-block parameter maps back onto HIR locals.
 enum AbiSlot {
-    /// Ordinary (or single-handle ECS) param → `locals[i]`.
+    /// Param → `locals[i]` (every ECS param — Query, Res/Mut, Commands — is
+    /// a single machine word: a `QueryInput`/resource/commands handle).
     Param(usize),
-    /// Query chunks pointer → query local.
-    QueryPtr(usize),
-    /// Query chunk count → `__qcount_{query_local}`.
-    QueryCount(usize),
 }
 
 /// State of the function currently being lowered.
@@ -79,7 +78,9 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         Self::declare_framed(module, name, params, ret, &[])
     }
 
-    /// Like [`declare`], but expands `Query` frame loads to (ptr, count) slots.
+    /// Like [`declare`], but validates ECS frame metadata. The machine ABI is
+    /// uniform: every param (including `Query`) is one machine word — a
+    /// `QueryInput { chunks_addr, chunk_count }` pointer for query params.
     pub fn declare_framed(
         module: &mut JITModule,
         name: &str,
@@ -87,24 +88,10 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         ret: Ty,
         frame_loads: &[crate::hir::FrameLoad],
     ) -> Result<FuncId, String> {
+        let _ = frame_loads;
         let mut sig = module.make_signature();
-        if frame_loads.is_empty() {
-            for p in params {
-                sig.params.push(AbiParam::new(p.clif()));
-            }
-        } else {
-            for fl in frame_loads {
-                match &fl.kind {
-                    crate::hir::FrameLoadKind::Query { .. } => {
-                        sig.params.push(AbiParam::new(types::I64));
-                        sig.params.push(AbiParam::new(types::I64));
-                    }
-                    crate::hir::FrameLoadKind::Resource { .. }
-                    | crate::hir::FrameLoadKind::Commands => {
-                        sig.params.push(AbiParam::new(types::I64));
-                    }
-                }
-            }
+        for p in params {
+            sig.params.push(AbiParam::new(p.clif()));
         }
         if ret != Ty::Void {
             sig.returns.push(AbiParam::new(ret.clif()));
@@ -146,31 +133,14 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         module.clear_context(ctx);
         let mut clif_sig = module.make_signature();
 
-        // Frame ABI expansion: each Query param becomes (chunks_ptr, chunk_count)
-        // so the host can pass both without a side channel. Other ECS params
-        // stay a single I64 handle/pointer.
+        // Uniform frame ABI: every param is one machine word. `Query` params
+        // receive a pointer to `QueryInput { chunks_addr, chunk_count }`,
+        // Res/Mut a resource pointer, Commands a handle — the same slot the
+        // host passes for non-framed functions.
         let mut abi_slots: Vec<AbiSlot> = Vec::new();
-        if f.frame_loads.is_empty() {
-            for (i, p) in f.params.iter().enumerate() {
-                clif_sig.params.push(AbiParam::new(p.clif()));
-                abi_slots.push(AbiSlot::Param(i));
-            }
-        } else {
-            for fl in &f.frame_loads {
-                match &fl.kind {
-                    crate::hir::FrameLoadKind::Query { .. } => {
-                        clif_sig.params.push(AbiParam::new(types::I64)); // chunks_ptr
-                        clif_sig.params.push(AbiParam::new(types::I64)); // chunk_count
-                        abi_slots.push(AbiSlot::QueryPtr(fl.local));
-                        abi_slots.push(AbiSlot::QueryCount(fl.local));
-                    }
-                    crate::hir::FrameLoadKind::Resource { .. }
-                    | crate::hir::FrameLoadKind::Commands => {
-                        clif_sig.params.push(AbiParam::new(types::I64));
-                        abi_slots.push(AbiSlot::Param(fl.local));
-                    }
-                }
-            }
+        for (i, p) in f.params.iter().enumerate() {
+            clif_sig.params.push(AbiParam::new(p.clif()));
+            abi_slots.push(AbiSlot::Param(i));
         }
         if f.ret != Ty::Void {
             clif_sig.returns.push(AbiParam::new(f.ret.clif()));
@@ -189,28 +159,13 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             vars.push(var);
         }
 
-        // Bind ABI params → locals (and __qcount_* for Query).
+        // Bind ABI params → locals.
         let bparams = builder.block_params(entry).to_vec();
         for (abi_i, slot) in abi_slots.iter().enumerate() {
             let val = bparams[abi_i];
             match *slot {
                 AbiSlot::Param(local) => {
                     builder.def_var(vars[local], val);
-                }
-                AbiSlot::QueryPtr(local) => {
-                    builder.def_var(vars[local], val);
-                }
-                AbiSlot::QueryCount(query_local) => {
-                    // Find the sibling __qcount_{query_local} local by name.
-                    let count_name = format!("__qcount_{query_local}");
-                    if let Some((ci, _)) = f
-                        .locals
-                        .iter()
-                        .enumerate()
-                        .find(|(_, l)| l.name == count_name)
-                    {
-                        builder.def_var(vars[ci], val);
-                    }
                 }
             }
         }
@@ -226,9 +181,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         let trap_block = builder.create_block();
         let fuel = Self::fuel_check(module, sigs, &mut builder);
         let body_block = builder.create_block();
-        builder
-            .ins()
-            .brif(fuel, body_block, &[], trap_block, &[]);
+        builder.ins().brif(fuel, body_block, &[], trap_block, &[]);
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
 
@@ -471,27 +424,130 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 b.ins().jump(cont, &[]);
                 Self::dead_block(b);
             }
-            Stmt::ForOf { .. } => {
-                // Array for-of is desugared by the checker into a counted For.
-                // If we still see ForOf here it is a checker bug.
-            }
+            Stmt::ForOf { .. } => {}
             Stmt::QueryFor {
-                chunks_ptr,
-                chunk_count,
-                columns,
+                query,
+                bindings,
+                terms,
                 body,
                 ..
-            } => {
-                // Phase-2 query iteration kernel.
-                // Layout of QueryChunkDesc (host-side, assumed):
-                //   struct QueryChunkDesc {
-                //     row_count: u64,
-                //     cols: [*mut u8; N],  // N = columns.len()
-                //   }
-                // The host packs an array of these and passes (ptr, count).
-                self.emit_query_for(b, *chunks_ptr, *chunk_count, columns, body);
-            }
+            } => self.query_for(b, *query, bindings, terms, body),
         }
+    }
+
+    fn query_for(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        query: usize,
+        bindings: &[usize],
+        terms: &[Ty],
+        body: &[Stmt],
+    ) {
+        let input = b.use_var(self.vars[query]);
+        let chunks = b.ins().load(types::I64, mem_flags(), input, 0);
+        let chunk_count_ptr = b.ins().iadd_imm_s(input, 8);
+        let chunk_count = b.ins().load(types::I64, mem_flags(), chunk_count_ptr, 0);
+
+        let chunk_index = b.declare_var(types::I64);
+        let row_index = b.declare_var(types::I64);
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(chunk_index, zero);
+
+        let chunk_header = b.create_block();
+        let chunk_body = b.create_block();
+        let row_header = b.create_block();
+        let row_body = b.create_block();
+        let row_next = b.create_block();
+        let chunk_next = b.create_block();
+        let exit = b.create_block();
+        b.ins().jump(chunk_header, &[]);
+
+        b.switch_to_block(chunk_header);
+        let chunk_i = b.use_var(chunk_index);
+        let has_chunk = b.ins().icmp(IntCC::UnsignedLessThan, chunk_i, chunk_count);
+        b.ins().brif(has_chunk, chunk_body, &[], exit, &[]);
+
+        b.switch_to_block(chunk_body);
+        b.seal_block(chunk_body);
+        let chunk_i = b.use_var(chunk_index);
+        let desc_stride = b
+            .ins()
+            .iconst(types::I64, (crate::abi::desc_words(terms.len()) * 8) as i64);
+        let desc_offset = b.ins().imul(chunk_i, desc_stride);
+        let desc = b.ins().iadd(chunks, desc_offset);
+        let rows = b.ins().load(types::I64, mem_flags(), desc, 0);
+        let fuel_ok = self.fuel_check_n(b, rows);
+
+        let mut column_vars = Vec::with_capacity(terms.len());
+        let mut strides = Vec::with_capacity(terms.len());
+        for (index, term) in terms.iter().enumerate() {
+            let col_offset = b.ins().iconst(types::I64, ((index + 1) * 8) as i64);
+            let col_addr = b.ins().iadd(desc, col_offset);
+            let col_ptr = b.ins().load(types::I64, mem_flags(), col_addr, 0);
+            let col_var = b.declare_var(types::I64);
+            b.def_var(col_var, col_ptr);
+            column_vars.push(col_var);
+            strides.push(if matches!(term, Ty::Entity) {
+                8
+            } else {
+                term.struct_layout()
+                    .expect("query component has a registered layout")
+                    .size
+            });
+        }
+        let zero = b.ins().iconst(types::I64, 0);
+        b.def_var(row_index, zero);
+        b.ins().brif(fuel_ok, row_header, &[], self.trap_block, &[]);
+
+        b.switch_to_block(row_header);
+        let row_i = b.use_var(row_index);
+        let has_row = b.ins().icmp(IntCC::UnsignedLessThan, row_i, rows);
+        b.ins().brif(has_row, row_body, &[], chunk_next, &[]);
+
+        b.switch_to_block(row_body);
+        b.seal_block(row_body);
+        for ((binding, term), col_var) in bindings.iter().zip(terms).zip(&column_vars) {
+            let ptr = b.use_var(*col_var);
+            let value = if matches!(term, Ty::Entity) {
+                b.ins().load(types::I64, mem_flags(), ptr, 0)
+            } else {
+                ptr
+            };
+            b.def_var(self.vars[*binding], value);
+        }
+        self.loops.push((row_next, exit));
+        for stmt in body {
+            self.stmt(b, stmt);
+        }
+        self.loops.pop();
+        b.ins().jump(row_next, &[]);
+
+        b.switch_to_block(row_next);
+        b.seal_block(row_next);
+        let row_i = b.use_var(row_index);
+        let one = b.ins().iconst(types::I64, 1);
+        let next_row = b.ins().iadd(row_i, one);
+        b.def_var(row_index, next_row);
+        for (col_var, stride) in column_vars.iter().zip(strides) {
+            let ptr = b.use_var(*col_var);
+            let increment = b.ins().iconst(types::I64, stride as i64);
+            let next_ptr = b.ins().iadd(ptr, increment);
+            b.def_var(*col_var, next_ptr);
+        }
+        b.ins().jump(row_header, &[]);
+
+        b.switch_to_block(chunk_next);
+        b.seal_block(chunk_next);
+        let chunk_i = b.use_var(chunk_index);
+        let one = b.ins().iconst(types::I64, 1);
+        let next_chunk = b.ins().iadd(chunk_i, one);
+        b.def_var(chunk_index, next_chunk);
+        b.ins().jump(chunk_header, &[]);
+
+        b.seal_block(row_header);
+        b.seal_block(chunk_header);
+        b.switch_to_block(exit);
+        b.seal_block(exit);
     }
 
     /// Type of local `slot` — the checker already validated it, and the JIT
@@ -767,6 +823,86 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 let _ = &mut arr;
                 arr
             }
+            ExprKind::StructLit { layout, fields } => {
+                let slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    layout.size.max(1) as u32,
+                    layout.align.trailing_zeros() as u8,
+                ));
+                let ptr = b.ins().stack_addr(types::I64, slot, 0);
+                for (offset, value) in fields {
+                    let value_ty = value.ty.clone();
+                    let value_ptr = self.offset_pointer(b, ptr, *offset);
+                    let value = self.expr(b, value);
+                    if let Some(nested) = value_ty.struct_layout() {
+                        self.copy_struct_fields(b, value, value_ptr, &nested);
+                    } else {
+                        b.ins().store(mem_flags(), value, value_ptr, 0);
+                    }
+                }
+                ptr
+            }
+            ExprKind::CommandsSpawn {
+                commands,
+                components,
+            } => {
+                let descriptor_size =
+                    (components.len() * std::mem::size_of::<crate::abi::SpawnComponent>()) as u32;
+                let descriptor_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    descriptor_size.max(1),
+                    3,
+                ));
+                let descriptor_ptr = b.ins().stack_addr(types::I64, descriptor_slot, 0);
+                for (index, component) in components.iter().enumerate() {
+                    let layout = component
+                        .ty
+                        .struct_layout()
+                        .expect("checker validated spawn component");
+                    let source_ptr = self.expr(b, component);
+                    let component_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        layout.size.max(1) as u32,
+                        layout.align.trailing_zeros() as u8,
+                    ));
+                    let component_ptr = b.ins().stack_addr(types::I64, component_slot, 0);
+                    self.zero_struct_padding(b, component_ptr, &layout);
+                    self.copy_struct_fields(b, source_ptr, component_ptr, &layout);
+                    let base_offset =
+                        (index * std::mem::size_of::<crate::abi::SpawnComponent>()) as u64;
+                    let fields = [
+                        layout.component_id.expect("checker validated component id") as u64,
+                        layout.size,
+                        layout.align,
+                    ];
+                    for (field_index, value) in fields.into_iter().enumerate() {
+                        let offset = base_offset + (field_index * 8) as u64;
+                        let field_ptr = self.offset_pointer(b, descriptor_ptr, offset);
+                        let value = b.ins().iconst(types::I64, value as i64);
+                        b.ins().store(mem_flags(), value, field_ptr, 0);
+                    }
+                    let data_ptr = self.offset_pointer(b, descriptor_ptr, base_offset + 24);
+                    b.ins().store(mem_flags(), component_ptr, data_ptr, 0);
+                }
+                let input_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    std::mem::size_of::<crate::abi::SpawnInput>() as u32,
+                    3,
+                ));
+                let input_ptr = b.ins().stack_addr(types::I64, input_slot, 0);
+                let count = b.ins().iconst(types::I64, components.len() as i64);
+                b.ins().store(mem_flags(), count, input_ptr, 0);
+                let components_addr = self.offset_pointer(b, input_ptr, 8);
+                b.ins()
+                    .store(mem_flags(), descriptor_ptr, components_addr, 0);
+                let commands = self.expr(b, commands);
+                let sig = self
+                    .sig_of("__tesjit_commands_spawn")
+                    .expect("Commands host function registered");
+                let fref = self.module.declare_func_in_func(sig.id, b.func);
+                b.ins().call(fref, &[commands, input_ptr]);
+                b.ins().iconst(types::I32, 0)
+            }
             ExprKind::OptionNone { ty: _ } => {
                 use crate::hir::Intrinsic;
                 let size = b.ins().iconst(types::I64, 16);
@@ -790,274 +926,117 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     };
                     b.ins().store(mem_flags(), v, ptr, 8);
                 } else {
-                    let v = if value.ty == Ty::I64 { v } else { self.convert(b, v, &value.ty, &Ty::I64) };
+                    let v = if value.ty == Ty::I64 {
+                        v
+                    } else {
+                        self.convert(b, v, &value.ty, &Ty::I64)
+                    };
                     b.ins().store(mem_flags(), v, ptr, 8);
                 }
                 ptr
             }
-            ExprKind::Iter { .. } => {
-                unreachable!("Iter is a phase-1 scaffold; use QueryFor")
+            ExprKind::PlaceRead { place } => {
+                let ptr = self.place_pointer(b, place);
+                if matches!(e.ty, Ty::Struct(_) | Ty::OwnedStruct(_)) {
+                    ptr
+                } else {
+                    b.ins().load(e.ty.clif(), mem_flags(), ptr, 0)
+                }
             }
-            ExprKind::PlaceRead { place } => self.place_read(b, place),
             ExprKind::PlaceWrite { place, op, value } => {
-                let v = self.expr(b, value);
-                self.place_write(b, place, *op, v, &value.ty);
-                // Assignment expression yields the written value.
-                v
+                let ptr = self.place_pointer(b, place);
+                let mut value = self.expr(b, value);
+                if let Some(op) = op {
+                    let current = b.ins().load(e.ty.clif(), mem_flags(), ptr, 0);
+                    value = self.arith(b, *op, current, value, e.ty.clone());
+                }
+                b.ins().store(mem_flags(), value, ptr, 0);
+                value
             }
+            ExprKind::Iter { .. } => {
+                unreachable!("query iteration is not lowered yet")
+            }
+        }
+    }
+
+    fn place_pointer(&self, b: &mut FunctionBuilder<'_>, place: &PlaceExpr) -> Value {
+        let (base, offset) = match place {
+            PlaceExpr::Field { base, offset } => (*base, *offset),
+            PlaceExpr::Slot(_) | PlaceExpr::Index { .. } => {
+                unreachable!("unsupported component place")
+            }
+        };
+        let ptr = b.use_var(self.vars[base]);
+        if offset == 0 {
+            ptr
+        } else {
+            let byte_offset = b.ins().iconst(types::I64, offset as i64);
+            b.ins().iadd(ptr, byte_offset)
+        }
+    }
+
+    fn offset_pointer(&self, b: &mut FunctionBuilder<'_>, ptr: Value, offset: u64) -> Value {
+        if offset == 0 {
+            ptr
+        } else {
+            let offset = b.ins().iconst(types::I64, offset as i64);
+            b.ins().iadd(ptr, offset)
+        }
+    }
+
+    fn copy_struct_fields(
+        &mut self,
+        b: &mut FunctionBuilder<'_>,
+        source: Value,
+        target: Value,
+        layout: &crate::ty::StructLayout,
+    ) {
+        for field in &layout.fields {
+            let source_ptr = self.offset_pointer(b, source, field.offset);
+            let target_ptr = self.offset_pointer(b, target, field.offset);
+            if let Some(nested) = field.ty.struct_layout() {
+                self.copy_struct_fields(b, source_ptr, target_ptr, &nested);
+            } else {
+                let value = b.ins().load(field.ty.clif(), mem_flags(), source_ptr, 0);
+                b.ins().store(mem_flags(), value, target_ptr, 0);
+            }
+        }
+    }
+
+    fn zero_struct_padding(
+        &self,
+        b: &mut FunctionBuilder<'_>,
+        ptr: Value,
+        layout: &crate::ty::StructLayout,
+    ) {
+        let mut fields: Vec<_> = layout.fields.iter().collect();
+        fields.sort_by_key(|field| field.offset);
+        let mut end = 0;
+        for field in fields {
+            self.zero_bytes(b, ptr, end, field.offset);
+            let field_ptr = self.offset_pointer(b, ptr, field.offset);
+            if let Some(nested) = field.ty.struct_layout() {
+                self.zero_struct_padding(b, field_ptr, &nested);
+            }
+            let (size, _) = field
+                .ty
+                .value_layout()
+                .expect("checker validated component field layout");
+            end = field.offset + size;
+        }
+        self.zero_bytes(b, ptr, end, layout.size);
+    }
+
+    fn zero_bytes(&self, b: &mut FunctionBuilder<'_>, ptr: Value, start: u64, end: u64) {
+        let zero = b.ins().iconst(types::I8, 0);
+        for offset in start..end {
+            let byte_ptr = self.offset_pointer(b, ptr, offset);
+            b.ins().store(mem_flags(), zero, byte_ptr, 0);
         }
     }
 
     // ───────────────────── place load / store ─────────────────────
 
-    /// Load the value of a resolved place.
-    fn place_read(&mut self, b: &mut FunctionBuilder<'_>, place: &crate::hir::Place) -> Value {
-        let base = b.use_var(self.vars[place.slot]);
-        let addr = if place.indirect {
-            // base is already a pointer; add field offset if any.
-            if place.offset == 0 {
-                base
-            } else {
-                b.ins().iadd_imm_s(base, place.offset as i64)
-            }
-        } else if place.offset == 0 {
-            // Whole local — just use the var (no memory).
-            return base;
-        } else {
-            // Struct local living in a stack slot: not yet fully supported.
-            // Phase-2 query bindings are always indirect, so this path is
-            // only hit for future stack-allocated structs.
-            let _ = base;
-            return b.ins().iconst(place.ty.clif(), 0);
-        };
-        let flags = mem_flags();
-        match &place.ty {
-            Ty::F32 => b.ins().load(types::F32, flags, addr, 0),
-            Ty::F64 => b.ins().load(types::F64, flags, addr, 0),
-            Ty::I8 | Ty::U8 | Ty::Bool => b.ins().load(types::I8, flags, addr, 0),
-            Ty::I16 | Ty::U16 => b.ins().load(types::I16, flags, addr, 0),
-            Ty::I32 | Ty::U32 => b.ins().load(types::I32, flags, addr, 0),
-            _ => b.ins().load(types::I64, flags, addr, 0),
-        }
-    }
-
-    /// Store `value` into a resolved place. If `op` is Some, performs a
-    /// read-modify-write (compound assignment).
-    fn place_write(
-        &mut self,
-        b: &mut FunctionBuilder<'_>,
-        place: &crate::hir::Place,
-        op: Option<oxc_ast::ast::BinaryOperator>,
-        value: Value,
-        value_ty: &Ty,
-    ) {
-        let mut v = value;
-        if let Some(binop) = op {
-            let cur = self.place_read(b, place);
-            // Reuse arithmetic lowering via a temporary binary expression path.
-            // For simplicity emit the op directly here for the common numeric cases.
-            v = self.emit_binop(b, binop, cur, &place.ty, value, value_ty);
-        }
-
-        if !place.indirect && place.offset == 0 {
-            // Plain local store.
-            b.def_var(self.vars[place.slot], v);
-        } else {
-            let base = b.use_var(self.vars[place.slot]);
-            let addr = if place.offset == 0 {
-                base
-            } else {
-                b.ins().iadd_imm_s(base, place.offset as i64)
-            };
-            let flags = mem_flags();
-            match &place.ty {
-                Ty::F32 => { b.ins().store(flags, v, addr, 0); }
-                Ty::F64 => { b.ins().store(flags, v, addr, 0); }
-                Ty::I8 | Ty::U8 | Ty::Bool => { b.ins().store(flags, v, addr, 0); }
-                Ty::I16 | Ty::U16 => { b.ins().store(flags, v, addr, 0); }
-                Ty::I32 | Ty::U32 => { b.ins().store(flags, v, addr, 0); }
-                _ => { b.ins().store(flags, v, addr, 0); }
-            }
-        }
-
-        // Mark dirty so QueryFor epilogue flushes the column.
-        if let Some(dirty) = place.dirty_slot {
-            let one = b.ins().iconst(types::I8, 1);
-            b.def_var(self.vars[dirty], one);
-        }
-    }
-
-    /// Minimal arithmetic for compound place writes.
-    fn emit_binop(
-        &mut self,
-        b: &mut FunctionBuilder<'_>,
-        op: oxc_ast::ast::BinaryOperator,
-        lhs: Value,
-        lhs_ty: &Ty,
-        rhs: Value,
-        rhs_ty: &Ty,
-    ) -> Value {
-        use oxc_ast::ast::BinaryOperator as B;
-        // Coerce rhs to lhs type when needed.
-        let rhs = if rhs_ty != lhs_ty {
-            self.convert(b, rhs, rhs_ty, lhs_ty)
-        } else {
-            rhs
-        };
-        match op {
-            B::Addition => {
-                if lhs_ty.is_float() {
-                    b.ins().fadd(lhs, rhs)
-                } else {
-                    b.ins().iadd(lhs, rhs)
-                }
-            }
-            B::Subtraction => {
-                if lhs_ty.is_float() {
-                    b.ins().fsub(lhs, rhs)
-                } else {
-                    b.ins().isub(lhs, rhs)
-                }
-            }
-            B::Multiplication => {
-                if lhs_ty.is_float() {
-                    b.ins().fmul(lhs, rhs)
-                } else {
-                    b.ins().imul(lhs, rhs)
-                }
-            }
-            B::Division => {
-                if lhs_ty.is_float() {
-                    b.ins().fdiv(lhs, rhs)
-                } else if lhs_ty.is_signed() {
-                    b.ins().sdiv(lhs, rhs)
-                } else {
-                    b.ins().udiv(lhs, rhs)
-                }
-            }
-            _ => lhs, // unsupported compound — leave unchanged
-        }
-    }
-
-    /// Emit the outer chunk loop + inner row loop for a QueryFor statement.
-    fn emit_query_for(
-        &mut self,
-        b: &mut FunctionBuilder<'_>,
-        chunks_ptr_slot: usize,
-        chunk_count_slot: usize,
-        columns: &[crate::hir::QueryForCol],
-        body: &[Stmt],
-    ) {
-        // Simplified kernel: for each chunk, for each row, bind column
-        // pointers and run the body. Fuel is checked on the inner back-edge.
-        //
-        // QueryChunkDesc layout assumed by the host (see ts_backend):
-        //   offset 0: row_count : u64
-        //   offset 8: col0_ptr  : *mut u8
-        //   offset 16: col1_ptr : *mut u8
-        //   ...
-        let desc_size = 8 + columns.len() * 8; // row_count + N pointers
-
-        let chunks_base = b.use_var(self.vars[chunks_ptr_slot]);
-        let n_chunks = b.use_var(self.vars[chunk_count_slot]);
-
-        // chunk_i = 0
-        let chunk_i = b.declare_var(types::I64);
-        let zero = b.ins().iconst(types::I64, 0);
-        b.def_var(chunk_i, zero);
-
-        let header = b.create_block();
-        let body_chunk = b.create_block();
-        let exit = b.create_block();
-        b.ins().jump(header, &[]);
-
-        b.switch_to_block(header);
-        let ci = b.use_var(chunk_i);
-        let cont = b.ins().icmp(cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan, ci, n_chunks);
-        // fuel on outer edge too
-        let fuel_ok = self.guard_check(b);
-        let cont = b.ins().band(cont, fuel_ok);
-        b.ins().brif(cont, body_chunk, &[], exit, &[]);
-
-        b.switch_to_block(body_chunk);
-        // desc = chunks_base + ci * desc_size
-        let off = b.ins().imul_imm_s(ci, desc_size as i64);
-        let desc = b.ins().iadd(chunks_base, off);
-        let flags = mem_flags();
-        let row_count = b.ins().load(types::I64, flags, desc, 0);
-
-        // row_i = 0
-        let row_i = b.declare_var(types::I64);
-        let zero = b.ins().iconst(types::I64, 0);
-        b.def_var(row_i, zero);
-
-        let row_header = b.create_block();
-        let row_body = b.create_block();
-        let row_exit = b.create_block();
-        b.ins().jump(row_header, &[]);
-
-        b.switch_to_block(row_header);
-        let ri = b.use_var(row_i);
-        let row_cont = b.ins().icmp(
-            cranelift_codegen::ir::condcodes::IntCC::UnsignedLessThan,
-            ri,
-            row_count,
-        );
-        let fuel_ok2 = self.guard_check(b);
-        let row_cont = b.ins().band(row_cont, fuel_ok2);
-        b.ins().brif(row_cont, row_body, &[], row_exit, &[]);
-
-        b.switch_to_block(row_body);
-        // Bind each column pointer: col_ptr + ri * size (+ field_offset)
-        for (col_idx, col) in columns.iter().enumerate() {
-            let col_ptr = b.ins().load(types::I64, flags, desc, (8 + col_idx * 8) as i32);
-            let elem_off = b.ins().imul_imm_s(ri, col.size as i64);
-            let mut ptr = b.ins().iadd(col_ptr, elem_off);
-            if col.field_offset != 0 {
-                ptr = b.ins().iadd_imm_s(ptr, col.field_offset as i64);
-            }
-            b.def_var(self.vars[col.local], ptr);
-            // clear dirty flag if present
-            if let Some(d) = self.slot_tys.get(col.local).and_then(|_| {
-                // dirty slot is stored on the Local; we don't have direct
-                // access here, so leave dirty management to place_write.
-                None::<usize>
-            }) {
-                let _ = d;
-            }
-        }
-
-        // Body statements.
-        for s in body {
-            self.stmt(b, s);
-        }
-
-        // Write-back mutable columns that were marked dirty is the
-        // responsibility of place_write (stores go directly through the
-        // column pointer). No extra epilogue needed for the indirect model.
-
-        // row_i++
-        let ri2 = b.use_var(row_i);
-        let next_ri = b.ins().iadd_imm_s(ri2, 1);
-        b.def_var(row_i, next_ri);
-        b.ins().jump(row_header, &[]);
-        Self::dead_block(b);
-
-        b.switch_to_block(row_exit);
-        // chunk_i++
-        let ci2 = b.use_var(chunk_i);
-        let next_ci = b.ins().iadd_imm_s(ci2, 1);
-        b.def_var(chunk_i, next_ci);
-        b.ins().jump(header, &[]);
-        Self::dead_block(b);
-
-        b.switch_to_block(exit);
-    }
-
-    /// Emit the fuel guard call; true while budget remains.
-    ///
-    /// Called on function entry (before the `FnLowerer` exists) and on every
-    /// loop back-edge, so it does not depend on instance state.
     fn fuel_check(
         module: &mut JITModule,
         sigs: &[(String, FnSig)],
@@ -1079,6 +1058,18 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         Self::fuel_check(self.module, self.sigs, b)
     }
 
+    fn fuel_check_n(&mut self, b: &mut FunctionBuilder<'_>, rows: Value) -> Value {
+        let sig = self
+            .sigs
+            .iter()
+            .find(|(name, _)| name == Intrinsic::FuelN.symbol())
+            .map(|(_, sig)| sig.clone())
+            .expect("chunk fuel helper declared by Jit");
+        let fref = self.module.declare_func_in_func(sig.id, b.func);
+        let call = b.ins().call(fref, &[rows]);
+        Self::adapt(b, &sig.ret, &Ty::Bool, b.inst_results(call)[0])
+    }
+
     /// Explicit `as` conversion. The checker guarantees the pair is legal;
     /// every combination below is total (wrapping integers, saturating
     /// float↔int, zero-extension from `bool`).
@@ -1088,10 +1079,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             // Integer ↔ integer: extend or truncate. Signedness only matters
             // for widening (sign- vs zero-extend); narrowing wraps.
             (f, t) if f.is_integer() && t.is_integer() => {
-                let (fw, tw) = (
-                    f.int_width().unwrap_or(32),
-                    t.int_width().unwrap_or(32),
-                );
+                let (fw, tw) = (f.int_width().unwrap_or(32), t.int_width().unwrap_or(32));
                 if fw == tw {
                     v
                 } else if tw < fw {
@@ -1158,6 +1146,7 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                     }
                 }
             }
+
             // `f32` ↔ `f64`.
             (Ty::F32, Ty::F64) => b.ins().fpromote(types::F64, v),
             (Ty::F64, Ty::F32) => b.ins().fdemote(types::F32, v),
@@ -1196,12 +1185,8 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         match (from, to) {
             // Widening: zero-extend, so a negative index stays a huge unsigned
             // value and the runtime bounds check traps on it.
-            (f, Ty::Ptr) if f.is_integer() || *f == Ty::Bool => {
-                b.ins().uextend(types::I64, v)
-            }
-            (Ty::Ptr, t) if t.is_integer() || *t == Ty::Bool => {
-                b.ins().ireduce(to.clif(), v)
-            }
+            (f, Ty::Ptr) if f.is_integer() || *f == Ty::Bool => b.ins().uextend(types::I64, v),
+            (Ty::Ptr, t) if t.is_integer() || *t == Ty::Bool => b.ins().ireduce(to.clif(), v),
             // Floats cross as words: exact-size bitcast, zero-extended words
             // for `f32` (matching `arr_get`'s zero-padded read).
             (Ty::F64, Ty::Ptr) => b.ins().bitcast(types::I64, mem_flags(), v),
@@ -1318,9 +1303,12 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         let ins = b.ins();
         match ty {
             Ty::Str => match op {
-                BinaryOperator::Addition => {
-                    self.call_intrinsic(b, Intrinsic::StrConcat, &[(&Ty::Str, l), (&Ty::Str, r)], &Ty::Str)
-                }
+                BinaryOperator::Addition => self.call_intrinsic(
+                    b,
+                    Intrinsic::StrConcat,
+                    &[(&Ty::Str, l), (&Ty::Str, r)],
+                    &Ty::Str,
+                ),
                 BinaryOperator::Equality | BinaryOperator::StrictEquality => self.call_intrinsic(
                     b,
                     Intrinsic::StrEq,
@@ -1456,13 +1444,14 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 };
                 ins.icmp(cc, l, r)
             }
-            Ty::Option(_)
+            Ty::Struct(_)
+            | Ty::OwnedStruct(_)
+            | Ty::Option(_)
             | Ty::Tuple(_)
-            | Ty::Query(_)
+            | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
             | Ty::Commands
-            | Ty::Struct(_)
             | Ty::Component(_)
             | Ty::Resource(_) => {
                 unreachable!("no operators on {}", ty)

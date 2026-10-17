@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf"]
+members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf", "crates/tesjit-schema"]
 # Scripting-runtime bench runners. Each links a DIFFERENT Lua C library
 # (mlua unifies features per version and mlua-sys declares `links = "lua"`,
 # so two backends can never coexist in one cargo graph). They are excluded

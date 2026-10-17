@@ -4,6 +4,42 @@
 // Handlers subscribe by export *name*: `on_tick` for every tick, and
 // `on_<event>` for each event below.
 
+// ───────────────────────── ECS query types ─────────────────────────
+
+/** Opaque Bevy entity identity (cast to `u64` only when needed). */
+type Entity = number & { readonly __entity: unique symbol };
+
+type i8 = number;
+type i16 = number;
+type i32 = number;
+type i64 = number;
+type u8 = number;
+type u16 = number;
+type u32 = number;
+type u64 = number;
+type f32 = number;
+type f64 = number;
+
+/** A mutable component borrow in a query. */
+type Mut<T> = T;
+
+/** Query archetype must contain the component. */
+type With<T> = T;
+
+/** Query archetype must not contain the component. */
+type Without<T> = T;
+
+/** A read-only resource available to `on_tick`. */
+type Res<T> = Readonly<T>;
+
+/** Stages supported component values for insertion after all mods finish. */
+interface Commands {
+  spawn(...components: object[]): void;
+}
+
+/** The host supplies matching table rows to `on_tick` each server tick. */
+interface Query<T, F = never> extends Iterable<T> {}
+
 // ───────────────────────── host functions ─────────────────────────
 
 /** Log a number to the server console. */
@@ -43,9 +79,8 @@ declare function register_keybind(id: string, default_key: string, description: 
 // The hands the mod a *view* of the world for one tick: a packed array of rows
 // in host memory. Rows are read and written through host functions that own
 // the offset math, so no mod ever hardcodes a byte offset — and every layout
-// is cross-checked against the type database exported from the server binary
-// (`just export-types`), so a Rust-side layout change is caught, not silently
-// wrong.
+// is cross-checked against the server's registered layout metadata, so a
+// Rust-side layout change is caught rather than silently misinterpreted.
 
 /** Region id of this tick's player rows (0 when there is none). */
 declare function query_players(): i32;
