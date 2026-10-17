@@ -29,6 +29,7 @@ cranelift-native = "0.136.1"
 tesjit-dwarf = { path = "../tesjit-dwarf" }
 criterion = "0.5"
 bevy_ecs = { workspace = true }
+bevy_app = { workspace = true }
 
 [[bench]]
 name = "scripting"
@@ -36,4 +37,12 @@ harness = false
 
 [[bench]]
 name = "ecs_spike"
+harness = false
+
+[[bench]]
+name = "query_showcase"
+harness = false
+
+[[bench]]
+name = "bevy_app_tick"
 harness = false

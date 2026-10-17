@@ -288,7 +288,11 @@ impl TsCommands {
                     // the PlayerId u64 for the demo path.
                     debug!("ts commands: Despawn({entity}) deferred to entity layer");
                 }
-                TsCommand::InsertComponent { entity, type_name, bytes } => {
+                TsCommand::InsertComponent {
+                    entity,
+                    type_name,
+                    bytes,
+                } => {
                     let _ = (entity, type_name, bytes);
                     debug!("ts commands: InsertComponent deferred (typed spawn Q3)");
                 }
@@ -299,8 +303,15 @@ impl TsCommands {
 
 #[derive(Clone, Debug)]
 enum TsCommand {
-    SetBlock { x: i32, y: i32, z: i32, block: i32 },
-    Despawn { entity: u64 },
+    SetBlock {
+        x: i32,
+        y: i32,
+        z: i32,
+        block: i32,
+    },
+    Despawn {
+        entity: u64,
+    },
     #[allow(dead_code)]
     InsertComponent {
         entity: u64,
@@ -339,7 +350,6 @@ fn flush_commands() {
 /// Opaque handle value passed as the `Commands` frame arg: non-zero token
 /// meaning "use the tick-local TS_COMMANDS buffer".
 const COMMANDS_HANDLE: i64 = 1;
-
 
 impl PullCtx {
     fn install(&self) {
@@ -622,7 +632,9 @@ enum PackKind {
     PlayerY,
     PlayerZ,
     /// Unknown / mod component: emit zeroed column with `row_count` rows.
-    Zero { stride: usize },
+    Zero {
+        stride: usize,
+    },
 }
 
 /// Registry of packable component names for generic `Query<T>` frame loads.
@@ -1500,9 +1512,7 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
 
         if entry.frame_loads.is_empty() {
             if entry.params.is_empty() {
-                run_guarded(m, name, |compiled| unsafe {
-                    compiled.call_void(name, &[])
-                });
+                run_guarded(m, name, |compiled| unsafe { compiled.call_void(name, &[]) });
             }
             continue;
         }
@@ -1510,10 +1520,15 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
         for fl in &entry.frame_loads {
             match &fl.kind {
                 tesjit::hir::FrameLoadKind::Query { shape } => {
-                    let (desc_buf, count, cols) = with_pull(|ctx| {
-                        pack_query_generic(rows, shape, &ctx.packers)
-                    })
-                    .unwrap_or_else(|| pack_query_generic(rows, shape, &QueryPackRegistry::engine_defaults()));
+                    let (desc_buf, count, cols) =
+                        with_pull(|ctx| pack_query_generic(rows, shape, &ctx.packers))
+                            .unwrap_or_else(|| {
+                                pack_query_generic(
+                                    rows,
+                                    shape,
+                                    &QueryPackRegistry::engine_defaults(),
+                                )
+                            });
                     let ptr = desc_buf.as_ptr() as u64;
                     live_bufs.push(desc_buf);
                     col_storage.extend(cols);
@@ -1533,11 +1548,7 @@ fn invoke_update_systems(m: &TsMod, rows: &[PlayerRow]) {
                             .iter()
                             .find_map(|n| {
                                 let p = resource_ptr(n, *mutable);
-                                if p.is_null() {
-                                    None
-                                } else {
-                                    Some(p)
-                                }
+                                if p.is_null() { None } else { Some(p) }
                             })
                             .unwrap_or(std::ptr::null_mut());
                     }
@@ -3104,11 +3115,7 @@ mod tests {
 /// Host-side view of `field_offset`, for tests (the host functions are
 /// `extern "C"` and take arena strings, which only compiled code can build).
 #[cfg(test)]
-fn host_field_offset_str(
-    db: &tesjit_dwarf::TypeDb,
-    ty: &str,
-    field: &str,
-) -> Option<u32> {
+fn host_field_offset_str(db: &tesjit_dwarf::TypeDb, ty: &str, field: &str) -> Option<u32> {
     let def = db.get(ty)?;
     let tesjit_dwarf::TypeArgs::Struct(fields) = &def.args else {
         return None;
@@ -3177,6 +3184,364 @@ mod typed_rows_compile_test {
         match compile_mod(&p, None) {
             Ok(_) => {}
             Err(es) => panic!("typed_rows.ts failed: {:#?}", es),
+        }
+    }
+}
+
+/// End-to-end validation of `server/tests/fixtures/showcase_embers.ts`: a
+/// wildfire-front
+/// simulation exercising multi-term queries, entity handles, mutable column
+/// writes, compound With/Without archetype filters, a mutable resource and
+/// deferred `Commands.spawn` — all in one `on_tick` system.
+#[cfg(test)]
+mod showcase_embers_test {
+    use super::*;
+    use bevy_ecs::prelude::Component;
+    use tesjit::{StructField, StructLayout, Ty};
+
+    #[derive(Component)]
+    struct Flame {
+        x: f32,
+        y: f32,
+        z: f32,
+        intensity: f32,
+    }
+
+    #[derive(Component)]
+    struct Fuel {
+        amount: f32,
+    }
+
+    #[derive(Component)]
+    struct Ignited;
+
+    #[derive(Component)]
+    struct Firebreak;
+
+    #[derive(bevy_ecs::prelude::Resource)]
+    struct FireState {
+        ticks: f64,
+        spawned: f64,
+        wind_x: f64,
+        decay: f64,
+        spread_intensity: f64,
+        spawn_cap: f64,
+        spread_range: f64,
+        burn_rate: f64,
+        total_burned: f64,
+    }
+
+    macro_rules! f32_schema {
+        ($ty:ty, $name:literal, $spawnable:expr, [$($field:ident),* $(,)?]) => {{
+            let fields = vec![$(StructField {
+                name: stringify!($field).to_owned(),
+                ty: Ty::F32,
+                offset: std::mem::offset_of!($ty, $field) as u64,
+            }),*];
+            let mut layout = StructLayout::from_parts(
+                $name,
+                fields,
+                std::mem::size_of::<$ty>() as u64,
+                std::mem::align_of::<$ty>() as u64,
+            )?;
+            layout.spawnable = $spawnable;
+            Ok(layout)
+        }};
+    }
+
+    impl crate::ts_ecs::TsSchema for Flame {
+        fn ts_schema() -> Result<StructLayout, String> {
+            f32_schema!(Flame, "Flame", true, [x, y, z, intensity])
+        }
+    }
+
+    impl crate::ts_ecs::TsSchema for Fuel {
+        fn ts_schema() -> Result<StructLayout, String> {
+            f32_schema!(Fuel, "Fuel", true, [amount])
+        }
+    }
+
+    impl crate::ts_ecs::TsSchema for Ignited {
+        fn ts_schema() -> Result<StructLayout, String> {
+            let mut layout = StructLayout::from_parts("Ignited", vec![], 0, 1).unwrap();
+            layout.spawnable = true;
+            Ok(layout)
+        }
+    }
+
+    impl crate::ts_ecs::TsSchema for Firebreak {
+        fn ts_schema() -> Result<StructLayout, String> {
+            let mut layout = StructLayout::from_parts("Firebreak", vec![], 0, 1).unwrap();
+            layout.spawnable = true;
+            Ok(layout)
+        }
+    }
+
+    impl crate::ts_ecs::TsSchema for FireState {
+        fn ts_schema() -> Result<StructLayout, String> {
+            let names = [
+                "ticks",
+                "spawned",
+                "wind_x",
+                "decay",
+                "spread_intensity",
+                "spawn_cap",
+                "spread_range",
+                "burn_rate",
+                "total_burned",
+            ];
+            let fields = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| StructField {
+                    name: (*name).to_owned(),
+                    ty: Ty::F64,
+                    offset: (i * std::mem::size_of::<f64>()) as u64,
+                })
+                .collect();
+            StructLayout::from_parts(
+                "FireState",
+                fields,
+                std::mem::size_of::<FireState>() as u64,
+                std::mem::align_of::<FireState>() as u64,
+            )
+        }
+    }
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-4
+    }
+
+    #[test]
+    fn showcase_embers_simulates_a_wildfire_front() {
+        let mut world = World::new();
+        world.insert_resource(FireState {
+            ticks: 0.0,
+            spawned: 0.0,
+            wind_x: 1.0,
+            decay: 0.1,
+            spread_intensity: 0.5,
+            spawn_cap: 3.0,
+            spread_range: 10.0,
+            burn_rate: 0.1,
+            total_burned: 0.0,
+        });
+        // The original flame, drifting with the wind and spreading.
+        world.spawn(Flame {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+            intensity: 1.0,
+        });
+        // A "stone" tile: it has a flame slot but never burns or spreads.
+        world.spawn((
+            Flame {
+                x: 5.0,
+                y: 0.0,
+                z: 0.0,
+                intensity: 1.0,
+            },
+            Firebreak,
+        ));
+        // Ignited fuel: burns down every tick.
+        world.spawn((Fuel { amount: 1.0 }, Ignited));
+        // Firebreak fuel: filtered out by [With<Ignited>, Without<Firebreak>].
+        world.spawn((Fuel { amount: 1.0 }, Ignited, Firebreak));
+        // Cold fuel: filtered out by With<Ignited>.
+        world.spawn(Fuel { amount: 1.0 });
+
+        let mut schemas = TsSchemaRegistry::default();
+        schemas.register::<Flame>().unwrap();
+        schemas.register::<Fuel>().unwrap();
+        schemas.register::<Ignited>().unwrap();
+        schemas.register::<Firebreak>().unwrap();
+        schemas.register::<FireState>().unwrap();
+        let registry = ComponentRegistry::from_world_with_schemas(&world, None, &schemas);
+        assert!(registry.layouts().any(|(name, _)| name == "Flame"));
+        assert!(registry.layouts().any(|(name, _)| name == "FireState"));
+
+        // Load the showcase mod from the repo, not an inline fixture. It lives
+        // under `server/tests/fixtures` rather than `mods/ts`, because its
+        // components only exist in this fixture world — as a live mod it would
+        // never link (see `mods/ts/showcase_orbit.ts` for the engine-component
+        // showcase that does run on a real server).
+        let repo_mod = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("showcase_embers.ts");
+        let dir = std::env::temp_dir().join(format!(
+            "ts-showcase-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::copy(&repo_mod, dir.join("showcase_embers.ts")).unwrap();
+        registry.write_declarations(&dir).unwrap();
+
+        let mut runtime = TsRuntime::with_root(dir);
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 1);
+        assert_eq!(runtime.mods[0].systems.len(), 1);
+
+        const TICKS: usize = 5;
+        for _ in 0..TICKS {
+            runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        }
+
+        // Resource accounting: five ticks, exactly `spawn_cap` children.
+        let state = world.resource::<FireState>();
+        assert!(approx(state.ticks, TICKS as f64), "{}", state.ticks);
+        assert!(approx(state.spawned, 3.0), "{}", state.spawned);
+        assert!(approx(state.total_burned, 0.5), "{}", state.total_burned);
+
+        // Flames: original + stone + three spread children.
+        let mut intensities: Vec<f64> = world
+            .query::<&Flame>()
+            .iter(&world)
+            .map(|f| f.intensity as f64)
+            .collect();
+        assert_eq!(intensities.len(), 5, "{intensities:?}");
+        intensities.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Original F0 decays 5×; child A (t1) decays 4×; children B (F0's
+        // t2 spread) and C (A's t2 spread — the chain reaction) decay 3×;
+        // the stone flame stays at 1.0.
+        for (got, want) in intensities.iter().zip([0.5, 0.6, 0.7, 0.7, 1.0]) {
+            assert!(approx(*got, want), "intensities {intensities:?}");
+        }
+
+        // The stone flame is untouched: no decay and no wind drift.
+        let stone = world
+            .query::<(&Flame, &Firebreak)>()
+            .iter(&world)
+            .next()
+            .unwrap()
+            .0;
+        assert!(approx(stone.intensity as f64, 1.0));
+        assert!(approx(stone.x as f64, 5.0), "{}", stone.x);
+
+        // The original flame drifted with the wind for all five ticks.
+        let min_x = world
+            .query::<&Flame>()
+            .iter(&world)
+            .map(|f| f.x)
+            .fold(f32::INFINITY, f32::min);
+        assert!(approx(min_x as f64, 0.5), "{min_x}");
+
+        // Fuel: ignited burned to 0.5, firebreak and cold fuel untouched.
+        let mut amounts: Vec<f64> = world
+            .query::<&Fuel>()
+            .iter(&world)
+            .map(|f| f.amount as f64)
+            .collect();
+        amounts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        assert_eq!(amounts.len(), 3, "{amounts:?}");
+        for (got, want) in amounts.iter().zip([0.5, 1.0, 1.0]) {
+            assert!(approx(*got, want), "fuel amounts {amounts:?}");
+        }
+    }
+}
+
+/// Validation of the *live* showcase mod, `mods/ts/showcase_orbit.ts`, against
+/// the real engine components it touches (`PlayerPosition` + `PlayerLook`).
+///
+/// The wildfire fixture above proves the query kernel; this one proves the mod
+/// a player actually sees: after a tick every avatar sits on the ring around
+/// the spawn point, at radius 12, looking at its centre.
+#[cfg(test)]
+mod showcase_orbit_test {
+    use super::*;
+    use glam::Vec3;
+
+    fn approx(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn showcase_orbit_puts_players_on_a_ring_facing_the_centre() {
+        let mut world = World::new();
+        // Two players, both spawned on the centre point exactly like
+        // `events.rs::on_server_event` does.
+        world.spawn((
+            PlayerPosition(Vec3::ZERO),
+            crate::movement::PlayerLook::default(),
+        ));
+        world.spawn((
+            PlayerPosition(Vec3::new(0.0, 28.0, 0.0)),
+            crate::movement::PlayerLook::default(),
+        ));
+
+        let registry = ComponentRegistry::from_world_with_schemas(
+            &world,
+            None,
+            &crate::ts_ecs::server_ts_schemas().unwrap(),
+        );
+        let dir = std::env::temp_dir().join(format!(
+            "ts-orbit-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo_mod = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("mods")
+            .join("ts")
+            .join("showcase_orbit.ts");
+        std::fs::copy(&repo_mod, dir.join("showcase_orbit.ts")).unwrap();
+
+        let mut runtime = TsRuntime::with_root(dir);
+        runtime.reload_with_registry(Some(&registry));
+        assert_eq!(runtime.mods.len(), 1);
+        assert_eq!(runtime.mods[0].systems.len(), 1);
+
+        // 60 ticks = three full laps of the 6°/tick orbit.
+        for _ in 0..60 {
+            runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        }
+
+        let mut seen: Vec<(f32, f32, f32)> = world
+            .query::<&PlayerPosition>()
+            .iter(&world)
+            .map(|p| (p.0.x, p.0.y, p.0.z))
+            .collect();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        for (x, y, z) in &seen {
+            // Radius 12 around (0, 28, 0).
+            assert!(
+                approx(*x as f64 * *x as f64 + *z as f64 * *z as f64, 144.0),
+                "x={x} z={z}"
+            );
+            // Vertical wave: CY ± BOB.
+            assert!((24.0..=32.0).contains(y), "y={y}");
+        }
+        seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        // Seeded 24° apart, so after a whole number of laps they are still
+        // 24° apart and never stacked on the same point.
+        assert!(
+            (seen[0].0 - seen[1].0).abs() > 1.0 || (seen[0].2 - seen[1].2).abs() > 1.0,
+            "players stacked: {seen:?}"
+        );
+
+        // Yaw points at the centre: forward = (-sin yaw, *, -cos yaw) must be
+        // antiparallel to the (x, z) offset.
+        let looks: Vec<(f32, f32)> = world
+            .query::<&crate::movement::PlayerLook>()
+            .iter(&world)
+            .map(|l| (l.yaw, l.pitch))
+            .collect();
+        assert_eq!(looks.len(), 2);
+        for (yaw, _) in &looks {
+            let fx = -yaw.sin();
+            let fz = -yaw.cos();
+            let len = (fx * fx + fz * fz).sqrt();
+            assert!(len > 0.99, "degenerate yaw {yaw}");
         }
     }
 }
