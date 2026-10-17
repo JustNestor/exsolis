@@ -915,11 +915,7 @@ impl TsRuntime {
                 let Some(entry) = m.compiled.entry("on_tick") else {
                     continue;
                 };
-                if entry
-                    .params
-                    .iter()
-                    .any(|param| matches!(param, Ty::Query(_)))
-                {
+                if entry.params.iter().any(is_ecs_system_param) {
                     continue;
                 }
                 if entry.ret != Ty::Void || !entry.params.is_empty() {
@@ -974,7 +970,9 @@ impl TsRuntime {
             }
             for system in systems {
                 let name = system.name.clone();
-                let args = system.args(world);
+                let Some(args) = system.args(world) else {
+                    continue;
+                };
                 run_guarded_parts(compiled, mod_name, &name, |compiled| unsafe {
                     compiled.call_void(&name, args)
                 });
@@ -1037,6 +1035,10 @@ impl TsRuntime {
     }
 }
 
+fn is_ecs_system_param(param: &Ty) -> bool {
+    matches!(param, Ty::Query(_) | Ty::Res(_) | Ty::Mut(_))
+}
+
 /// Run one handler with fuel armed, the runtime entered, and any trap logged.
 fn run_guarded(m: &TsMod, handler: &str, call: impl Fn(&Compiled)) {
     run_guarded_parts(&m.compiled, &m.name, handler, call);
@@ -1087,7 +1089,7 @@ fn compile_mod(
     let mut query_params = Vec::new();
     if let Some(registry) = registry {
         for (name, params, ret) in compiled.exports() {
-            if !params.iter().any(|param| matches!(param, Ty::Query(_))) {
+            if !params.iter().any(is_ecs_system_param) {
                 continue;
             }
             if name != "on_tick" {
@@ -1595,7 +1597,13 @@ mod tests {
         #[derive(Component)]
         struct AddedAfterFirstTick;
 
+        #[derive(Resource)]
+        struct RuntimeConfig {
+            calls: u64,
+        }
+
         let type_name = std::any::type_name::<QueryFixture>().to_owned();
+        let config_type_name = std::any::type_name::<RuntimeConfig>().to_owned();
         let mut db = tesjit_dwarf::TypeDb::new();
         db.types.insert(
             type_name.clone(),
@@ -1620,8 +1628,25 @@ mod tests {
                 }),
             },
         );
+        db.types.insert(
+            config_type_name.clone(),
+            tesjit_dwarf::TypeDef {
+                name: tesjit_dwarf::TypeName(config_type_name.clone()),
+                size: 8,
+                align: 8,
+                args: tesjit_dwarf::TypeArgs::Struct(tesjit_dwarf::StructType {
+                    is_union: false,
+                    fields: vec![tesjit_dwarf::Field {
+                        name: "calls".to_owned(),
+                        ty: tesjit_dwarf::TypeName::from("u64"),
+                        offset: 0,
+                    }],
+                }),
+            },
+        );
 
         let mut world = World::new();
+        world.insert_resource(RuntimeConfig { calls: 0 });
         let first = world
             .spawn(QueryFixture {
                 amount: 0.5,
@@ -1630,11 +1655,16 @@ mod tests {
             .id();
         let registry = ComponentRegistry::from_world(&world, Some(&db));
         assert!(registry.layouts().any(|(name, _)| name == "QueryFixture"));
+        assert!(registry.layouts().any(|(name, _)| name == "RuntimeConfig"));
 
         let dir = mods_dir(&[(
             "query.ts",
             r#"
-            export function on_tick(query: Query<[Entity, Mut<QueryFixture>]>): void {
+            export function on_tick(
+              query: Query<[Entity, Mut<QueryFixture>]>,
+              config: Mut<RuntimeConfig>,
+            ): void {
+              config.calls += 1;
               for (const [entity, value] of query) {
                 value.amount += 3.0;
                 value.entity_bits = entity as u64;
@@ -1646,6 +1676,8 @@ mod tests {
         let declarations = std::fs::read_to_string(dir.join("exsolis.generated.d.ts")).unwrap();
         assert!(declarations.contains("interface QueryFixture"));
         assert!(declarations.contains("amount: f64;"));
+        let compilation = compile_mod(&dir.join("query.ts"), Some(&registry));
+        assert!(compilation.is_ok(), "{:?}", compilation.err());
         let mut runtime = TsRuntime::with_root(dir.clone());
         runtime.reload_with_registry(Some(&registry));
         assert_eq!(runtime.mods.len(), 1);
@@ -1655,6 +1687,7 @@ mod tests {
         let first_value = world.get::<QueryFixture>(first).unwrap();
         assert_eq!(first_value.amount, 3.5);
         assert_eq!(first_value.entity_bits, first.to_bits());
+        assert_eq!(world.resource::<RuntimeConfig>().calls, 1);
 
         let second = world
             .spawn((
@@ -1671,7 +1704,11 @@ mod tests {
         assert_eq!(first_value.amount, 6.5);
         assert_eq!(second_value.amount, 4.0);
         assert_eq!(second_value.entity_bits, second.to_bits());
-
+        assert_eq!(world.resource::<RuntimeConfig>().calls, 2);
+        world.remove_resource::<RuntimeConfig>();
+        runtime.tick_ecs(&HashMap::new(), std::ptr::null(), &[], &mut world);
+        assert_eq!(world.get::<QueryFixture>(first).unwrap().amount, 6.5);
+        world.insert_resource(RuntimeConfig { calls: 2 });
         let old_layout_hash = runtime.mods[0].layout_hash;
         let source_path = dir.join("query.ts");
         let source = std::fs::read_to_string(&source_path).unwrap();

@@ -1,9 +1,11 @@
 # Scripting with ECS for flexible mods — design document
 
 Status: **implementation approved and underway**. The tesjit query-loop
-foundation and initial Bevy table-query runtime are implemented. Resources,
-`Commands`, query filters, the planned builder API, and performance/fuzz
-acceptance work remain outstanding.
+foundation, Bevy table queries, and typed `Res<T>`/`Mut<T>` system parameters
+are implemented. `Commands`, query filters, the planned builder API, and performance/fuzz
+acceptance work remain outstanding. The initial runtime currently imports
+component layouts from `types.tdb`; replacing that runtime dependency is now a
+planned migration (see §11).
 
 Sources of truth for this document:
 
@@ -441,7 +443,50 @@ Each phase ends in a testable, revertible deliverable.
 3. Should the spawn path take an explicit `Archetype` or infer from the
    `T` tuple? Proposed: infer from a typed spawn command `.spawn((C1, C2))`.
 
-These correspond to v1 design choices this doc leaves for explicit sign-off.
-Please answer and close the doc before phase 1 starts.
+The component set is currently fixed at compile time. The two spawn semantics
+remain open and should be confirmed before `Commands` is implemented; the
+proposals above are the recommended defaults.
+
+---
+
+## 11. Runtime layout metadata without `types.tdb`
+
+It is possible, and preferred, to remove `types.tdb` as a runtime prerequisite
+for mod ECS access. `types.tdb` is a DWARF export for broad inspection of Rust
+types; using it as the source of a live JIT ABI ties mod loading to a separate
+binary-export step and can leave the server without typed queries when the
+database is missing or stale.
+
+Recommended replacement: an explicit, compile-time schema for opted-in
+components and resources. A `TsComponent`/`TsResource` derive (or equivalent
+registration macro) emits each exposed type's field names, field types,
+`size_of`, `align_of`, and `offset_of!` values from the same Rust compilation
+that builds the server. The server registers those schemas with Bevy's runtime
+component/resource IDs; the JIT consumes the schema directly. Nested types
+must also provide an exposed schema, and unsupported layouts (unions,
+zero-sized table components, opaque fields, or recursive by-value types) are
+rejected rather than guessed.
+
+This keeps the hot path zero-copy and avoids a generic reflection lookup per
+field. It does mean schemas are an explicit allowlist: only registered types
+are available to mods, which is a useful safety boundary and makes generated
+editor declarations deterministic. Do not derive offsets from Bevy reflection:
+reflection describes logical fields, not necessarily their physical Rust
+offsets. Keep `types.tdb` as an optional debugging/inspection tool and
+temporary migration fallback, not as the source of production JIT layouts.
+
+Migration steps:
+
+1. Add the schema trait/derive and tests for primitive and nested component
+   fields, including `repr(Rust)` structs using compiler-provided
+   `offset_of!`.
+2. Register opted-in component/resource schemas and generate declarations
+   from that registry. Require an exact match between schema and Bevy's
+   runtime size/alignment before linking.
+3. Move production query tests and supported server components off
+   `types.tdb`; keep a fixture proving missing `types.tdb` does not disable
+   registered schemas.
+4. Remove `ServerTypes` from mod compilation/linking. Retain the exporter
+   crate only for developer diagnostics if still useful.
 """, "path">
 /home/nestor/prj/exsolis/docs/SCRIPTING_ECS_MODS_PLAN.md

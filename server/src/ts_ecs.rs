@@ -15,6 +15,7 @@ use tesjit_dwarf::{TypeArgs, TypeDb, TypeDef};
 struct EngineComponent {
     id: ComponentId,
     layout: Arc<StructLayout>,
+    table_stored: bool,
 }
 
 /// Component names and layouts available to one mod compilation.
@@ -22,6 +23,7 @@ struct EngineComponent {
 pub(crate) struct ComponentRegistry {
     by_name: HashMap<String, EngineComponent>,
     ambiguous: HashSet<String>,
+    resources: HashSet<ComponentId>,
 }
 
 pub(crate) fn layout_hash(params: &[Ty]) -> u64 {
@@ -82,10 +84,7 @@ impl ComponentRegistry {
         };
         let mut registry = Self::default();
         for info in world.components().iter_registered() {
-            if info.storage_type() != StorageType::Table
-                || info.layout().size() == 0
-                || info.type_id().is_none()
-            {
+            if info.layout().size() == 0 || info.type_id().is_none() {
                 continue;
             }
             let rust_name = info.name().to_string();
@@ -117,12 +116,16 @@ impl ComponentRegistry {
             let component = EngineComponent {
                 id: info.id(),
                 layout: Arc::new(layout),
+                table_stored: info.storage_type() == StorageType::Table,
             };
             if registry.by_name.insert(name.clone(), component).is_some() {
                 registry.by_name.remove(&name);
                 registry.ambiguous.insert(name);
             }
         }
+        registry
+            .resources
+            .extend(world.iter_resources().map(|(info, _)| info.id()));
         registry
     }
 
@@ -167,6 +170,12 @@ impl ComponentRegistry {
 
     fn get(&self, name: &str) -> Option<&EngineComponent> {
         self.by_name.get(name)
+    }
+
+    fn resource(&self, name: &str) -> Option<&EngineComponent> {
+        self.by_name
+            .get(name)
+            .filter(|component| self.resources.contains(&component.id))
     }
 }
 
@@ -336,6 +345,12 @@ impl QueryPlan {
                             layout.name
                         ));
                     }
+                    if !component.table_stored {
+                        return Err(format!(
+                            "query component `{}` is not table-stored",
+                            layout.name
+                        ));
+                    }
                     if component.layout.size != layout.size
                         || component.layout.align != layout.align
                     {
@@ -368,6 +383,12 @@ impl QueryPlan {
                     if component.layout.size == 0 {
                         return Err(format!(
                             "zero-sized query component `{}` is unsupported",
+                            layout.name
+                        ));
+                    }
+                    if !component.table_stored {
+                        return Err(format!(
+                            "query component `{}` is not table-stored",
                             layout.name
                         ));
                     }
@@ -524,9 +545,19 @@ impl Default for QueryBuffer {
 
 pub(crate) struct QuerySystem {
     pub(crate) name: String,
-    plans: Vec<QueryPlan>,
-    buffers: Vec<QueryBuffer>,
+    params: Vec<LinkedParam>,
     args: Vec<i64>,
+}
+
+enum LinkedParam {
+    Query {
+        plan: QueryPlan,
+        buffer: QueryBuffer,
+    },
+    Resource {
+        component: ComponentId,
+        mutable: bool,
+    },
 }
 
 impl QuerySystem {
@@ -542,46 +573,101 @@ impl QuerySystem {
         if params.len() > tesjit::jit::MAX_ARGS {
             return Err(format!("query system `{name}` exceeds the argument limit"));
         }
-        let mut plans = Vec::with_capacity(params.len());
+        let mut linked = Vec::with_capacity(params.len());
         let mut access = HashMap::new();
         for param in params {
-            let Ty::Query(row) = param else {
-                return Err(format!(
-                    "query system `{name}` may only take Query<T> parameters"
-                ));
-            };
-            let plan = QueryPlan::link(row, registry)?;
-            for term in &plan.terms {
-                if let Some(component) = term.component
-                    && let Some(previous_mutable) = access.insert(component, term.mutable)
-                    && (previous_mutable || term.mutable)
-                {
+            match param {
+                Ty::Query(row) => {
+                    let plan = QueryPlan::link(row, registry)?;
+                    for term in &plan.terms {
+                        if let Some(component) = term.component
+                            && let Some(previous_mutable) = access.insert(component, term.mutable)
+                            && (previous_mutable || term.mutable)
+                        {
+                            return Err(format!(
+                                "query system `{name}` has conflicting access to one component"
+                            ));
+                        }
+                    }
+                    linked.push(LinkedParam::Query {
+                        plan,
+                        buffer: QueryBuffer::default(),
+                    });
+                }
+                Ty::Res(inner) | Ty::Mut(inner) => {
+                    let Ty::Struct(layout) = inner.as_ref() else {
+                        return Err(format!(
+                            "resource system parameter `{}` must name a registered struct",
+                            param.name()
+                        ));
+                    };
+                    let component = registry.resource(&layout.name).ok_or_else(|| {
+                        format!(
+                            "resource `{}` is not registered or is not currently present",
+                            layout.name
+                        )
+                    })?;
+                    if component.layout.size != layout.size
+                        || component.layout.align != layout.align
+                    {
+                        return Err(format!(
+                            "resource `{}` layout changed since compilation",
+                            layout.name
+                        ));
+                    }
+                    let mutable = matches!(param, Ty::Mut(_));
+                    if let Some(previous_mutable) = access.insert(component.id, mutable)
+                        && (previous_mutable || mutable)
+                    {
+                        return Err(format!(
+                            "query system `{name}` has conflicting access to one component or resource"
+                        ));
+                    }
+                    linked.push(LinkedParam::Resource {
+                        component: component.id,
+                        mutable,
+                    });
+                }
+                other => {
                     return Err(format!(
-                        "query system `{name}` has conflicting access to one component"
+                        "query system `{name}` parameters must be Query<T>, Res<T>, or Mut<T>; found {other}"
                     ));
                 }
             }
-            plans.push(plan);
         }
-        let buffers = (0..plans.len()).map(|_| QueryBuffer::default()).collect();
         Ok(Self {
             name: name.to_owned(),
-            plans,
-            buffers,
+            params: linked,
             args: Vec::new(),
         })
     }
 
-    pub(crate) fn args(&mut self, world: &mut World) -> &[i64] {
-        for (plan, buffer) in self.plans.iter_mut().zip(&mut self.buffers) {
-            plan.fill(world, buffer);
-        }
+    pub(crate) fn args(&mut self, world: &mut World) -> Option<&[i64]> {
         self.args.clear();
-        self.args.extend(
-            self.buffers
-                .iter()
-                .map(|buffer| &buffer.input as *const QueryInput as usize as i64),
-        );
-        &self.args
+        for param in &mut self.params {
+            match param {
+                LinkedParam::Query { plan, buffer } => {
+                    plan.fill(world, buffer);
+                    self.args
+                        .push(&buffer.input as *const QueryInput as usize as i64);
+                }
+                LinkedParam::Resource {
+                    component,
+                    mutable: false,
+                } => {
+                    let value = world.get_resource_by_id(*component)?;
+                    self.args.push(value.as_ptr() as usize as i64);
+                }
+                LinkedParam::Resource {
+                    component,
+                    mutable: true,
+                } => {
+                    let mut value = world.get_resource_mut_by_id(*component)?;
+                    let ptr = value.as_mut().as_ptr();
+                    self.args.push(ptr as usize as i64);
+                }
+            }
+        }
+        Some(&self.args)
     }
 }

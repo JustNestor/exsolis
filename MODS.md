@@ -15,24 +15,28 @@ to the world without a snapshot or copy-back:
 ```ts
 export function on_tick(
   query: Query<[Entity, Mut<Position>]>,
+  config: Res<ModConfig>,
 ): void {
   for (const [entity, position] of query) {
-    position.x += 1.0;
+    position.x += config.speed;
   }
 }
 ```
 
 The component types and fields available in a mod are listed in the generated
 declarations. Query terms may be `Entity`, a read-only component type, or
-`Mut<Component>` for writable access. Read-only component writes are rejected
-at compile time. A `Mut` query updates Bevy's changed tick for every matching
-row, including rows whose fields the mod leaves unchanged.
+`Mut<Component>` for writable access. Tick systems may also take
+`Res<Resource>` for a read-only resource or `Mut<Resource>` for a mutable
+resource. The resource must be present when the system is linked; if removed
+later, that system is skipped until it returns. Read-only component/resource
+writes are rejected at compile time. A `Mut` borrow updates Bevy's changed tick
+when acquired, even if the mod leaves its fields unchanged.
 
 Query systems execute synchronously during the server's exclusive tick system.
 They cannot add or remove components while query pointers are live. Query
 matching currently supports table-stored components and requires every listed
-term; filters, resources, and `Commands` are not exposed yet. Each table chunk
-is charged against the mod's fuel budget before any row in that chunk runs.
+term; filters and `Commands` are not exposed yet. Each table chunk is charged
+against the mod's fuel budget before any row in that chunk runs.
 
 Existing zero-argument `on_tick()` mods and event handlers remain supported.
 An export other than `on_tick` cannot take query parameters.

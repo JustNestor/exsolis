@@ -23,6 +23,9 @@ type f64 = number;
 /** A mutable component borrow in a query. */
 type Mut<T> = T;
 
+/** A read-only resource available to `on_tick`. */
+type Res<T> = Readonly<T>;
+
 /** The host supplies matching table rows to `on_tick` each server tick. */
 interface Query<T> extends Iterable<T> {}
 

@@ -32,8 +32,8 @@
 //! (`number` means `f64`), `boolean`, opaque `Entity` handles, `string`,
 //! `T[]`, `void`. Every function boundary is fully annotated.
 
-pub mod check;
 pub mod abi;
+pub mod check;
 pub mod codegen;
 pub mod diag;
 pub mod hir;
