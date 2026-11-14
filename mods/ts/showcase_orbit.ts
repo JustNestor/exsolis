@@ -28,7 +28,7 @@ export function on_tick(
   const CX: f32 = 0.0;
   const CY: f32 = 28.0;
   const CZ: f32 = 0.0;
-  const R: f32 = 5.0; // ring radius
+  const R: f32 = 1.0; // ring radius
   const BOB: f32 = 4.0; // vertical wave amplitude
 
   // Orbit step: 6° per tick (server ticks at 20 Hz → one lap every 3 s).
