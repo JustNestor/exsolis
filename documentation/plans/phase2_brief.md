@@ -13,7 +13,7 @@
 - Note: may use existing subagents in OpenCode, but the brief assumes single-developer work; do not change `temp/bevy` (submodule) unless absolutely needed.
 
 ## Objective
-Finish phase 2 of the scripting/modding design (`docs/SCRIPTING_ECS_MODS_PLAN.md`) so a TS mod can express typed ECS read/mutate through `Query<T>`/`Res<T>`/`Mut<T>`/`Commands` without per-type host calls, validate that a typed surface actually runs against live world data, then proceed to phase 3 + 4 to the extent possible.
+Finish phase 2 of the scripting/modding design (`documentation/plans/SCRIPTING_ECS_MODS_PLAN.md`) so a TS mod can express typed ECS read/mutate through `Query<T>`/`Res<T>`/`Mut<T>`/`Commands` without per-type host calls, validate that a typed surface actually runs against live world data, then proceed to phase 3 + 4 to the extent possible.
 
 ## What is already shipped (do NOT redo)
 - Type system: `i8..i64`, `u8..u64`, `f32`, `f64`, `bool`, `Entity`, `Option<T>`, `Tuple`, `Query<T>`, `Res<T>`, `Mut<T>`, `Commands`; UFCS method resolution in `check.rs`.
@@ -21,7 +21,7 @@ Finish phase 2 of the scripting/modding design (`docs/SCRIPTING_ECS_MODS_PLAN.md
 - `host_fns()` pattern in `server/src/ts_backend.rs`, PullCtx with `world`, `bevy_world`, `components` mapping (currently typed by Player).
 - `layout_hash()` on HostRegistry.
 - Benchmarks: `crates/tesjit/benches/scripting.rs` with `bench_spike` (a_native, b_dynamic, c1, c1t, c2, d_player_rows) — 100k entities, ns/entity reported.
-- Docs: `docs/SCRIPTING_ECS_MODS_PLAN.md` (Phases structure, §6 ForOf sketch, typed-query requirements).
+- Docs: `documentation/plans/SCRIPTING_ECS_MODS_PLAN.md` (Phases structure, §6 ForOf sketch, typed-query requirements).
 - Demo mods: `mods/ts/{demo_option.ts, typed_rows.ts, component_access.ts, phase2_smoke.ts}`.
 
 ## Deliverables required before declaration of phase 2 done
@@ -53,7 +53,7 @@ Finish phase 2 of the scripting/modding design (`docs/SCRIPTING_ECS_MODS_PLAN.md
 - Separation of "queries" from "TS mod type-check": none of the type injection should require compiling against concrete Rust component names from TS; names are strings but are registered on the Rust side at app build time (this is a deliberate, documentable tradeoff consistent with `Entity`'s opaque handling).
 
 ### P2.4 — Documentation
-- Append section in `docs/SCRIPTING_ECS_MODS_PLAN.md` for Phase 2 Typed surface (§4 extension): how a mod author passes type names for the typed helper, example.
+- Append section in `documentation/plans/SCRIPTING_ECS_MODS_PLAN.md` for Phase 2 Typed surface (§4 extension): how a mod author passes type names for the typed helper, example.
 - Update `mods/exsolis.d.ts` with the new declarations (see 2.2), keep existing Lua bridge design untouched.
 
 ## Phase 3 (optional this run but bounded scope)
@@ -66,7 +66,7 @@ Finish phase 2 of the scripting/modding design (`docs/SCRIPTING_ECS_MODS_PLAN.md
 - Add test harness in `server/tests/` (or `ts_backend.rs` tests) that reloads a changed mod and asserts old build kept.
 
 ## Files to read first (in order)
-1. `docs/SCRIPTING_ECS_MODS_PLAN.md` — phased plan + design decisions.
+1. `documentation/plans/SCRIPTING_ECS_MODS_PLAN.md` — phased plan + design decisions.
 2. `crates/tesjit/src/hir.rs` — `Stmt`, `ExprKind`, `PlaceExpr`.
 3. `crates/tesjit/src/check.rs` — lowering pipelines and scope entry points
 4. `crates/tesjit/src/codegen.rs` — `stmt`, `arith`, `adapt`, `zero`, `convert`.

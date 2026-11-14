@@ -89,7 +89,7 @@ The client connects to `127.0.0.1:5000` by default. Assets are served over HTTP 
 | `EXSOLIS_ASSET_DIR` | `assets/` | Server-side asset source directory that gets packed and served. |
 | `EXSOLIS_ASSET_BIND_ADDR` | `0.0.0.0:5001` | Address the asset HTTP listener binds to. |
 | `EXSOLIS_ASSET_BASE_URL` | `http://<public host>:5001` | Public origin clients download assets from — point it at an HTTPS reverse proxy in production. |
-| `EXSOLIS_ASSET_CACHE_DIR` | `~/.exsolis/downloaded/` | Persistent client-side asset cache (kept outside the repo). |
+| `EXSOLIS_ASSET_CACHE_DIR` | `~/.exso/downloaded/` | Persistent client-side asset cache (kept outside the repo). |
 | `EXSOLIS_MODS_DIR` | `mods/` | Directory the server scans for Lua and TypeScript mods. |
 | `EXSOLIS_TYPES_DB` | `./types.tdb` | Exported type layout database the server loads at startup. |
 
@@ -160,7 +160,7 @@ export function on_tick(
 
 Every function boundary must be annotated (parameters *and* return type). Queries iterate matching Bevy table rows directly and write through to the world with no snapshot or copy-back. The runtime is sandboxed: fuel budgets, bounds-checked memory access, a fixed arena per module, and traps instead of unwinds — one buggy mod can never take the server down.
 
-See [`MODS.md`](MODS.md) for the full query and `Commands` surface, and [`mods/exsolis.d.ts`](mods/exsolis.d.ts) for the ambient host API.
+See [`documentation/scripting/typescript-modding.md`](documentation/scripting/typescript-modding.md) for the full query and `Commands` surface, and [`mods/exsolis.d.ts`](mods/exsolis.d.ts) for the ambient host API.
 
 ---
 
@@ -175,7 +175,7 @@ The server scans its `assets/` directory, builds a manifest of normalized paths 
 
 Clients keep a persistent cache outside the repository, compare it against the server manifest on join, and download only what is missing or changed. Asset bytes travel over HTTP only — never over the UDP game channel. While the server runs it polls asset metadata and pushes small deltas to connected clients.
 
-Details, including HTTPS reverse-proxy setup, are in [`ASSETS.md`](ASSETS.md).
+Details, including HTTPS reverse-proxy setup, are in [`documentation/assets.md`](documentation/assets.md).
 
 ---
 
@@ -221,19 +221,25 @@ The JIT matches a hand-written unsafe Rust loop byte for byte, so codegen is not
 
 ## Documentation
 
+Full documentation lives in **[`documentation/`](documentation/)** — start with its [index](documentation/README.md).
+
 | Document | Contents |
 |---|---|
-| [`MODS.md`](MODS.md) | TypeScript mod API: queries, resources, `Commands`. |
-| [`ASSETS.md`](ASSETS.md) | Asset delivery, caching, environment variables. |
-| [`docs/mod-effects.md`](docs/mod-effects.md) | Server-authored visual effects: action routing, WGSL packages, instance pooling. |
-| [`docs/SCRIPTING_ECS_MODS_PLAN.md`](docs/SCRIPTING_ECS_MODS_PLAN.md) | The full design of scripting against the ECS, with measurements. |
-| [`docs/ENTITIES_ANIMATION_PLAN.md`](docs/ENTITIES_ANIMATION_PLAN.md) | Entity system, block entities, skeletal animation, first-person viewmodel. |
-| [`docs/GLTF_BEVY_PARITY_PLAN.md`](docs/GLTF_BEVY_PARITY_PLAN.md) | glTF loader parity work and the Bevy comparison. |
-| [`docs/scroll_virtualization_plan.md`](docs/scroll_virtualization_plan.md) | Virtualized scroll lists for the creative grid. |
-| [`LEVEL_PARADIGM_PLAN.md`](LEVEL_PARADIGM_PLAN.md) | The planned multi-level server architecture. |
-| [`GLTF_INTEGRATION_PLAN.md`](GLTF_INTEGRATION_PLAN.md) | glTF import pipeline plan. |
-| [`crates/tesjit/README.md`](crates/tesjit/README.md) | The TypeScript → Cranelift JIT: language rules, embedding, sandbox. |
-| [`crates/tesjit-dwarf/README.md`](crates/tesjit-dwarf/README.md) | The DWARF type-layout exporter. |
+| [`documentation/architecture.md`](documentation/architecture.md) | The crates, their responsibilities, and how data flows between them. |
+| [`documentation/world-and-blocks.md`](documentation/world-and-blocks.md) | Chunks, streaming, the block registry, world generation, the authoritative inventory. |
+| [`documentation/networking.md`](documentation/networking.md) | The Renet transport, the two channels, and every message on the wire. |
+| [`documentation/rendering.md`](documentation/rendering.md) | The Vulkano pipeline, chunk meshing, the glTF loader. |
+| [`documentation/entities-and-animation.md`](documentation/entities-and-animation.md) | The entity registry, entity kinds, animation. |
+| [`documentation/scripting/typescript-modding.md`](documentation/scripting/typescript-modding.md) | **Writing a TypeScript mod** — the language subset, the host API, typed ECS queries. |
+| [`documentation/scripting/typescript-runtime.md`](documentation/scripting/typescript-runtime.md) | **How the TypeScript runtime works** — the compiler pipeline, the sandbox, the DWARF type database. |
+| [`documentation/lua-modding.md`](documentation/lua-modding.md) | The Lua `api.*` surface and the event list. |
+| [`documentation/ui/xml-ui.md`](documentation/ui/xml-ui.md) | **Writing an XML UI** — the tag vocabulary, the template language, actions. |
+| [`documentation/ui/xml-ui-internals.md`](documentation/ui/xml-ui-internals.md) | **How the XML UI works** — the server renderer, the client parser, the round trip. |
+| [`documentation/assets.md`](documentation/assets.md) | Asset delivery, the `.pak` format, caching, hot reload. |
+| [`documentation/mod-effects.md`](documentation/mod-effects.md) | Server-authored visual effects: action routing, WGSL packages, instance pooling. |
+| [`documentation/build-and-tooling.md`](documentation/build-and-tooling.md) | Build profiles, the `just` recipes, the export toolchain, the benchmarks. |
+| [`crates/tesjit/README.md`](crates/tesjit/README.md) | The TypeScript → Cranelift JIT crate: language rules, embedding, sandbox. |
+| [`crates/tesjit-dwarf/README.md`](crates/tesjit-dwarf/README.md) | The DWARF type-layout exporter crate. |
 
 ---
 
@@ -252,7 +258,7 @@ exsolis/
 ├── mods/            Lua and TypeScript mods (hot-reloaded)
 ├── assets/          Textures, models, UI XML templates
 ├── examples/        Standalone mod packages
-└── docs/            Design documents and plans
+└── documentation/   Guides, references and design plans
 ```
 
 ---

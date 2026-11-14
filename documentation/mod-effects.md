@@ -260,8 +260,8 @@ buffer alignment. Updated WGSL or manifests rebuild the package set after the
 active frame completes.
 
 The fly mod is installed and runnable in this checkout at
-[`mods/fly`](/home/nestor/prj/exsolis/mods/fly). Its source package is in
-[`examples/mod-effects/fly`](/home/nestor/prj/exsolis/examples/mod-effects/fly).
+[`mods/fly`](../mods/fly). Its source package is in
+[`examples/mod-effects/fly`](../examples/mod-effects/fly).
 To install it on another server, copy the example directory's contents into
 `mods/fly`. The server discovers Lua files recursively and scans each mod's
 `assets/` directory recursively. It publishes `.fxm`, `.wgsl`, `.png`, `.xml`,

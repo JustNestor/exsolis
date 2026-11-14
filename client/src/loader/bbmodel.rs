@@ -12,7 +12,7 @@
 //! sampling is deferred (see `BbAnim`).
 //!
 //! Reference: jasonjgardner/blockbench-mcp-project skills
-//! (`docs/blockbench/`); the format facts used here (outliner hierarchy
+//! (`documentation/blockbench/`); the format facts used here (outliner hierarchy
 //! with pivots, mesh-local vertices, per-face UV rects, animator keyframes)
 //! match those docs.
 
