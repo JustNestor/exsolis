@@ -12,6 +12,7 @@ exsolis_common.workspace = true
 exsolis_server.workspace = true
 fastpack.workspace = true
 reqwest.workspace = true
+bbmodel_rs.workspace = true
 
 bevy_app.workspace = true
 bevy_math = "0.19"

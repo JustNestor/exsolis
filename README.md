@@ -240,6 +240,7 @@ Full documentation lives in **[`documentation/`](documentation/)** — start wit
 | [`documentation/build-and-tooling.md`](documentation/build-and-tooling.md) | Build profiles, the `just` recipes, the export toolchain, the benchmarks. |
 | [`crates/tesjit/README.md`](crates/tesjit/README.md) | The TypeScript → Cranelift JIT crate: language rules, embedding, sandbox. |
 | [`crates/tesjit-dwarf/README.md`](crates/tesjit-dwarf/README.md) | The DWARF type-layout exporter crate. |
+| [`crates/bbmodel_rs/README.md`](crates/bbmodel_rs/README.md) | The Blockbench `.bbmodel` model loading and animation-summaries crate. |
 
 ---
 
@@ -251,6 +252,7 @@ exsolis/
 ├── server/          Authoritative simulation: chunks, entities, inventory, mods, assets
 ├── client/          Vulkano renderer, glTF loader, animation, server-driven UI
 ├── crates/
+│   ├── bbmodel_rs/ Blockbench .bbmodel loading + animation summaries
 │   ├── fastpak/     Memory-mapped asset archive (.pak)
 │   ├── tesjit/      Statically-typed TypeScript → Cranelift JIT
 │   ├── tesjit-dwarf/DWARF → type layout database (types.tdb)

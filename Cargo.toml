@@ -1,5 +1,5 @@
 [workspace]
-members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf", "crates/tesjit-schema"]
+members = ["common", "server", "client", "crates/fastpak", "crates/tesjit", "crates/tesjit-dwarf", "crates/tesjit-schema", "crates/bbmodel_rs"]
 # Scripting-runtime bench runners. Each links a DIFFERENT Lua C library
 # (mlua unifies features per version and mlua-sys declares `links = "lua"`,
 # so two backends can never coexist in one cargo graph). They are excluded
@@ -88,6 +88,7 @@ zrip = "0.8.11"
 fastpack = { package = "fastpak", path = "./crates/fastpak" }
 tesjit-dwarf = { path = "./crates/tesjit-dwarf" }
 tesjit = { path = "./crates/tesjit" }
+bbmodel_rs = { path = "./crates/bbmodel_rs" }
 
 
 # [workspace.dependencies.bevy_mod_scripting]

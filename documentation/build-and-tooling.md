@@ -116,6 +116,7 @@ The `crates/` directory holds pieces that are not part of the game and each has 
 | [`tesjit`](../crates/tesjit) | The statically-typed TypeScript → Cranelift JIT. |
 | [`tesjit-dwarf`](../crates/tesjit-dwarf) | The DWARF → `types.tdb` exporter. |
 | [`tesjit-schema`](../crates/tesjit-schema) | The shared schema for the type database. |
+| [`bbmodel_rs`](../crates/bbmodel_rs) | The Blockbench `.bbmodel` model loading and animation-summaries crate. |
 
 Each of `tesjit` and `tesjit-dwarf` also ships a CLI:
 

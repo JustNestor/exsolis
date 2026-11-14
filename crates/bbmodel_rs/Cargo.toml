@@ -1,0 +1,13 @@
+[package]
+name = "bbmodel_rs"
+version = "0.1.0"
+edition = "2024"
+description = "Blockbench .bbmodel model loading and animation summaries baked to the engine's voxel format."
+
+[lib]
+name = "bbmodel_rs"
+path = "src/lib.rs"
+
+[dependencies]
+serde_json = "1.0.151"
+image = { version = "0.25.10", default-features = false, features = ["png", "webp"] }
