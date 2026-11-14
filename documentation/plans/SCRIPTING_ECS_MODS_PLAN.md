@@ -512,4 +512,4 @@ Migration steps:
    TypeDB-dependent host layout helpers. Retain the exporter crate only for
    developer diagnostics if still useful.
 """, "path">
-/home/nestor/prj/exsolis/docs/SCRIPTING_ECS_MODS_PLAN.md
+/home/nestor/prj/exsolis/documentation/plans/SCRIPTING_ECS_MODS_PLAN.md

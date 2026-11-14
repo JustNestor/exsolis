@@ -938,7 +938,7 @@ pub fn apply_manifest(clips: &mut [AnimationClip], manifest: &[(String, ClipRole
 
 /// The authoritative role table for the two Blockbench exports of this avatar.
 ///
-/// Measured from the files (see docs/ENTITIES_ANIMATION_PLAN.md §2.2). Every
+/// Measured from the files (see documentation/plans/ENTITIES_ANIMATION_PLAN.md §2.2). Every
 /// clip name except `walk` and `extra6` was destroyed by the exporter, so
 /// these indices are the only stable identifier.
 ///

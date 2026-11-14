@@ -120,7 +120,7 @@ with whatever `PLAYER_MODEL` ships.
 Fix: key the role table on *both* paths (or on the basename+shape, e.g. match
 `girl.glb` / `girl.glb`/`girl2.glb`, both measure the same), and tighten the rig
 test so it can't drift again. Long term, ship the manifest as an asset
-(`docs/ENTITIES_ANIMATION_PLAN.md:93` promises `assets/anim/avatars.toml`, which
+(`documentation/plans/ENTITIES_ANIMATION_PLAN.md:93` promises `assets/anim/avatars.toml`, which
 `parse_manifest` (`anim.rs:735`) already parses) instead of a `const`.
 
 ### P0 — every non-LINEAR animation channel is silently dropped

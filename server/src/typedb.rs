@@ -10,7 +10,7 @@
 //! - the game and recompiled script code agree on layouts even across builds
 //!
 //! Later phases use it to give JIT-compiled code exact offsets for Rust-side
-//! payloads (see `docs/tesjit-abi.md`).
+//! payloads (see `documentation/scripting/typescript-runtime.md`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
