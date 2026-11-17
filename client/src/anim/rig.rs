@@ -237,6 +237,7 @@ impl Rig {
             joints: joints.iter().map(|j| j.joint.clone()).collect(),
             clips: decode_clips(document, buffers, &joint_of_node, &joints)?,
             upper_body: upper_body_flags(&joints),
+            overrides: std::collections::HashMap::new(),
         };
 
         debug!(

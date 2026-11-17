@@ -5,8 +5,9 @@ mod chunk_blocks;
 pub mod inventory;
 
 pub use blocks::{
-    AIR_ID, BlockDef, BlockId, BlockRegistry, Facing, MultiblockLayout, MultiblockPart,
-    is_air_like_name, mc_item_template, orientation_parts, placement_pick,
+    AIR_ID, BlockAnimCatalog, BlockAnimClip, BlockAnimMask, BlockAnimSet, BlockDef, BlockId,
+    BlockRegistry, Facing, MultiblockLayout, MultiblockPart, is_air_like_name, mc_item_template,
+    orientation_parts, placement_pick,
 };
 pub use chunk_blocks::{CHUNK_SIZE, CHUNK_VOLUME, ChunkBlocks};
 
@@ -95,6 +96,44 @@ impl Face {
             Face::Right => (1, 0, 0),
             Face::Front => (0, 0, 1),
             Face::Back => (0, 0, -1),
+        }
+    }
+}
+
+/// Animation state of a block entity: which pose its model should be in.
+///
+/// Server-authoritative: interactions resolve an action through a block's
+/// animation set and the server broadcasts the resulting state; clients play
+/// the clip the state names (see [`ServerMessage::BlockAnimState`]).
+///
+/// `#[repr(u8)]` + explicit discriminants: the numeric value is what goes
+/// into the wire format. New states MUST be appended or the protocol shifts
+/// (same rule as [`EntityKind`]).
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BlockAnimState {
+    /// Closed / at-rest pose. The default for freshly placed blocks.
+    Closed = 0,
+    /// Open / fully posed. Doors, beds, pistons, ...
+    Open = 1,
+}
+
+impl BlockAnimState {
+    /// Stable name used by the animation config files (`"closed"`, `"open"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockAnimState::Closed => "closed",
+            BlockAnimState::Open => "open",
+        }
+    }
+
+    /// Inverse of [`BlockAnimState::as_str`]; `None` for unknown states.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "closed" => Some(BlockAnimState::Closed),
+            "open" => Some(BlockAnimState::Open),
+            _ => None,
         }
     }
 }
@@ -225,6 +264,16 @@ pub enum ClientMessage {
     /// inventory is updated via `InventorySync`. Appended last.
     CreativeGive {
         name: String,
+    },
+    /// Client intent: use a block entity at `pos` (right-click — open a door,
+    /// sit in a bed, ...). The server resolves the block's animation set,
+    /// applies the named action and owns the resulting state; it then
+    /// broadcasts [`ServerMessage::BlockAnimState`] back. The action string
+    /// is untrusted client input and MUST be length-checked before it reaches
+    /// the resolver. Appended last so existing variant indices don't shift.
+    UseBlock {
+        pos: BlockPos,
+        action: String,
     },
 }
 
@@ -362,6 +411,29 @@ pub enum ServerMessage {
         slots: Vec<Option<(String, u8)>>,
         selected: u8,
     },
+    /// Animation state of a block entity changed server-side (a door
+    /// opening, a bed being slept in, ...). ReliableOrdered: a lost state
+    /// packet must not leave a block stuck mid-animation. Appended last so
+    /// existing variant indices don't shift.
+    BlockAnimState {
+        entity_id: EntityId,
+        /// Registry name of the animated block (master for multiblock parts).
+        block: String,
+        state: BlockAnimState,
+    },
+    /// Incremental hotbar sync: only the slots that changed since the
+    /// receiver's last applied sync, plus the authoritative selection.
+    /// Sent after an inventory mutation (give / place / break / click /
+    /// select) instead of re-sending the whole hotbar — and skipped
+    /// entirely for no-op selects. `changes` holds one entry per changed
+    /// hotbar slot as `(hotbar_index, contents)`; `contents` is the slot's
+    /// new value (`None` when the slot was emptied, `Some((name, amount))`
+    /// when a stack moved in). `selected: None` means "unchanged".
+    /// Appended last so existing variant indices don't shift.
+    InventorySyncDiff {
+        changes: Vec<(u8, Option<(String, u8)>)>,
+        selected: Option<u8>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -395,6 +467,10 @@ pub const MODEL_PATH_MAX_LEN: usize = 256;
 /// Maximum decoded bytes for one GLB model. Models dwarf shaders/textures;
 /// one oversized asset must not stall joins or exhaust GPU buffers.
 pub const GLB_MAX_BYTES: usize = 64 * 1024 * 1024;
+/// Maximum length of a block `UseBlock` action string (`"open"`, `"close"`,
+/// `"toggle"`, ...). The action is untrusted client input, so it is bounded
+/// before it reaches the state resolver.
+pub const BLOCK_ACTION_MAX_LEN: usize = 32;
 
 /// Mod action identifiers use the same `namespace:name` form as keybinds.
 pub fn is_valid_mod_action_id(id: &str) -> bool {

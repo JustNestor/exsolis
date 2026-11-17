@@ -142,6 +142,33 @@ fn receive_chunk_updates(
                     debug!("InventorySync: applied ({applied} stacks)");
                 }
             }
+            ServerMessage::InventorySyncDiff { changes, selected } => {
+                let Some(inv) = inventory.as_mut() else {
+                    continue;
+                };
+                for (index, contents) in changes.iter() {
+                    let i = *index as usize;
+                    if i >= exsolis_common::HOTBAR_SIZE {
+                        warn!("InventorySyncDiff: slot {i} out of hotbar range, ignoring");
+                        continue;
+                    }
+                    inv.slots[i] = match contents {
+                        Some((name, count)) => match blocks.as_ref().and_then(|b| b.0.id(name)) {
+                            Some(id) => Some((id, *count)),
+                            None => {
+                                warn!("InventorySyncDiff: unknown block {name:?}, clearing slot");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                }
+                if let Some(sel) = selected
+                    && (*sel as usize) < exsolis_common::HOTBAR_SIZE
+                {
+                    inv.selected = *sel;
+                }
+            }
             _ => {}
         }
     }

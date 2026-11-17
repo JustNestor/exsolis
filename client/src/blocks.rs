@@ -6,13 +6,33 @@
 
 use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
-use exsolis_common::{BlockId, BlockRegistry};
+use exsolis_common::{BlockAnimCatalog, BlockId, BlockRegistry};
 
 /// The client's block registry. Starts from the frozen M0 ids and extends
 /// with `minecraft:*` names scanned from the MC asset tree (same scan as
 /// the server, same sort => same numeric ids on both sides).
 #[derive(Resource, Clone)]
 pub struct ClientBlocks(pub BlockRegistry);
+
+/// The client's block animation catalog, parsed from
+/// `assets/animations/blocks.json` (same file the server reads; see
+/// [`BlockAnimCatalog::from_json`]).
+#[derive(Resource, Debug, Clone, Default)]
+pub struct ClientAnimCatalog {
+    pub sets: BlockAnimCatalog,
+}
+
+impl ClientAnimCatalog {
+    /// The animation set for a block, if the catalog declares one.
+    pub fn get(&self, block: &str) -> Option<&exsolis_common::BlockAnimSet> {
+        self.sets.get(block)
+    }
+}
+
+/// Dev asset dir for the block animation catalog.
+pub fn block_animations_path() -> std::path::PathBuf {
+    std::path::PathBuf::from("assets/animations/blocks.json")
+}
 
 /// Solidity/transparency heuristic for MC block names. Mirrors
 /// `server/src/blocks.rs::mc_flags` — keep the two in sync (a registry-sync
@@ -145,5 +165,13 @@ impl Plugin for BlocksPlugin {
             );
         }
         app.insert_resource(ClientBlocks(registry));
+        // Block animation sets (doors, beds, pistons). Same file the server
+        // reads; absent file => empty catalog and no block animations.
+        let anims = std::fs::read_to_string(block_animations_path())
+            .ok()
+            .and_then(|text| BlockAnimCatalog::from_json(&text).ok())
+            .unwrap_or_default();
+        bevy_log::info!("ClientAnimCatalog: {} block anim sets", anims.sets.len());
+        app.insert_resource(ClientAnimCatalog { sets: anims });
     }
 }

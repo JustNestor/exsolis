@@ -21,8 +21,8 @@ use glam::Vec3;
 use crate::net::{GameplaySet, OutgoingPacket};
 
 use exsolis_common::{
-    BlockId, BlockPos, BlockRegistry, EntityId, EntityKind, EntityState, MODEL_PATH_MAX_LEN,
-    PlayerId, ServerMessage,
+    BlockAnimState, BlockId, BlockPos, BlockRegistry, EntityId, EntityKind, EntityState,
+    MODEL_PATH_MAX_LEN, PlayerId, ServerMessage,
 };
 
 /// Model path used for every player avatar, and the scale that makes it the
@@ -80,6 +80,10 @@ pub struct EntityRecord {
     pub last_sent: Option<EntityState>,
     /// Where this entity lives, for block entities.
     pub block_pos: Option<BlockPos>,
+    /// Server-authoritative animation state for block entities (doors open
+    /// / closed, beds, ...). `None` means the at-rest pose until a use
+    /// interaction changes it.
+    pub anim: Option<BlockAnimState>,
 }
 
 #[derive(Resource, Default)]
@@ -141,6 +145,23 @@ impl EntityRegistry {
             .iter()
             .find(|(_, r)| r.block_pos == Some(pos))
             .map(|(id, _)| *id)
+    }
+
+    /// The animation state of the block entity bound at `pos`, if any. A
+    /// missing record (or a never-animated one) reads as the at-rest pose.
+    pub fn anim_at_block(&self, pos: BlockPos) -> Option<(EntityId, BlockAnimState)> {
+        let id = self.at_block(pos)?;
+        let record = self.get(id)?;
+        Some((id, record.anim.unwrap_or(BlockAnimState::Closed)))
+    }
+
+    /// Set the animation state of the block entity bound at `pos`.
+    pub fn set_anim_at_block(&mut self, pos: BlockPos, state: BlockAnimState) -> Option<EntityId> {
+        let id = self.at_block(pos)?;
+        if let Some(record) = self.records.get_mut(&id) {
+            record.anim = Some(state);
+        }
+        Some(id)
     }
 
     fn allocate(&mut self) -> Option<EntityId> {
@@ -270,6 +291,7 @@ pub fn spawn_requested(
                 state: req.state,
                 last_sent: None,
                 block_pos: req.block_pos,
+                anim: None,
             },
         );
 
@@ -426,6 +448,7 @@ mod tests {
                     state: EntityState::default(),
                     last_sent: None,
                     block_pos: None,
+                    anim: None,
                 },
             );
         }

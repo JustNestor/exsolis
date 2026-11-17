@@ -19,16 +19,19 @@ use bevy_app::prelude::*;
 use bevy_ecs::message::Message;
 use bevy_ecs::prelude::*;
 use bevy_log::{debug, warn};
-use exsolis_common::{AIR_ID, BlockId, BlockPos, ChunkCoord, PlayerId, ServerMessage};
+use exsolis_common::{
+    AIR_ID, BlockAnimState, BlockId, BlockPos, ChunkCoord, PlayerId, ServerMessage,
+};
 use exsolis_common::{EntityKind, EntityState};
+use exsolis_common::BLOCK_ACTION_MAX_LEN;
 use glam::Vec3;
 
 use crate::Inventory;
 use crate::PlayerMap;
-use crate::blocks::ServerBlocks;
+use crate::blocks::{ServerAnimCatalog, ServerBlocks};
+use crate::creative::{HotbarSyncLog, send_inventory_sync};
 use crate::chunks::PlayerPosition;
 use crate::chunks::{ChunkRenderState, ChunkWorld};
-use crate::creative::send_inventory_sync;
 use crate::net::{self, OutgoingPacket};
 
 /// Blocks. A block is 1 world unit, so this is also world units. Generous
@@ -44,11 +47,13 @@ impl Plugin for InteractionPlugin {
             .add_message::<BreakBlockRequested>()
             .add_message::<BreakBlockApplied>()
             .add_message::<SelectHotbarRequested>()
+            .add_message::<UseBlockRequested>()
             .add_systems(
                 Update,
                 (
                     handle_select_hotbar,
                     (handle_place_block, handle_break_block),
+                    handle_use_block,
                 )
                     .chain()
                     .after(crate::events::dispatch_incoming)
@@ -73,6 +78,16 @@ pub struct BreakBlockRequested {
     pub pos: BlockPos,
 }
 
+/// Bridged from `events.rs::dispatch_incoming` (client `ClientMessage::UseBlock`):
+/// the client wants to use a block entity (open a door, sit in a bed, ...).
+/// The server resolves the animation state; see [`handle_use_block`].
+#[derive(Message)]
+pub struct UseBlockRequested {
+    pub player_id: PlayerId,
+    pub pos: BlockPos,
+    pub action: String,
+}
+
 /// Fired when a break succeeds, carrying what was broken. Scripting
 /// forwards it to Lua (`break_block` with name + numeric id) so the Lua
 /// display inventory can mirror the Rust authority.
@@ -95,6 +110,7 @@ fn handle_select_hotbar(
     mut inventories: Query<&mut Inventory>,
     blocks: Res<ServerBlocks>,
     mut outgoing: MessageWriter<OutgoingPacket>,
+    mut hotbar_log: ResMut<HotbarSyncLog>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -113,7 +129,7 @@ fn handle_select_hotbar(
         };
         inventory.select(ev.index);
         let inv = inventory.clone();
-        send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
+        send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing, &mut hotbar_log);
     }
 }
 
@@ -140,6 +156,121 @@ fn within_reach(player_pos: Vec3, target: BlockPos) -> (bool, f32) {
     );
     let dist = player_pos.distance(center);
     (dist <= MAX_REACH, dist)
+}
+
+/// Bridged from `events.rs::dispatch_incoming` (client `ClientMessage::UseBlock`):
+/// resolve the used block's animation state and broadcast it. The server owns
+/// the state; the client only ever asked.
+fn handle_use_block(
+    mut events: MessageReader<UseBlockRequested>,
+    player_map: Res<PlayerMap>,
+    positions: Query<&PlayerPosition>,
+    world: ResMut<ChunkWorld>,
+    blocks: Res<ServerBlocks>,
+    anims: Res<ServerAnimCatalog>,
+    mut registry: ResMut<crate::entities::EntityRegistry>,
+    mut outgoing: MessageWriter<OutgoingPacket>,
+) {
+    for ev in events.read() {
+        let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
+            warn!("[UseBlock] Player ID {:?} not in PlayerMap", ev.player_id);
+            continue;
+        };
+        let Ok(player_pos) = positions.get(entity) else {
+            warn!(
+                "[UseBlock] Entity {:?} missing PlayerPosition component",
+                entity
+            );
+            continue;
+        };
+        let (in_reach, dist) = within_reach(player_pos.0, ev.pos);
+        if !in_reach {
+            warn!(
+                "[UseBlock] Reach check failed for PlayerId {:?}: distance {:.2} > MAX_REACH {:.1} (player_pos: {:?}, target_pos: {:?})",
+                ev.player_id, dist, MAX_REACH, player_pos.0, ev.pos
+            );
+            continue;
+        }
+        if ev.action.len() > BLOCK_ACTION_MAX_LEN {
+            warn!(
+                "[UseBlock] Action too long for PlayerId {:?}: {} bytes",
+                ev.player_id,
+                ev.action.len()
+            );
+            continue;
+        }
+        let action = ev.action.trim().to_ascii_lowercase();
+        if action.is_empty() {
+            continue;
+        }
+
+        // Which block is being used, and does it animate?
+        let (coord, idx) = world_to_chunk(ev.pos);
+        let Some(target) = world.ready.get(&coord) else {
+            warn!(
+                "[UseBlock] Target chunk {:?} not loaded/ready in ChunkWorld for target pos {:?}",
+                coord, ev.pos
+            );
+            continue;
+        };
+        let Some(unpacked) = target.unpack() else {
+            warn!("[UseBlock] Failed to unpack target chunk {:?}", coord);
+            continue;
+        };
+        let block_id = unpacked[idx];
+        // Resolve the animation target the same way breaking resolves a
+        // structure: a multiblock part animates through its master, whose
+        // block entity lives at the master cell (the first one `break_cells`
+        // reports). Degenerate hits fall back to the clicked cell.
+        let (master_id, cells) = break_cells(ev.pos, block_id, &world, &blocks);
+        let anchor = cells.first().map(|(pos, _)| *pos).unwrap_or(ev.pos);
+        let Some(block_name) = blocks.name(master_id) else {
+            continue;
+        };
+        let Some(set) = anims.get(block_name) else {
+            // Not a block with an animation set (chests, drawers, ...): the
+            // use simply has nothing to animate.
+            continue;
+        };
+
+        let Some((entity_id, current)) = registry.anim_at_block(anchor) else {
+            continue;
+        };
+        let new_state = match action.as_str() {
+            "open" => BlockAnimState::Open,
+            "close" => BlockAnimState::Closed,
+            "toggle" => {
+                if current == BlockAnimState::Closed {
+                    BlockAnimState::Open
+                } else {
+                    BlockAnimState::Closed
+                }
+            }
+            other => {
+                warn!("[UseBlock] Unknown action {other:?} for block {block_name:?}");
+                continue;
+            }
+        };
+        if !set.states.contains(&new_state) {
+            warn!(
+                "[UseBlock] Block {block_name:?} declares no animation state {new_state:?}; ignoring"
+            );
+            continue;
+        }
+        if new_state == current {
+            continue;
+        }
+        registry.set_anim_at_block(anchor, new_state);
+        outgoing.write(OutgoingPacket::broadcast(ServerMessage::BlockAnimState {
+            entity_id,
+            block: block_name.to_string(),
+            state: new_state,
+        }));
+        bevy_log::debug!(
+            "[UseBlock] {:?} -> {:?} for block {block_name:?} (entity {entity_id}, anchor {anchor:?})",
+            ev.pos, new_state
+        );
+    }
 }
 
 /// Applies the mutation and queues a `BlockUpdate` `OutgoingPacket` to
@@ -199,6 +330,7 @@ pub(crate) fn handle_place_block(
     mut spawns: MessageWriter<crate::entities::SpawnEntityRequest>,
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
     blocks: Res<ServerBlocks>,
+    mut hotbar_log: ResMut<HotbarSyncLog>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -312,7 +444,9 @@ pub(crate) fn handle_place_block(
         let mut ok = true;
         for (pos, id) in &cells {
             let (coord, idx) = world_to_chunk(*pos);
-            if !apply_and_broadcast(coord, idx, *id, *pos, &mut world, &mut outgoing, &loaded_by, &blocks) {
+            if !apply_and_broadcast(
+                coord, idx, *id, *pos, &mut world, &mut outgoing, &loaded_by, &blocks,
+            ) {
                 warn!("[PlaceBlock] apply failed for multiblock cell {pos:?}");
                 ok = false;
                 break;
@@ -325,7 +459,7 @@ pub(crate) fn handle_place_block(
             let selected_index = inventory.selected_index();
             inventory.remove_one(selected_index, resolved_id);
             let inv = inventory.clone();
-            send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
+            send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing, &mut hotbar_log);
             // Placing a container block brings its block entity into being.
             // Keyed by position, so replacing the block at a position that
             // already has an entity is handled by the break path first.
@@ -553,6 +687,7 @@ pub(crate) fn handle_break_block(
     loaded_by: Query<(&crate::Player, &ChunkRenderState)>,
     blocks: Res<ServerBlocks>,
     mut applied: MessageWriter<BreakBlockApplied>,
+    mut hotbar_log: ResMut<HotbarSyncLog>,
 ) {
     for ev in events.read() {
         let Some(&entity) = player_map.playerid_to_entity.get(&ev.player_id) else {
@@ -640,7 +775,7 @@ pub(crate) fn handle_break_block(
             if let Ok(mut inventory) = inventories.get_mut(entity) {
                 inventory.add_item(drop_id, 1);
                 let inv = inventory.clone();
-                send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing);
+                send_inventory_sync(ev.player_id, &inv, &blocks, &mut outgoing, &mut hotbar_log);
             }
             applied.write(BreakBlockApplied {
                 player_id: ev.player_id,

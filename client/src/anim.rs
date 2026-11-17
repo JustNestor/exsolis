@@ -390,6 +390,11 @@ pub struct Skeleton {
     /// Joint index -> the clip roles that have a channel for it. Used by
     /// masked blending to decide whether a joint is upper or lower body.
     upper_body: Vec<bool>,
+    /// Explicit `(from_clip, to_clip) -> transition` overrides. The clip-role
+    /// table in [`Transition::between`] is gameplay-shaped and cannot express
+    /// every authored block cross-fade, so block animations (doors, pistons,
+    /// ...) can name their own transition per clip pair here.
+    pub overrides: std::collections::HashMap<(u32, u32), Transition>,
 }
 
 /// Structural facts about one clip, used to infer its [`ClipRole`].
@@ -770,7 +775,22 @@ impl Skeleton {
 
     /// The transition to use between two clips.
     pub fn transition(&self, from_clip: u32, to_clip: u32) -> Transition {
+        if let Some(transition) = self.overrides.get(&(from_clip, to_clip)) {
+            return *transition;
+        }
         Transition::between(self.role_of(from_clip), self.role_of(to_clip))
+    }
+
+    /// Index of the clip with the given name, if the skeleton has one.
+    ///
+    /// Block animations are addressed by the authoring clip name (the block
+    /// animation config names clips like `"door_open"`), not by a classified
+    /// [`ClipRole`] — authored block clips have no gameplay role table.
+    pub fn clip_index_by_name(&self, name: &str) -> Option<u32> {
+        self.clips
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| i as u32)
     }
 
     /// Compose the bone palette for a pose that may be mid-transition.
@@ -1467,10 +1487,50 @@ models/test.glb
             ],
             clips: Vec::new(),
             upper_body: vec![true, false, false],
+            overrides: std::collections::HashMap::new(),
         };
         assert!(skeleton.is_upper_body(0), "head is upper body");
         assert!(!skeleton.is_upper_body(1), "thigh is lower body");
         assert!(!skeleton.is_upper_body(2), "foot is lower body");
+    }
+
+    #[test]
+    fn skeleton_resolves_clips_by_name_and_honours_overrides() {
+        let skeleton = Skeleton {
+            joints: vec![],
+            clips: vec![
+                AnimationClip {
+                    name: "door_closed".into(),
+                    role: ClipRole::Rest,
+                    duration: 0.2,
+                    channels: Vec::new(),
+                    stats: ClipStats::default(),
+                    natural_speed: 0.0,
+                },
+                AnimationClip {
+                    name: "door_open".into(),
+                    role: ClipRole::Rest,
+                    duration: 0.4,
+                    channels: Vec::new(),
+                    stats: ClipStats::default(),
+                    natural_speed: 0.0,
+                },
+            ],
+            upper_body: vec![],
+            overrides: std::collections::HashMap::from([(
+                (0, 1),
+                Transition {
+                    duration: 0.9,
+                    easing: Easing::Linear,
+                    mask: Mask::Full,
+                },
+            )]),
+        };
+        assert_eq!(skeleton.clip_index_by_name("door_open"), Some(1));
+        assert_eq!(skeleton.clip_index_by_name("door_closed"), Some(0));
+        assert_eq!(skeleton.clip_index_by_name("missing"), None);
+        // A block-named transition overrides the gameplay role table.
+        assert_eq!(skeleton.transition(0, 1).duration, 0.9);
     }
 
     /// A lower-body transition must leave the head's pose alone. If the
@@ -1497,6 +1557,7 @@ models/test.glb
             ],
             clips: Vec::new(),
             upper_body: vec![true, false],
+            overrides: std::collections::HashMap::new(),
         };
         // Incoming pose: head rotated, leg at rest.
         let mut locals = vec![
@@ -1543,6 +1604,7 @@ models/test.glb
             }],
             clips: Vec::new(),
             upper_body: vec![true],
+            overrides: std::collections::HashMap::new(),
         };
         let mut locals = vec![Transform {
             rotation: Quat::from_rotation_y(1.0),

@@ -474,6 +474,12 @@ fn host_fns() -> Vec<HostFn> {
             host_get_block as *const u8,
         ),
         HostFn::new(
+            "__tesjit_world_get",
+            vec![Ty::I64, Ty::I64, Ty::I64],
+            Ty::I64,
+            host_world_get as *const u8,
+        ),
+        HostFn::new(
             "component_access_id",
             vec![Ty::Str],
             Ty::I64,
@@ -601,6 +607,28 @@ extern "C" fn host_world_token() -> i64 {
 extern "C" fn host_player_component_id() -> i64 {
     with_pull(|ctx| ctx.world as usize as i64).unwrap_or(0)
 }
+/// Implementation of the typed `world.get<T>(entity)` intrinsic. The world
+/// handle is a capability token; the actual world is borrowed from the tick's
+/// pull context so the pointer stays valid only for this call.
+extern "C" fn host_world_get(_world: i64, entity: i64, component: i64) -> i64 {
+    if entity == 0 || component < 0 {
+        return 0;
+    }
+    with_pull(|ctx| {
+        if ctx.bevy_world.is_null() {
+            return 0;
+        }
+        let world = unsafe { &*ctx.bevy_world };
+        let entity = bevy_ecs::entity::Entity::from_bits(entity as u64);
+        let component = bevy_ecs::component::ComponentId::new(component as usize);
+        world
+            .get_by_id(entity, component)
+            .map(|ptr| ptr.as_ptr() as usize as i64)
+            .unwrap_or(0)
+    })
+    .unwrap_or(0)
+}
+
 extern "C" fn host_component_access_id(name: i64) -> i64 {
     let name = unsafe { ts_str(name) };
     with_pull(|ctx| *ctx.components.get(&name).unwrap_or(&0)).unwrap_or(0) as i64
@@ -1413,6 +1441,7 @@ impl TsRuntime {
         for module in &mut self.mods {
             for system in &mut module.systems {
                 system.apply_commands(world);
+                system.finish_tick(world);
             }
         }
         OUTBOX.with(|outbox| *outbox.borrow_mut() = None);
@@ -2031,6 +2060,7 @@ fn ts_drain_system(
     blocks: Res<crate::blocks::ServerBlocks>,
     player_map: Res<crate::PlayerMap>,
     mut inventories: Query<&mut crate::Inventory>,
+    mut hotbar_log: ResMut<crate::creative::HotbarSyncLog>,
 ) {
     let outbox = runtime.outbox();
     let requests = outbox
@@ -2053,6 +2083,7 @@ fn ts_drain_system(
         &blocks,
         &player_map,
         &mut inventories,
+        &mut hotbar_log,
     );
 }
 
@@ -3513,9 +3544,10 @@ mod showcase_orbit_test {
             .collect();
         assert_eq!(seen.len(), 2, "{seen:?}");
         for (x, y, z) in &seen {
-            // Radius 12 around (0, 28, 0).
+            // Ring radius `R = 1.0` around (0, 28, 0), matching
+            // `mods/ts/showcase_orbit.ts`.
             assert!(
-                approx(*x as f64 * *x as f64 + *z as f64 * *z as f64, 144.0),
+                approx(*x as f64 * *x as f64 + *z as f64 * *z as f64, 1.0),
                 "x={x} z={z}"
             );
             // Vertical wave: CY ± BOB.
@@ -3523,9 +3555,10 @@ mod showcase_orbit_test {
         }
         seen.sort_by(|a, b| a.partial_cmp(b).unwrap());
         // Seeded 24° apart, so after a whole number of laps they are still
-        // 24° apart and never stacked on the same point.
+        // 24° apart and never stacked on the same point. On the unit ring the
+        // chord for 24° is ~0.42, so any separation beyond a quad is a stack.
         assert!(
-            (seen[0].0 - seen[1].0).abs() > 1.0 || (seen[0].2 - seen[1].2).abs() > 1.0,
+            (seen[0].0 - seen[1].0).abs() > 0.2 || (seen[0].2 - seen[1].2).abs() > 0.2,
             "players stacked: {seen:?}"
         );
 

@@ -49,6 +49,11 @@ pub struct UiManager {
     /// (the inventory re-renders on every click) keeps its scroll instead
     /// of jumping to the top. First scroll area per screen wins.
     scroll_memory: HashMap<String, bevy_math::Vec2>,
+    /// Exact XML most recently mounted per screen. A `UiShow` carrying the
+    /// same bytes (a mod re-rendering on a click that changed nothing, or a
+    /// periodic refresh) is a no-op: no re-parse, no despawn, no respawn,
+    /// so hover/scroll/drag state survives untouched.
+    last_xml: HashMap<String, String>,
 }
 
 impl UiManager {
@@ -100,6 +105,15 @@ impl UiManager {
             warn!("ui: too many open screens, ignoring `{ui_id}`");
             return;
         }
+        // Already mounted with byte-identical XML: nothing to do. This is the
+        // cheap win for screens a mod re-renders from unchanged data (every
+        // forwarded `UiAction`, periodic refreshes). A locally closed screen
+        // has no root and no cached xml, so re-opening it still works.
+        if self.roots.contains_key(ui_id)
+            && self.last_xml.get(ui_id).is_some_and(|old| old == xml)
+        {
+            return;
+        }
         let parsed = match parse::parse_ui(xml) {
             Ok(p) => p,
             Err(e) => {
@@ -111,6 +125,7 @@ impl UiManager {
         self.hide(commands, ui_id);
         let root = spawn::spawn_ui(commands, ui_id, &parsed);
         self.roots.insert(ui_id.to_owned(), root);
+        self.last_xml.insert(ui_id.to_owned(), xml.to_owned());
         if parsed.root.attrs.get("modal").is_some_and(|v| v == "true") {
             self.modal.insert(ui_id.to_owned());
         }
@@ -131,6 +146,7 @@ impl UiManager {
 
     pub fn hide(&mut self, commands: &mut Commands, ui_id: &str) {
         self.modal.remove(ui_id);
+        self.last_xml.remove(ui_id);
         if let Some(root) = self.roots.remove(ui_id) {
             // Despawn is recursive over `Children`.
             commands.entity(root).despawn();
@@ -139,6 +155,7 @@ impl UiManager {
 
     pub fn hide_all(&mut self, commands: &mut Commands) {
         self.modal.clear();
+        self.last_xml.clear();
         for (_, root) in self.roots.drain() {
             commands.entity(root).despawn();
         }

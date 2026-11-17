@@ -423,6 +423,13 @@ pub enum ExprKind {
         commands: Box<Expr>,
         components: Vec<Expr>,
     },
+    /// `world.get<T>(entity)` — read-only typed borrow of another entity's
+    /// component, returned as `Option<T>`.
+    WorldGet {
+        world: Box<Expr>,
+        entity: Box<Expr>,
+        layout: Arc<StructLayout>,
+    },
     /// Read through a resolved place (field projection off a component local).
     PlaceRead {
         place: PlaceExpr,

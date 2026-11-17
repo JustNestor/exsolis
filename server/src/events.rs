@@ -1,7 +1,9 @@
 use crate::entities::{DespawnEntityRequest, SpawnEntityRequest, SpawnExtra};
 use crate::blocks::ServerBlocks;
 use crate::creative::CreativeGiveRequested;
-use crate::interaction::{BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested};
+use crate::interaction::{
+    BreakBlockRequested, PlaceBlockRequested, SelectHotbarRequested, UseBlockRequested,
+};
 use crate::net::{IncomingPacket, OutgoingPacket};
 use crate::scripting::KeybindActionRequested;
 
@@ -56,6 +58,7 @@ pub fn on_server_event(
     entity_registry: Res<crate::entities::EntityRegistry>,
     mut despawns: MessageWriter<DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
+    mut hotbar_log: ResMut<crate::creative::HotbarSyncLog>,
     catalog: Res<crate::assets::AssetCatalog>,
     mut http: ResMut<crate::assets::AssetHttpService>,
     mut pending: ResMut<crate::assets::PendingAssetJoins>,
@@ -75,6 +78,7 @@ pub fn on_server_event(
             info!("client {client_id} disconnected: {reason}");
             crate::assets::handle_disconnected(client_id, &mut pending);
             joining.requested.remove(&client_id);
+            hotbar_log.forget(client_id);
             if let Some(entity) = player_map.playerid_to_entity.remove(&client_id) {
                 player_map.entity_to_playerid.remove(&entity);
                 // Despawn through the registry so peers get `DespawnEntity`
@@ -283,6 +287,13 @@ pub fn dispatch_incoming(
                 commands.write_message(BreakBlockRequested {
                     player_id: client_id,
                     pos: *pos,
+                });
+            }
+            ClientMessage::UseBlock { pos, action } => {
+                commands.write_message(UseBlockRequested {
+                    player_id: client_id,
+                    pos: *pos,
+                    action: action.clone(),
                 });
             }
             ClientMessage::SelectHotbar(index) => {

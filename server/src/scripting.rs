@@ -1400,6 +1400,7 @@ pub(crate) fn drain_script_requests(
     blocks: Res<crate::blocks::ServerBlocks>,
     player_map: Res<crate::PlayerMap>,
     mut inventories: Query<&mut crate::Inventory>,
+    mut hotbar_log: ResMut<crate::creative::HotbarSyncLog>,
 ) {
     apply_script_requests(
         runtime.take_requests(),
@@ -1413,6 +1414,7 @@ pub(crate) fn drain_script_requests(
         &blocks,
         &player_map,
         &mut inventories,
+        &mut hotbar_log,
     );
 }
 
@@ -1434,6 +1436,7 @@ pub(crate) fn apply_script_requests(
     blocks: &crate::blocks::ServerBlocks,
     player_map: &crate::PlayerMap,
     inventories: &mut Query<&mut crate::Inventory>,
+    hotbar_log: &mut crate::creative::HotbarSyncLog,
 ) {
     for req in requests {
         match req {
@@ -1522,7 +1525,13 @@ pub(crate) fn apply_script_requests(
                 }
                 info!("scripting: api.give_block: player {player_id} given block {block} x{amount}");
                 let inv = inventory.clone();
-                crate::creative::send_inventory_sync(player_id, &inv, blocks, &mut outgoing);
+                crate::creative::send_inventory_sync(
+                    player_id,
+                    &inv,
+                    blocks,
+                    &mut outgoing,
+                    &mut *hotbar_log,
+                );
             }
             ScriptRequest::StashHeld { player_id } => {
                 let Some(&entity) = player_map.playerid_to_entity.get(&player_id) else {
@@ -1536,7 +1545,13 @@ pub(crate) fn apply_script_requests(
                     warn!("scripting: stash_held: {dropped} items did not fit, dropped");
                 }
                 let inv = inventory.clone();
-                crate::creative::send_inventory_sync(player_id, &inv, blocks, &mut outgoing);
+                crate::creative::send_inventory_sync(
+                    player_id,
+                    &inv,
+                    blocks,
+                    &mut outgoing,
+                    &mut *hotbar_log,
+                );
             }
             ScriptRequest::SpawnEntity {
                 kind,

@@ -14,6 +14,19 @@ use exsolis_common::{BlockId, BlockRegistry};
 #[derive(Resource, Clone)]
 pub struct ServerBlocks(pub BlockRegistry);
 
+/// The server's block animation catalog, parsed from the same
+/// `assets/animations/blocks.json` the client reads, so both sides agree on
+/// which states a block has and what clip poses them.
+#[derive(Resource, Clone, Default)]
+pub struct ServerAnimCatalog(pub exsolis_common::BlockAnimCatalog);
+
+impl ServerAnimCatalog {
+    /// The animation set for a block, if the catalog declares one.
+    pub fn get(&self, block: &str) -> Option<&exsolis_common::BlockAnimSet> {
+        self.0.get(block)
+    }
+}
+
 impl ServerBlocks {
     /// Numeric id for a block name, if registered.
     pub fn id(&self, name: &str) -> Option<BlockId> {
@@ -123,6 +136,14 @@ impl Plugin for BlocksPlugin {
             bevy_log::info!("ServerBlocks: +{parts} multiblock parts, +{oparts} orientation parts, +{items} items");
         }
         app.insert_resource(ServerBlocks(registry));
+        // Block animation sets (doors, beds, pistons). Same file the client
+        // reads; absent file => empty catalog and no block anims.
+        let anims = std::fs::read_to_string("assets/animations/blocks.json")
+            .ok()
+            .and_then(|text| exsolis_common::BlockAnimCatalog::from_json(&text).ok())
+            .unwrap_or_default();
+        bevy_log::info!("ServerAnimCatalog: {} block anim sets", anims.sets.len());
+        app.insert_resource(ServerAnimCatalog(anims));
     }
 }
 

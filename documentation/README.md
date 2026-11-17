@@ -49,6 +49,7 @@ If you are new to the codebase, read these in order:
 | [`GLTF_INTEGRATION_PLAN.md`](plans/GLTF_INTEGRATION_PLAN.md) | The glTF import pipeline. |
 | [`LEVEL_PARADIGM_PLAN.md`](plans/LEVEL_PARADIGM_PLAN.md) | The planned multi-level server architecture. |
 | [`scroll_virtualization_plan.md`](plans/scroll_virtualization_plan.md) | Virtualized scroll lists for the creative grid. |
+| [`ui_incremental_update_plan.md`](plans/ui_incremental_update_plan.md) | **Proposal** — incremental (diff-driven) UI screen updates instead of full re-mount per state change. |
 | [`phase2_brief.md`](plans/phase2_brief.md) | The task brief that drove the typed scripting runtime. |
 | [`ASSET_SYSTEM_HANDOFF.md`](plans/ASSET_SYSTEM_HANDOFF.md) | Handoff notes for the asset system work in flight. |
 

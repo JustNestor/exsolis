@@ -10,3 +10,4 @@ glam.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 serde.workspace = true
+serde_json.workspace = true

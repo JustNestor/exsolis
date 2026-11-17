@@ -903,6 +903,37 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 b.ins().call(fref, &[commands, input_ptr]);
                 b.ins().iconst(types::I32, 0)
             }
+            ExprKind::WorldGet {
+                world,
+                entity,
+                layout,
+            } => {
+                let world = self.expr(b, world);
+                let entity = self.expr(b, entity);
+                let component_id = b.ins().iconst(
+                    types::I64,
+                    layout.component_id.expect("checker validated component") as i64,
+                );
+                let sig = self
+                    .sig_of("__tesjit_world_get")
+                    .expect("world_get host function registered");
+                let fref = self.module.declare_func_in_func(sig.id, b.func);
+                let call = b.ins().call(fref, &[world, entity, component_id]);
+                let ptr = b.inst_results(call)[0];
+                // Wrap the borrowed pointer in the runtime's tagged Option<T>:
+                // [tag: i64][value: ptr]. A null host pointer means None.
+                use crate::hir::Intrinsic;
+                let size = b.ins().iconst(types::I64, 16);
+                let option =
+                    self.call_intrinsic(b, Intrinsic::Alloc, &[(&Ty::Ptr, size)], &Ty::Ptr);
+                let is_some = b.ins().icmp_imm_s(IntCC::NotEqual, ptr, 0);
+                let one = b.ins().iconst(types::I64, 1);
+                let zero = b.ins().iconst(types::I64, 0);
+                let tag = b.ins().select(is_some, one, zero);
+                b.ins().store(mem_flags(), tag, option, 0);
+                b.ins().store(mem_flags(), ptr, option, 8);
+                option
+            }
             ExprKind::OptionNone { ty: _ } => {
                 use crate::hir::Intrinsic;
                 let size = b.ins().iconst(types::I64, 16);
@@ -1451,6 +1482,9 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
+            | Ty::Added(_)
+            | Ty::Changed(_)
+            | Ty::World
             | Ty::Commands
             | Ty::Component(_)
             | Ty::Resource(_) => {
