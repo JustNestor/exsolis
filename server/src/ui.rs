@@ -25,9 +25,11 @@ use bevy_app::prelude::*;
 use bevy_ecs::prelude::*;
 use bevy_log::warn;
 
-use exsolis_common::{PlayerId, UI_DRAG_MAX_ID_LEN, UI_MAX_ACTION_LEN, UI_MAX_ID_LEN, UI_MAX_OPEN};
+use exsolis_common::{PlayerId, ServerMessage, UI_DRAG_MAX_ID_LEN, UI_MAX_ACTION_LEN, UI_MAX_ID_LEN, UI_MAX_OPEN};
 
-use crate::net::{GameplaySet, IncomingPacket};
+use crate::Inventory;
+use crate::blocks::ServerBlocks;
+use crate::net::{GameplaySet, IncomingPacket, OutgoingPacket};
 
 pub struct UiPlugin;
 
@@ -50,6 +52,56 @@ impl Plugin for UiPlugin {
                     .after(crate::scripting::drain_script_requests)
                     .before(crate::net::flush_outgoing),
             );
+    }
+}
+
+/// Render `assets/xml/hud.xml` for one player and mount it as the
+/// non-modal `hud` screen. Called by the inventory wire-sync path only
+/// when the hotbar actually changed; presentation belongs here in the UI
+/// module, not in the protocol/inventory state module.
+pub(crate) fn send_hud(
+    player_id: PlayerId,
+    inventory: &Inventory,
+    blocks: &ServerBlocks,
+    outgoing: &mut MessageWriter<OutgoingPacket>,
+) {
+    use crate::ui_template::DataValue;
+    use std::collections::HashMap;
+    let selected = inventory.selected_index() as usize;
+    let mut cells = Vec::with_capacity(exsolis_common::HOTBAR_SIZE);
+    for (i, slot) in inventory.hotbar().iter().enumerate() {
+        let mut cell = HashMap::new();
+        let is_selected = i == selected;
+        cell.insert(
+            "bg".to_string(),
+            DataValue::Str(if is_selected { "#c8c8c8".into() } else { "#222222cc".into() }),
+        );
+        cell.insert(
+            "border".to_string(),
+            DataValue::Str(if is_selected { "#ffffff".into() } else { "#555555".into() }),
+        );
+        if let Some(s) = slot {
+            if let Some(def) = blocks.0.def(s.item) {
+                let prefix = if def.placeable { "block#" } else { "item#" };
+                cell.insert(
+                    "img".to_string(),
+                    DataValue::Str(format!("{prefix}{}", def.name)),
+                );
+                cell.insert("count".to_string(), DataValue::Int(s.amount as i64));
+            }
+        }
+        cells.push(DataValue::Map(cell));
+    }
+    let mut root = HashMap::new();
+    root.insert("slots".to_string(), DataValue::Array(cells));
+    match crate::ui_template::render_file("hud", &DataValue::Map(root)) {
+        Ok(xml) => {
+            outgoing.write(OutgoingPacket::to(
+                player_id,
+                ServerMessage::UiShow { id: "hud".to_string(), xml },
+            ));
+        }
+        Err(e) => warn!("[hud] render failed for player {player_id}: {e}"),
     }
 }
 

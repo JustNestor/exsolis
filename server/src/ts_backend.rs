@@ -2060,7 +2060,7 @@ fn ts_drain_system(
     blocks: Res<crate::blocks::ServerBlocks>,
     player_map: Res<crate::PlayerMap>,
     mut inventories: Query<&mut crate::Inventory>,
-    mut hotbar_log: ResMut<crate::creative::HotbarSyncLog>,
+    mut hotbar_log: ResMut<crate::inventory_sync::HotbarSyncLog>,
 ) {
     let outbox = runtime.outbox();
     let requests = outbox

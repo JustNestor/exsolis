@@ -58,7 +58,7 @@ pub fn on_server_event(
     entity_registry: Res<crate::entities::EntityRegistry>,
     mut despawns: MessageWriter<DespawnEntityRequest>,
     mut outgoing: MessageWriter<OutgoingPacket>,
-    mut hotbar_log: ResMut<crate::creative::HotbarSyncLog>,
+    mut hotbar_log: ResMut<crate::inventory_sync::HotbarSyncLog>,
     catalog: Res<crate::assets::AssetCatalog>,
     mut http: ResMut<crate::assets::AssetHttpService>,
     mut pending: ResMut<crate::assets::PendingAssetJoins>,

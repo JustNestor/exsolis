@@ -29,7 +29,7 @@ use glam::Vec3;
 use crate::Inventory;
 use crate::PlayerMap;
 use crate::blocks::{ServerAnimCatalog, ServerBlocks};
-use crate::creative::{HotbarSyncLog, send_inventory_sync};
+use crate::inventory_sync::{HotbarSyncLog, send_inventory_sync};
 use crate::chunks::PlayerPosition;
 use crate::chunks::{ChunkRenderState, ChunkWorld};
 use crate::net::{self, OutgoingPacket};

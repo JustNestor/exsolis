@@ -26,6 +26,7 @@ mod chunks;
 mod creative;
 mod entities;
 mod events;
+mod inventory_sync;
 mod interaction;
 mod movement;
 mod net;
@@ -148,6 +149,7 @@ fn main() {
         .add_plugins(ChunksPlugin)
         .add_plugins(InteractionPlugin)
         .add_plugins(creative::CreativePlugin)
+        .add_plugins(inventory_sync::InventorySyncPlugin)
         .add_plugins(UiPlugin)
         .add_plugins(ScriptingPlugin)
         .add_plugins(ts_backend::TsScriptingPlugin)
