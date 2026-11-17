@@ -66,18 +66,14 @@ The reason to go first: `creative.rs` currently owns `HotbarSyncLog`, `send_inve
 
 ### A.1 Mod manifest and type packages
 
-- [ ] **A1.1** New file convention: `mods/ts/<name>.mod.json` next to each `*.ts` mod (or a single `mods/manifest.json` listing packages — pick one and document it). Fields:
-  ```json
-  {
-    "id": "mymod",
-    "version": "1.2.0",
-    "types": "types/mymod.d.ts",
-    "owns": ["mymod:Lightning", "mymod:RuneSocket"],
-    "depends": [{ "id": "other-mod", "range": "^1.0.0" }]
-  }
+- [ ] **A1.1** The manifest is **TOML and contains only dependencies** — no id, version, type path or ownership fields (those belong to the type package / conventions). One file per mod: `mods/ts/<id>.toml`, where `<id>` is the file stem of the matching `*.ts`:
+  ```toml
+  # mods/ts/mymod.toml
+  dependencies = ["mymod-core", "exsolis-blocks"]
   ```
-- [ ] **A1.2** `mods/types/<id>.d.ts` is hand-written by the mod author (consistent with "types by hand"). It declares the exact `interface`s for the components in `owns`. The host validates declared layout against the runtime registration (A.4).
-- [ ] **A1.3** `ComponentDecl` in the mod's own `*.ts` must be registered under its `owns` names. Today `lower_type_alias` registers `Component<T>` aliases (`check.rs:122`) but only in `TypeScope`, not in the Bevy world — see A.4.
+  A missing manifest means "no dependencies" — legal. Add `toml` as a workspace dependency (not currently present — checked `Cargo.toml`).
+- [ ] **A1.2** `mods/types/<id>.d.ts` is hand-written by the mod author (consistent with "types by hand"). Its path is a **convention** keyed by `<id>`, not a manifest field. It declares the exact `interface`s for the components this mod exports. The host validates declared layouts against runtime registrations (A.4).
+- [ ] **A1.3** Component ownership is derived from `<id>` + the declarations in the type package, not from a manifest `owns` list. Today `lower_type_alias` registers `Component<T>` aliases (`check.rs:122`) but only in `TypeScope`, not in the Bevy world — see A.4.
 
 ### A.2 Compile-time import resolution
 
@@ -91,15 +87,15 @@ The reason to go first: `creative.rs` currently owns `HotbarSyncLog`, `send_inve
 
 ### A.3 Host wiring
 
-- [ ] **A3.1** Before compiling a mod, load all manifests, build `name → (layout, size, align, owner, version)` for every `owns` entry, and pass them to `JitBuilder` via `builder.component(...)`. This is the same call path as engine components (`ts_backend.rs:1713`) — just a second source.
+- [ ] **A3.1** Before compiling a mod, load all `*.toml` manifests (TOML, dependencies only) plus the conventional `mods/types/<id>.d.ts` files, build `name → layout` for every exported component, and pass them to `JitBuilder` via `builder.component(...)`. This is the same call path as engine components (`ts_backend.rs:1713`) — just a second source.
 - [ ] **A3.2** `compile_mod` signature takes an extra `&ImportRegistry` (or extend `ComponentRegistry` with `mod_components`). Keep tests compiling: update every `compile_mod`/`reload_with_registry` call site (`ts_backend.rs:1227,1889,2354,2397,2513,2610,2696,3390,3508`).
 - [ ] **A3.3** Hot reload: when a dependency's `types/*.d.ts` or manifest changes, **recompile dependants** — the current stamp check (`ts_backend.rs:1239-1267`) only watches each mod's own `*.ts` file. Track a manifest/type stamp and invalidate dependants transitively.
 
 ### A.4 Layout safety, ownership, dependencies (no typedb)
 
 - [ ] **A4.1** Validate each declared layout: `size`, `align`, and every field offset from the `.d.ts` against the runtime registration. Reuse the existing check pattern in `TsSchemaRegistry::register` (`ts_ecs.rs:97`) and the "layout changed since compilation" checks in `QueryPlan::link` (`ts_ecs.rs:562,603,640`).
-- [ ] **A4.2** Namespace ownership: only the mod whose `id` matches the prefix may register `mymod:*`. A second mod trying to register or shadow the same name is a hard load error.
-- [ ] **A4.3** Dependency check: resolve `depends[].range` with a semver crate (add to workspace deps), hard-fail with a readable message on missing/incompatible deps. No silent empty queries.
+- [ ] **A4.2** Namespace ownership: only the mod whose `<id>` (file stem) matches the prefix may register `mymod:*`. A second mod trying to register or shadow the same name is a hard load error.
+- [ ] **A4.3** Dependency check: the TOML manifest lists only dependency **ids** (no version ranges for now — versioning is future work, see `ideas-for-the-future.md`). Hard-fail with a readable message on a missing dependency. No silent empty queries.
 - [ ] **A4.4** Layout mismatch or missing dependency → the mod keeps its last good build, logs diagnostics (same policy as `reload_with_registry`'s failure handling, `ts_backend.rs:1248`).
 
 ### A.5 Modification sites summary (for the executing agent)
@@ -111,7 +107,7 @@ The reason to go first: `creative.rs` currently owns `HotbarSyncLog`, `send_inve
 | `server/src/ts_backend.rs` | manifest loader, `compile_mod` extra param, dependency invalidation, hot reload |
 | `server/src/ts_ecs.rs` | extend `ComponentRegistry` or new `ImportRegistry` with validation helpers |
 | `mods/exsolis.d.ts` | document `import type` usage |
-| `Cargo.toml` | add `semver` workspace dependency |
+| `Cargo.toml` | add `toml` workspace dependency (no `semver` — versions are future work) |
 
 **Exit test for Part A:** Write two temporary TS mods in a test: `provider.ts` declares `export type Lightning = Component<{ level: i32 }>` (or equivalent) and a manifest owning `mymod:Lightning`; `consumer.ts` does `import type { Lightning } from "@mymod/lightning"` and has `on_tick(q: Query<[Entity, Lightning]>)`. Both compile and link. Remove the provider → consumer fails with "missing dependency", no silent success. Change the `.d.ts` field type → consumer fails with a layout mismatch before any JIT code runs.
 

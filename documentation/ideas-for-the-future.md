@@ -99,6 +99,34 @@ The hover card depends on two things from the main plan: **item entities** (so a
 
 ---
 
+## Mod capabilities — user-granted permissions (future work, not in stage 2)
+
+**Vision:** a mod must be able to *ask* for dangerous abilities instead of silently having them. The player (or server owner) sees a clear request and grants or denies it. This is the line between "mods are sandboxed code" and "mods are trusted programs".
+
+Examples of capabilities a mod might request:
+- **Filesystem** — read/write a save directory for its own persistent state (tool XP, rune collections).
+- **Network** — make outbound HTTP requests (fetch a texture pack, post a score to a leaderboard).
+- **Host commands** — spawn entities, change blocks, send UI (today these are implicitly allowed through the `ScriptRequest` surface; in a capability model they would be explicit grants).
+- **Cross-mod data** — read another mod's component data (relevant to the rune-on-enchanted-tool case).
+
+How it should feel:
+- A mod declares its requested capabilities in a manifest or at load time.
+- On first join/load, the user sees a plain-language prompt: "mymod wants to: read/write its save folder, make network requests" with Allow / Deny.
+- Grants are remembered per server/mod, revocable later from the launcher UI.
+- Denied capability → the mod still loads but that specific host function returns a clean error (or `None`), never a crash or silent data theft.
+
+Why it is **not** in stage 2:
+- Stage 2 already introduces cross-mod type imports, item entities and the `creative.rs` split. Capabilities add a second trust/permission axis and would double the blast radius.
+- The TS runtime is already sandboxed with fuel budgets and bounds-checked memory, so there is no urgent security hole — this is a *policy* feature, not a stop-the-bleeding fix.
+- It interacts with the free-client/server-discovery business model: grants belong to the player's launcher profile, so the design should be done once the launcher UI exists.
+
+Open questions to settle when this is picked up:
+- Who grants on a multiplayer server — the player for their client, or the server owner for the server-side script? Likely both, for different capabilities.
+- Are capabilities per-mod, per-mod-version, or per-transaction?
+- How do authored game bundles declare their needs without prompting on every join?
+
+---
+
 ## Engine hygiene: remove `creative.rs` from the core (queued, not urgent)
 
 `server/src/creative.rs` is misnamed. It started as "creative tab" but absorbed all inventory-authority logic because that is where UI actions landed. It currently mixes three unrelated things:
