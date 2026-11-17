@@ -23,6 +23,16 @@ type f64 = number;
 /** A mutable component borrow in a query. */
 type Mut<T> = T;
 
+/**
+ * Change-detection query marker. In a row tuple it is a read-only borrow of T
+ * and also restricts the query to entities where T was just added. It may also
+ * appear in Query's filter position without being listed in the row.
+ */
+type Added<T> = T;
+
+/** As Added<T>, but matches components added or mutably accessed recently. */
+type Changed<T> = T;
+
 /** Query archetype must contain the component. */
 type With<T> = T;
 
@@ -39,6 +49,16 @@ interface Commands {
 
 /** The host supplies matching table rows to `on_tick` each server tick. */
 interface Query<T, F = never> extends Iterable<T> {}
+
+/**
+ * Read-only world handle, available as an `on_tick` parameter. `get<T>` follows
+ * an Entity to one of its components and returns an Option (use `isSome()` /
+ * `unwrap()`). Mutations still belong in queries, so change detection stays
+ * honest — there is no "mark changed" API.
+ */
+interface World {
+  get<T>(entity: Entity): Option<T>;
+}
 
 // ───────────────────────── host functions ─────────────────────────
 

@@ -42,6 +42,28 @@ pub struct StructLayout {
 pub enum QueryFilterKind {
     With,
     Without,
+    /// Only rows where the component was added since the system last ran.
+    Added,
+    /// Only rows where the component was added or mutably accessed since the
+    /// system last ran.
+    Changed,
+}
+
+impl QueryFilterKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            QueryFilterKind::With => "With",
+            QueryFilterKind::Without => "Without",
+            QueryFilterKind::Added => "Added",
+            QueryFilterKind::Changed => "Changed",
+        }
+    }
+
+    /// Whether this is a row-level change-detection filter. These cannot be
+    /// resolved at archetype level; the host compares per-row change ticks.
+    pub fn is_change(self) -> bool {
+        matches!(self, QueryFilterKind::Added | QueryFilterKind::Changed)
+    }
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -234,6 +256,15 @@ pub enum Ty {
     Res(Box<Ty>),
     /// `Mut<T>` — signature-only mutable resource/component handle.
     Mut(Box<Ty>),
+    /// `Added<T>` — query-only marker. In a query row it desugars to a
+    /// read-only borrow of `T` plus an `Added` row filter; in the filter
+    /// position it contributes the filter without a row term.
+    Added(Box<Ty>),
+    /// `Changed<T>` — query-only marker, same desugaring as `Added<T>`.
+    Changed(Box<Ty>),
+    /// `World` — signature-only read-only world handle. Its only operation is
+    /// `get<T>(entity)`, which returns `Option<T>` borrowed from the world.
+    World,
     /// `Commands` — signature-only append-only command buffer.
     Commands,
     /// `string` — pointer to `[len: i64][utf8 bytes]` (see [`crate::runtime`]).
@@ -267,6 +298,9 @@ impl Ty {
             | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
+            | Ty::Added(_)
+            | Ty::Changed(_)
+            | Ty::World
             | Ty::Commands => types::I64,
             Ty::F32 => types::F32,
             Ty::F64 => types::F64,
@@ -310,11 +344,7 @@ impl Ty {
                 filters
                     .iter()
                     .map(|filter| {
-                        let name = match filter.kind {
-                            QueryFilterKind::With => "With",
-                            QueryFilterKind::Without => "Without",
-                        };
-                        format!("{name}<{}>", filter.component.name)
+                        format!("{}<{}>", filter.kind.name(), filter.component.name)
                     })
                     .collect::<Vec<_>>()
                     .join(", ")
@@ -322,6 +352,9 @@ impl Ty {
             .into(),
             Ty::Res(t) => format!("Res<{t}>").into(),
             Ty::Mut(t) => format!("Mut<{t}>").into(),
+            Ty::Added(t) => format!("Added<{t}>").into(),
+            Ty::Changed(t) => format!("Changed<{t}>").into(),
+            Ty::World => "World".into(),
             Ty::Commands => "Commands".into(),
             Ty::Array(elem) => format!("{elem}[]").into(),
             Ty::Str => "string".into(),
@@ -339,6 +372,9 @@ impl Ty {
                 | Ty::Query(..)
                 | Ty::Res(_)
                 | Ty::Mut(_)
+                | Ty::Added(_)
+                | Ty::Changed(_)
+                | Ty::World
                 | Ty::Commands
                 | Ty::Component(_)
                 | Ty::Resource(_)
@@ -353,6 +389,9 @@ impl Ty {
             Ty::Query(..)
                 | Ty::Res(_)
                 | Ty::Mut(_)
+                | Ty::Added(_)
+                | Ty::Changed(_)
+                | Ty::World
                 | Ty::Commands
                 | Ty::Component(_)
                 | Ty::Resource(_)
@@ -483,6 +522,9 @@ impl Ty {
             | Ty::Query(..)
             | Ty::Res(_)
             | Ty::Mut(_)
+            | Ty::Added(_)
+            | Ty::Changed(_)
+            | Ty::World
             | Ty::Commands
             | Ty::Str
             | Ty::Array(_)
@@ -515,7 +557,14 @@ impl Ty {
                     .ok()
                     .map(|l| (l.size as u32, l.align as u32))
             }
-            Ty::Query(..) | Ty::Res(_) | Ty::Mut(_) | Ty::Commands | Ty::Void => None,
+            Ty::Query(..)
+            | Ty::Res(_)
+            | Ty::Mut(_)
+            | Ty::Added(_)
+            | Ty::Changed(_)
+            | Ty::World
+            | Ty::Commands
+            | Ty::Void => None,
         }
     }
 

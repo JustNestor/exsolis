@@ -101,9 +101,8 @@ Finishing that is the first piece of work, and it is what makes the whole design
 - **`Added<T>`** — a system with `Query<[Entity, Added<Lightning>]>` runs once when an enchant is applied. This is how a sword *gains* its damage, name, and glow without a resolver function.
 - **`Changed<T>`** — "this component was touched since my last check". The end-of-tick damage system uses `Changed<HitContext>` to skip hits nobody edited.
 - **`Removed<T>`** — a component went away. Removing the enchant triggers a rebuild of the sword's characteristics. Because there is no row left to filter, this is exposed as a small separate query region of "things that were removed".
-- **Manual labels** — sometimes a script changes something *derived* without writing the field directly. It needs to say "treat this as changed". We'll add host functions `mark_added`, `mark_changed`, `mark_removed(entity, component)` using the existing `component_access_id`. Important detail: these labels drive other systems' queries; they do not physically remove a component unless the script also issues a real `commands.remove`.
 
-You also asked how we can "put these labels ourselves" — that's exactly the `mark_*` functions above. **If you want it the other way, say so** — for example a `Dirty<T>` wrapper type where writing `dirty.set()` marks the change implicitly.
+There are **no manual labels**. A script marks something as changed by actually writing it (or inserting/removing the component) through the ECS. "Saying" a component changed without changing it is not supported — it would let a mod lie to every other mod's queries. Derived state is invalidated by writing real components, which keeps the change stream honest and simple.
 
 ---
 
@@ -184,7 +183,7 @@ Applying the prefab inserts those components. That is all JSON does. It cannot d
 
 ### To build `[ ]`
 
-- [ ] Change detection exposed to TypeScript: ticks per system, `Added`/`Changed` filters, `Removed` region, manual `mark_*` labels.
+- [ ] Change detection exposed to TypeScript: ticks per system, `Added`/`Changed` filters, `Removed` region. No manual labels — change means a real write or a real insert/remove.
 - [ ] Typed random access to another entity's components (`world.get<T>`), insert/remove commands, generic queries over mod-defined components.
 - [ ] Mod type packages with imports, ownership, dependency checks, layout validation.
 - [ ] An item entity model: `ItemId` registry, `ItemStack` entity, `InInventory`, stack merge/split rules.
@@ -200,7 +199,7 @@ Applying the prefab inserts those components. That is all JSON does. It cannot d
 
 I picked sensible defaults for everything we discussed. Read them as statements, not questions — tell me which one you want changed.
 
-- **D1 — V1 TS surface.** First land: per-system change ticks, `Added`/`Changed` filters, manual `mark_*` labels, and `world.get<T>`. Generic mod-defined queries and named phases come next but are not blockers. *Why: this is the minimum that makes `Added`-driven characteristics possible.*
+- **D1 — V1 TS surface.** First land: per-system change ticks, `Added`/`Changed` filters, and `world.get<T>`. Generic mod-defined queries and named phases come next but are not blockers. *Why: this is the minimum that makes `Added`-driven characteristics possible.* Manual labels are explicitly out of scope — a change is a real write or a real insert/remove.
 - **D2 — Hit field ownership.** Engine owns attacker/weapon/target/entity id; mods may write damage, flags, and a bounded list of effects (max 8). *Why: mods can't corrupt the identity of an event.*
 - **D3 — Phases.** `Seed → React → PostTick → Apply`. Ordering inside a phase is by convention (write distinct fields) with a priority escape hatch. No full ordering graph. *Why: simple and enough for the examples.*
 - **D4 — Stackability.** Two stacks merge if their `ItemId` matches and their component sets are equal, excluding derived components. *Why: safe default — unknown components make things unstackable rather than silently merging.*

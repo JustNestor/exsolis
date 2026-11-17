@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+use bevy_ecs::change_detection::Tick;
 use bevy_ecs::component::{ComponentId, StorageType};
 use bevy_ecs::prelude::World;
 use bevy_ecs::storage::{TableId, TableRow};
@@ -673,7 +674,9 @@ impl QueryPlan {
                 term.component
                     .is_none_or(|component| archetype.contains(component))
             }) && self.filters.iter().all(|(component, kind)| match kind {
-                QueryFilterKind::With => archetype.contains(*component),
+                QueryFilterKind::With
+                | QueryFilterKind::Added
+                | QueryFilterKind::Changed => archetype.contains(*component),
                 QueryFilterKind::Without => !archetype.contains(*component),
             }) {
                 let id = archetype.table_id();
@@ -684,11 +687,24 @@ impl QueryPlan {
         }
     }
 
-    pub(crate) fn fill(&mut self, world: &mut World, buffer: &mut QueryBuffer) {
+    /// Fill the zero-copy query input.
+    ///
+    /// `last_run` is this system's change tick from the previous run. With/Without
+    /// are resolved at archetype level in [`Self::refresh`], but Added/Changed are
+    /// per-row: a table can contain a mix of passing and failing rows. We emit one
+    /// chunk per contiguous run of passing rows, pointing directly into Bevy's
+    /// columns — no copying, so mutable terms still write straight through.
+    pub(crate) fn fill(&mut self, world: &mut World, buffer: &mut QueryBuffer, last_run: Tick) {
         self.refresh(world);
+        let this_run = world.change_tick();
         let needs_tick = self.terms.iter().any(|term| term.mutable);
-        let tick = needs_tick.then(|| world.change_tick());
         let has_entity_term = self.terms.iter().any(|term| term.component.is_none());
+        let change_filters: Vec<(ComponentId, QueryFilterKind)> = self
+            .filters
+            .iter()
+            .copied()
+            .filter(|(_, kind)| kind.is_change())
+            .collect();
         let total_rows = if has_entity_term {
             self.tables
                 .iter()
@@ -713,46 +729,108 @@ impl QueryPlan {
             if rows == 0 {
                 continue;
             }
-            let entity_addr = if has_entity_term {
-                let start = buffer.entity_bits.len();
-                buffer
-                    .entity_bits
-                    .extend(table.entities().iter().map(|entity| entity.to_bits()));
-                unsafe { buffer.entity_bits.as_mut_ptr().add(start) as usize as u64 }
-            } else {
-                0
-            };
-            buffer.columns.clear();
-            for term in &self.terms {
-                if let Some(component) = term.component {
-                    let Some(column) = table.get_column(component) else {
-                        buffer.columns.clear();
+
+            // Per-row change filters need the tick column for each component.
+            let mut tick_slices: Vec<(&[std::cell::UnsafeCell<Tick>], QueryFilterKind)> =
+                Vec::with_capacity(change_filters.len());
+            let mut missing_slice = false;
+            for (component, kind) in &change_filters {
+                let slice = if *kind == QueryFilterKind::Added {
+                    table.get_added_ticks_slice_for(*component)
+                } else {
+                    table.get_changed_ticks_slice_for(*component)
+                };
+                match slice {
+                    Some(slice) => tick_slices.push((slice, *kind)),
+                    None => {
+                        missing_slice = true;
                         break;
-                    };
-                    let ptr = unsafe {
-                        column
-                            .get_data_unchecked(TableRow::new(
-                                NonMaxU32::new(0).expect("zero is not the NonMaxU32 sentinel"),
-                            ))
-                            .as_ptr()
-                    };
-                    buffer.columns.push(ptr as usize as u64);
-                    if term.mutable {
-                        if let Some(tick) = tick {
+                    }
+                }
+            }
+            if missing_slice {
+                continue;
+            }
+
+            // Contiguous runs of rows that pass every change filter.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            let mut run_start: Option<usize> = None;
+            for row in 0..rows {
+                let pass = tick_slices.iter().all(|(slice, _)| unsafe {
+                    (*slice[row].get()).is_newer_than(last_run, this_run)
+                });
+                if pass {
+                    if run_start.is_none() {
+                        run_start = Some(row);
+                    }
+                } else if let Some(start) = run_start.take() {
+                    runs.push((start, row));
+                }
+            }
+            if let Some(start) = run_start {
+                runs.push((start, rows));
+            }
+            if runs.is_empty() {
+                continue;
+            }
+
+            let entity_base = buffer.entity_bits.len();
+            if has_entity_term {
+                for (start, end) in &runs {
+                    buffer.entity_bits.extend(
+                        table
+                            .entities()
+                            .iter()
+                            .skip(*start)
+                            .take(*end - *start)
+                            .map(|entity| entity.to_bits()),
+                    );
+                }
+            }
+
+            let mut entity_offset = 0usize;
+            for (run_start, run_end) in runs {
+                buffer.columns.clear();
+                for term in &self.terms {
+                    if let Some(component) = term.component {
+                        let Some(column) = table.get_column(component) else {
+                            buffer.columns.clear();
+                            break;
+                        };
+                        let ptr = unsafe {
+                            column
+                                .get_data_unchecked(TableRow::new(
+                                    NonMaxU32::new(run_start as u32)
+                                        .expect("table row fits NonMaxU32"),
+                                ))
+                                .as_ptr()
+                        };
+                        buffer.columns.push(ptr as usize as u64);
+                        if term.mutable && needs_tick {
                             if let Some(changed) = table.get_changed_ticks_slice_for(component) {
-                                for cell in changed {
-                                    unsafe { *cell.get() = tick };
+                                for cell in changed.iter().take(run_end).skip(run_start) {
+                                    unsafe { *cell.get() = this_run };
                                 }
                             }
                         }
+                    } else {
+                        let base = unsafe {
+                            buffer.entity_bits.as_mut_ptr().add(entity_base + entity_offset)
+                        };
+                        buffer.columns.push(base as usize as u64);
                     }
-                } else {
-                    buffer.columns.push(entity_addr);
                 }
-            }
-            if buffer.columns.len() == self.terms.len() {
-                tesjit::abi::write_chunk_addrs(&mut buffer.chunks, rows as u64, &buffer.columns);
-                buffer.chunk_count += 1;
+                if has_entity_term {
+                    entity_offset += run_end - run_start;
+                }
+                if buffer.columns.len() == self.terms.len() {
+                    tesjit::abi::write_chunk_addrs(
+                        &mut buffer.chunks,
+                        (run_end - run_start) as u64,
+                        &buffer.columns,
+                    );
+                    buffer.chunk_count += 1;
+                }
             }
         }
         buffer.input = QueryInput {
@@ -956,6 +1034,9 @@ pub(crate) struct QuerySystem {
     pub(crate) name: String,
     params: Vec<LinkedParam>,
     args: Vec<i64>,
+    /// Change tick from the previous run. `None` until the first tick, where
+    /// every component reads as newly added (matching Bevy's system semantics).
+    last_run: Option<Tick>,
 }
 
 enum LinkedParam {
@@ -1054,15 +1135,19 @@ impl QuerySystem {
             name: name.to_owned(),
             params: linked,
             args: Vec::new(),
+            last_run: None,
         })
     }
 
     pub(crate) fn args(&mut self, world: &mut World) -> Option<&[i64]> {
         self.args.clear();
+        // Tick 0 means "never run": every component is newly added on the
+        // first tick, so change-detection queries behave like Bevy's.
+        let last_run = self.last_run.unwrap_or(Tick::new(0));
         for param in &mut self.params {
             match param {
                 LinkedParam::Query { plan, buffer } => {
-                    plan.fill(world, buffer);
+                    plan.fill(world, buffer, last_run);
                     self.args
                         .push(&buffer.input as *const QueryInput as usize as i64);
                 }
@@ -1087,6 +1172,13 @@ impl QuerySystem {
             }
         }
         Some(&self.args)
+    }
+
+    /// Advance this system's change-detection cursor after it has run. Called
+    /// for every system each tick, including ones that were skipped, so a
+    /// skipped system never sees stale "changed" rows forever.
+    pub(crate) fn finish_tick(&mut self, world: &World) {
+        self.last_run = Some(world.change_tick());
     }
 
     pub(crate) fn apply_commands(&mut self, world: &mut World) {

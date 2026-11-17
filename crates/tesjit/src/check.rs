@@ -1723,6 +1723,47 @@ impl<'a, 'l> FnCtx<'a, 'l> {
                         );
                     }
                 }
+                if let Expression::StaticMemberExpression(member) = &c.callee
+                    && member.property.name.as_str() == "get"
+                {
+                    let world = self.expr(&member.object, None);
+                    if world.ty == Ty::World {
+                        if c.arguments.len() != 1 {
+                            return self.poison(c.span, "world.get<T> takes exactly one entity");
+                        }
+                        let Some(entity) = c.arguments.first().and_then(|a| a.as_expression())
+                        else {
+                            return self.poison(c.span, "spread world.get arguments are unsupported");
+                        };
+                        let entity = self.expr(entity, None);
+                        if entity.ty != Ty::Entity {
+                            return self.poison(entity.span, "world.get<T> expects an Entity");
+                        }
+                        let Some(args) = c.type_arguments.as_ref() else {
+                            return self.poison(c.span, "world.get requires an explicit type <T>");
+                        };
+                        if args.params.len() != 1 {
+                            return self.poison(c.span, "world.get<T> requires exactly one type");
+                        }
+                        let ty = match self.lowerer.resolve_ty(&args.params[0]) {
+                            Ok(ty) => ty,
+                            Err(error) => return self.poison(c.span, error.to_string()),
+                        };
+                        let Some(layout) = ty.struct_layout() else {
+                            return self.poison(c.span, "world.get<T> requires a component type");
+                        };
+                        let result = Ty::Option(Box::new(Ty::Struct(layout.clone())));
+                        return Expr::new(
+                            ExprKind::WorldGet {
+                                world: Box::new(world),
+                                entity: Box::new(entity),
+                                layout,
+                            },
+                            result,
+                            c.span,
+                        );
+                    }
+                }
                 // Option<T> constructors.
                 if let Expression::Identifier(id) = &c.callee {
                     match id.name.as_str() {
@@ -2292,6 +2333,9 @@ fn ty_of_x(
                         Ty::Tuple(mut elements) if elements.len() == 1 => elements.remove(0),
                         row => row,
                     };
+                    // Inline `Added<T>` / `Changed<T>` terms are sugar: they
+                    // borrow T read-only and contribute a row-level filter.
+                    let (row, inline_filters) = desugar_query_row(row)?;
                     let terms = match &row {
                         Ty::Tuple(elements) => elements.as_slice(),
                         _ => std::slice::from_ref(&row),
@@ -2317,12 +2361,13 @@ fn ty_of_x(
                             }
                         }
                     }
-                    let filters = args
+                    let mut filters = args
                         .params
                         .get(1)
                         .map(|filter_ty| query_filters_in(filter_ty, host, env))
                         .transpose()?
                         .unwrap_or_default();
+                    filters.extend(inline_filters);
                     Ok(Ty::Query(Box::new(row), filters))
                 }
                 "Res" => {
@@ -2370,6 +2415,24 @@ fn ty_of_x(
                     Ok(Ty::Resource(Box::new(inner)))
                 }
                 "Commands" => Ok(Ty::Commands),
+                "World" => Ok(Ty::World),
+                "Added" | "Changed" => {
+                    let kind = id.name.as_str();
+                    let args = r.type_arguments.as_ref().ok_or_else(|| {
+                        crate::diag::plain(format!("{kind}<T> requires <T>"))
+                    })?;
+                    if args.params.len() != 1 {
+                        return Err(crate::diag::plain(format!(
+                            "{kind}<T> requires exactly one component type"
+                        )));
+                    }
+                    let inner = Box::new(ty_of_x(&args.params[0], host, env)?);
+                    Ok(if kind == "Added" {
+                        Ty::Added(inner)
+                    } else {
+                        Ty::Changed(inner)
+                    })
+                }
                 other => {
                     // Look up mod-defined type aliases first, then
                     // host-registered engine components.
@@ -2390,6 +2453,42 @@ fn ty_of_x(
             other.span()
         ))),
     }
+}
+
+/// Turn inline `Added<T>` / `Changed<T>` query terms into a read-only `T`
+/// borrow plus a matching row filter. The filter position is handled by
+/// `query_filter_in`; this only rewrites the row tuple.
+fn desugar_query_row(row: Ty) -> Result<(Ty, Vec<QueryFilter>), CompileError> {
+    fn one(term: Ty, filters: &mut Vec<QueryFilter>) -> Result<Ty, CompileError> {
+        let (kind, inner) = match term {
+            Ty::Added(inner) => (Some(QueryFilterKind::Added), *inner),
+            Ty::Changed(inner) => (Some(QueryFilterKind::Changed), *inner),
+            other => return Ok(other),
+        };
+        let Some(layout) = inner.struct_layout() else {
+            return Err(crate::diag::plain(format!(
+                "{} must name a registered component",
+                kind.unwrap().name()
+            )));
+        };
+        filters.push(QueryFilter {
+            kind: kind.expect("checked above"),
+            component: layout,
+        });
+        Ok(inner)
+    }
+
+    let mut filters = Vec::new();
+    let row = match row {
+        Ty::Tuple(elements) => Ty::Tuple(
+            elements
+                .into_iter()
+                .map(|element| one(element, &mut filters))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        other => one(other, &mut filters)?,
+    };
+    Ok((row, filters))
 }
 
 fn query_filters_in(
@@ -2433,7 +2532,7 @@ fn query_filter_in(
 ) -> Result<QueryFilter, CompileError> {
     let TSType::TSTypeReference(reference) = ty else {
         return Err(crate::diag::plain(
-            "query filters must be With<Component> or Without<Component>".to_string(),
+            "query filters must be With<Component>, Without<Component>, Added<Component> or Changed<Component>".to_string(),
         ));
     };
     let TSTypeName::IdentifierReference(identifier) = &reference.type_name else {
@@ -2444,9 +2543,11 @@ fn query_filter_in(
     let kind = match identifier.name.as_str() {
         "With" => QueryFilterKind::With,
         "Without" => QueryFilterKind::Without,
+        "Added" => QueryFilterKind::Added,
+        "Changed" => QueryFilterKind::Changed,
         other => {
             return Err(crate::diag::plain(format!(
-                "unknown query filter `{other}`; expected With<T> or Without<T>"
+                "unknown query filter `{other}`; expected With<T>, Without<T>, Added<T> or Changed<T>"
             )));
         }
     };
