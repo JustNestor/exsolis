@@ -1177,7 +1177,7 @@ impl QuerySystem {
     /// Advance this system's change-detection cursor after it has run. Called
     /// for every system each tick, including ones that were skipped, so a
     /// skipped system never sees stale "changed" rows forever.
-    pub(crate) fn finish_tick(&mut self, world: &World) {
+    pub(crate) fn finish_tick(&mut self, world: &mut World) {
         self.last_run = Some(world.change_tick());
     }
 
