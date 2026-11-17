@@ -179,9 +179,15 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
         // laid out in fill order, and the entry block (with the parameters)
         // must stay first.
         let trap_block = builder.create_block();
+        // Two independent sandbox guards on entry: recursion depth (native
+        // stack) and fuel (total work). Either failing jumps to trap_block;
+        // depth resets at the next host call via reset_fuel, so no leave is
+        // needed on the trap path.
+        let depth_ok = Self::depth_check(module, sigs, &mut builder);
         let fuel = Self::fuel_check(module, sigs, &mut builder);
+        let guards_ok = builder.ins().band(depth_ok, fuel);
         let body_block = builder.create_block();
-        builder.ins().brif(fuel, body_block, &[], trap_block, &[]);
+        builder.ins().brif(guards_ok, body_block, &[], trap_block, &[]);
         builder.switch_to_block(body_block);
         builder.seal_block(body_block);
 
@@ -228,7 +234,8 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
             .map_err(|e| format!("cranelift: {e:?}"))
     }
 
-    fn default_return(&self, b: &mut FunctionBuilder<'_>) {
+    fn default_return(&mut self, b: &mut FunctionBuilder<'_>) {
+        self.leave_frame(b);
         if self.ret == Ty::Void {
             b.ins().return_(&[]);
         } else {
@@ -280,9 +287,11 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
                 match value {
                     Some(v) => {
                         let val = self.expr(b, v);
+                        self.leave_frame(b);
                         b.ins().return_(&[val]);
                     }
                     None => {
+                        self.leave_frame(b);
                         b.ins().return_(&[]);
                     }
                 }
@@ -1067,6 +1076,32 @@ impl<'s, 'm> FnLowerer<'s, 'm> {
     }
 
     // ───────────────────── place load / store ─────────────────────
+
+    fn depth_check(
+        module: &mut JITModule,
+        sigs: &[(String, FnSig)],
+        b: &mut FunctionBuilder<'_>,
+    ) -> Value {
+        let sig = sigs
+            .iter()
+            .find(|(name, _)| name == Intrinsic::CallDepth.symbol())
+            .map(|(_, sig)| sig.clone())
+            .expect("call-depth helper declared by Jit");
+        let fref = module.declare_func_in_func(sig.id, b.func);
+        let call = b.ins().call(fref, &[]);
+        Self::adapt(b, &sig.ret, &Ty::Bool, b.inst_results(call)[0])
+    }
+
+    fn leave_frame(&mut self, b: &mut FunctionBuilder<'_>) {
+        let sig = self
+            .sigs
+            .iter()
+            .find(|(name, _)| name == Intrinsic::CallDepthLeave.symbol())
+            .map(|(_, sig)| sig.clone())
+            .expect("call-depth-leave helper declared by Jit");
+        let fref = self.module.declare_func_in_func(sig.id, b.func);
+        b.ins().call(fref, &[]);
+    }
 
     fn fuel_check(
         module: &mut JITModule,

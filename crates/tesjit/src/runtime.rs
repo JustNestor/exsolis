@@ -30,8 +30,14 @@ use std::sync::Arc;
 pub const ARENA_CAP: usize = 64 * 1024 * 1024;
 
 /// Default per-call fuel budget: function entries and loop back-edges each
-/// cost one unit, so this bounds both total work and recursion depth.
+/// cost one unit, so this bounds total work.
 pub const DEFAULT_FUEL: u64 = 10_000_000;
+
+/// Maximum nested function calls per host invocation. Distinct from fuel:
+/// fuel bounds total work, this bounds the **native stack depth** so an
+/// unbounded recursion traps before it can overflow the thread stack (test
+/// threads often have only a 2 MiB stack, far shallower than 10M fuel).
+pub const MAX_CALL_DEPTH: u32 = 512;
 
 /// Trap codes, surfaced to the host through [`crate::Compiled::trap`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -195,6 +201,9 @@ pub struct TesjitRuntime {
     trap: RefCell<Option<TrapKind>>,
     /// Remaining fuel for the current call.
     fuel: std::cell::Cell<u64>,
+    /// Nested function calls in the current host invocation. Reset alongside
+    /// fuel; incremented on every function entry by `__tesjit_call_depth`.
+    call_depth: std::cell::Cell<u32>,
     /// Host-owned memory the module may read/write through the region
     /// intrinsics. A Bevy system hands over query rows this way; the JIT side
     /// only ever sees an opaque id plus a bounds-checked offset.
@@ -230,6 +239,7 @@ impl TesjitRuntime {
             arena: RefCell::new(Arena::new()),
             trap: RefCell::new(None),
             fuel: std::cell::Cell::new(DEFAULT_FUEL),
+            call_depth: std::cell::Cell::new(0),
             regions: RefCell::new(Vec::new()),
         }
     }
@@ -282,6 +292,29 @@ impl TesjitRuntime {
     /// Hosts call this before invoking a handler so every entry starts fresh.
     pub fn reset_fuel(&self, fuel: u64) {
         self.fuel.set(fuel);
+        self.call_depth.set(0);
+    }
+
+    /// Nested-call guard, called on every function entry. Returns 1 while it
+    /// is safe to descend, 0 (with a trap) when `MAX_CALL_DEPTH` is reached.
+    /// Reset by [`Self::reset_fuel`] at the start of each host call.
+    fn enter_frame(&self) -> bool {
+        let depth = self.call_depth.get();
+        if depth >= MAX_CALL_DEPTH {
+            *self.trap.borrow_mut() = Some(TrapKind::FuelExhausted);
+            return false;
+        }
+        self.call_depth.set(depth + 1);
+        true
+    }
+
+    /// Release one nested-call frame. Called by JIT code immediately before a
+    /// function returns; saturating so a malformed module cannot underflow.
+    fn leave_frame(&self) {
+        let depth = self.call_depth.get();
+        if depth > 0 {
+            self.call_depth.set(depth - 1);
+        }
     }
 
     /// Fuel still available.
@@ -585,6 +618,19 @@ extern "C" fn arr_set(a: i64, i: i64, elem_size: i64, value: i64) -> i64 {
     value
 }
 
+/// Per-entry call-depth guard. Returns 1 while it is safe to descend, 0 when
+/// the recursion budget is spent (trap recorded).
+extern "C" fn call_depth() -> i64 {
+    i64::from(current().enter_frame())
+}
+
+/// Release one call-depth frame before a function returns. Returns a
+/// machine word so its runtime signature matches the other helpers.
+extern "C" fn call_depth_leave() -> i64 {
+    current().leave_frame();
+    0
+}
+
 /// Fuel check on function entry and loop back-edges.
 ///
 /// Returns 1 while fuel remains, 0 when it ran out (with the trap recorded) —
@@ -808,6 +854,8 @@ extern "C" fn opt_unwrap_f64(p: i64) -> f64 {
 pub fn symbols() -> Vec<(&'static str, *const u8)> {
     vec![
         ("__tesjit_fuel", fuel as *const u8),
+        ("__tesjit_call_depth", call_depth as *const u8),
+        ("__tesjit_call_depth_leave", call_depth_leave as *const u8),
         ("__tesjit_fuel_n", fuel_n as *const u8),
         ("__tesjit_opt_is_some", opt_is_some as *const u8),
         ("__tesjit_opt_unwrap_i64", opt_unwrap_i64 as *const u8),

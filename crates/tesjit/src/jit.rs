@@ -481,6 +481,8 @@ impl Jit {
         use Ty::{Ptr, Str};
         vec![
             ("__tesjit_fuel", vec![], Ty::Ptr),
+            ("__tesjit_call_depth", vec![], Ty::Ptr),
+            ("__tesjit_call_depth_leave", vec![], Ty::Ptr),
             ("__tesjit_fuel_n", vec![Ty::I64], Ty::Ptr),
             ("__tesjit_alloc", vec![Ptr], Ptr),
             ("__tesjit_str_wrap", vec![Ptr, Ptr], Str),

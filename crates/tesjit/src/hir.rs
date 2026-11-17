@@ -239,6 +239,14 @@ pub enum CallTarget {
 pub enum Intrinsic {
     /// Fuel guard: `() -> boolean` (false when the budget ran out).
     Fuel,
+    /// Per-call depth guard: `() -> boolean` (false when recursion is too deep).
+    /// Incremented on each function entry, reset by `reset_fuel` at the top of
+    /// a host call. Bounds the native stack independently of the fuel budget,
+    /// so an infinite recursion traps before it can overflow the thread stack.
+    CallDepth,
+    /// Per-call depth release: `() -> void`, called just before a function
+    /// returns so sequential (non-recursive) calls do not accumulate.
+    CallDepthLeave,
     /// Chunk fuel guard: `(row_count: i64) -> boolean`.
     FuelN,
     /// Wrap `.rodata` bytes as an arena string: `(ptr, len) -> str`.
@@ -309,6 +317,8 @@ impl Intrinsic {
     pub fn symbol(self) -> &'static str {
         match self {
             Intrinsic::Fuel => "__tesjit_fuel",
+            Intrinsic::CallDepth => "__tesjit_call_depth",
+            Intrinsic::CallDepthLeave => "__tesjit_call_depth_leave",
             Intrinsic::FuelN => "__tesjit_fuel_n",
             Intrinsic::StrWrap => "__tesjit_str_wrap",
             Intrinsic::StrLen => "__tesjit_str_len",
