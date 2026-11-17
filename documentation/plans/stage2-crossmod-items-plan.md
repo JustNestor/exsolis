@@ -1,6 +1,9 @@
 # Stage 2 — Cross-mod types + Item entities + core hygiene
 
-- **Status:** ready for implementation
+- **Status:** Part C done (partial C3), Part A done (with limitation), Part B pending
+- **Progress log (2026-11-17):**
+  - Part C `[x]` C1/C2 done: `HotbarSyncLog`/`send_inventory_sync`/`hotbar_diff`/`sync_new_inventories` moved to `server/src/inventory_sync.rs` (+ `InventorySyncPlugin`); `send_hud` moved to `ui.rs`. **C3 deliberately partial:** `CreativePlugin`, `handle_creative_give`, `give_stack`, `apply_inventory_clicks`, `sorted_block_names` remain in `creative.rs` — removing them now (before Lua removal + first authored bundle) would break inventory/creative flow. Revisit when the game layer exists.
+  - Part A `[x]` done: tesjit parses `import type { T } from "source"` (`@ns/name` → `ns:Name`), binds local name to the host-registered layout; TOML `mods/ts/<id>.toml` with `dependencies` only (`server/src/mod_manifest.rs`), missing deps → hard error; `toml = 0.8` + `serde` added. **Limitation:** mod components must currently be registered on the Rust side (via `TsSchemaRegistry`/Bevy world) to be queryable — pure-TS dynamic component registration (`World::register_component` with a dynamic layout) is future work; `QueryPlan::link` looks up `ComponentId`, which only Bevy-registered components have.
 - **Date:** 2026-11-17
 - **Branch:** `plan/next-stage` (created from `main` after the change-detection merge)
 - **Depends on:** change detection in `main` (`Added`/`Changed`, `world.get<T>`, `QuerySystem::finish_tick`)
