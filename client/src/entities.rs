@@ -12,11 +12,14 @@ use bevy_ecs::prelude::*;
 use bevy_log::{debug, warn};
 use bevy_time::Time;
 use bevy_transform::prelude::{GlobalTransform, Transform};
-use exsolis_common::{EntityId, EntityKind, EntityState, PlayerId, ServerMessage};
+use exsolis_common::{
+    BlockAnimMask, BlockAnimState, EntityId, EntityKind, EntityState, PlayerId, ServerMessage,
+};
 use glam::{EulerRot, Quat, Vec3};
 
-use crate::anim::Animator;
-use crate::gltf::GltfModelInstance;
+use crate::anim::{Animator, Easing, Mask, Transition};
+use crate::blocks::ClientAnimCatalog;
+use crate::gltf::{GltfModelInstance, GltfModels};
 
 /// Hide third-person player avatars while viewmodel/inventory work is in
 /// progress. Flip back when avatars should render again.
@@ -59,6 +62,18 @@ pub struct EntityNetState(pub EntityState);
 /// chases this instead of snapping to whatever the last packet said.
 #[derive(Component, Debug, Clone, Copy)]
 pub struct EntityTarget(pub EntityState);
+
+/// Animation state the server assigned to an entity's block — doors opening,
+/// beds being slept in, and whatever else the block animation config knows.
+/// Inserted from [`ServerMessage::BlockAnimState`]; the block animation
+/// driver in this module poses the owning entity's `Animator` from it.
+#[derive(Component, Debug, Clone, PartialEq, Eq, Hash)]
+pub struct EntityAnimState {
+    /// Block (master) the state belongs to, registry name.
+    pub block: String,
+    /// Pose the block's model should be in.
+    pub state: BlockAnimState,
+}
 
 /// Entity ids keyed by the ECS entity that represents them.
 #[derive(Resource, Default)]
@@ -103,6 +118,7 @@ impl Plugin for EntityClientPlugin {
                 receive_entity_messages,
                 hide_local_player_body,
                 follow_entity_targets,
+                drive_block_animations,
             )
                 .chain()
                 .in_set(GameplaySet),
@@ -195,6 +211,23 @@ fn receive_entity_messages(
                     .entity(entity)
                     .insert((EntityNetState(*state), EntityTarget(*state)));
             }
+            ServerMessage::BlockAnimState {
+                entity_id,
+                block,
+                state,
+            } => {
+                let Some(entity) = entities.entity_of(*entity_id) else {
+                    // Same reasoning as EntityStateUpdate above: a state for an
+                    // entity we never saw spawn only happens on mid-session
+                    // joins. Wait for the spawn.
+                    continue;
+                };
+                debug!("block anim state update: entity {entity_id} block {block} -> {:?}", state);
+                commands.entity(entity).insert(EntityAnimState {
+                    block: block.clone(),
+                    state: *state,
+                });
+            }
             ServerMessage::DespawnEntity { entity_id } => {
                 if let Some(entity) = entities.entity_of(*entity_id) {
                     commands.entity(entity).despawn();
@@ -277,5 +310,72 @@ fn follow_entity_targets(
             // rest pose instead of playing a walk cycle in place.
             animator.speed = 0.0;
         }
+    }
+}
+
+/// Cross-fade duration used when a block anim set declares no transition for
+/// a state change. Matches the default transition the clip graph uses.
+const BLOCK_TRANSITION_DURATION: f32 = 0.25;
+
+/// Drive block-entity animations from the server-authoritative state.
+///
+/// The server owns *which* state a block entity is in (see
+/// [`ServerMessage::BlockAnimState`]); this system resolves that state
+/// through the block animation catalog to the clip that poses it and asks the
+/// entity's `Animator` to play it, cross-fading along the transition the
+/// block's anim set declared (falling back to a default settle).
+fn drive_block_animations(
+    mut query: Query<(&mut Animator, Option<&EntityAnimState>, &GltfModelInstance)>,
+    mut models: ResMut<GltfModels>,
+    anims: Res<ClientAnimCatalog>,
+) {
+    for (mut animator, state, instance) in &mut query {
+        let Some(state) = state else {
+            continue;
+        };
+        let Some(set) = anims.get(&state.block) else {
+            continue;
+        };
+        let Some(clip) = set.clip_for(state.state) else {
+            continue;
+        };
+        let Some(skeleton) = models.skeletons.get_mut(&instance.model_path) else {
+            continue;
+        };
+        let Some(to_clip) = skeleton.clip_index_by_name(&clip.name) else {
+            warn!(
+                "gltf {}: no clip named {:?} for block anim {:?} (block {})",
+                instance.model_path, clip.name, state.state, state.block
+            );
+            continue;
+        };
+        let from_clip = animator.current.clip;
+        if to_clip == from_clip {
+            continue;
+        }
+        let from_name = skeleton.clips.get(from_clip as usize).map(|c| c.name.clone());
+        let from_state = from_name
+            .as_deref()
+            .and_then(|n| set.state_for_clip_name(n))
+            .unwrap_or(state.state);
+        let authored = set.transition(from_state, state.state);
+        let duration = authored
+            .map(|t| t.duration)
+            .unwrap_or(BLOCK_TRANSITION_DURATION);
+        let mask = match authored.map(|t| t.mask).unwrap_or_default() {
+            BlockAnimMask::Full => Mask::Full,
+            BlockAnimMask::Upper => Mask::UpperBody,
+            BlockAnimMask::Lower => Mask::LowerBody,
+        };
+        let transition = Transition {
+            duration,
+            easing: Easing::CubicInOut,
+            mask,
+        };
+        // `Animator::play` ignores its transition argument; the renderer asks
+        // the skeleton for the blend along `(from_clip, to_clip)`, so the
+        // authored duration/mask has to live in `overrides`.
+        skeleton.overrides.insert((from_clip, to_clip), transition);
+        animator.play(to_clip, transition);
     }
 }

@@ -1,0 +1,13 @@
+{
+  "$comment": "Block animation sets. Keyed by block name (the master for multiblock parts); each set describes the states a block can be in, the clip that poses each state, and how the runtime cross-fades between states (duration + optional mask: full | upper | lower). Server-authoritative state changes flow to clients as BlockAnimState and drive playback by clip name.",
+  "minecraft:oak_door": {
+    "states": ["closed", "open"],
+    "clips": {
+      "closed": { "name": "door_closed", "duration": 0.2 },
+      "open": { "name": "door_open", "duration": 0.4 }
+    },
+    "transitions": [
+      { "from": "closed", "to": "open", "duration": 0.25 }
+    ]
+  }
+}

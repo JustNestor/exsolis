@@ -12,7 +12,7 @@ use bevy_transform::prelude::Transform;
 use exsolis_common::{AIR_ID, BlockId, BlockPos, ClientMessage, HOTBAR_SIZE};
 use glam::{IVec3, Vec3};
 
-use crate::blocks::ClientBlocks;
+use crate::blocks::{ClientAnimCatalog, ClientBlocks};
 use crate::chunk::{CHUNK_SIZE_I32, Chunk};
 use crate::chunk_registry::ChunkRegistry;
 use crate::net::{GameplaySet, NetConnected, OutgoingPacket};
@@ -384,6 +384,9 @@ fn handle_place_input(
     mut outgoing: MessageWriter<OutgoingPacket>,
     inventory: Res<ClientInventory>,
     blocks: Option<Res<ClientBlocks>>,
+    anims: Res<ClientAnimCatalog>,
+    registry: Res<ChunkRegistry>,
+    chunks: Query<&Chunk>,
     query: Query<&BlockTargeting, With<LocalPlayer>>,
 ) {
     if !mouse.pressed(MouseButton::Right) {
@@ -404,14 +407,6 @@ fn handle_place_input(
         return;
     }
 
-    let Some(item) = inventory.selected_item() else {
-        warn!(
-            "[PlaceBlock] Right click pressed, but ClientInventory selected slot {} is empty/None! (slots: {:?})",
-            inventory.selected, inventory.slots
-        );
-        return;
-    };
-
     if query.is_empty() {
         warn!(
             "[PlaceBlock] Right click pressed, but query for LocalPlayer + BlockTargeting returned NO entities!"
@@ -423,6 +418,48 @@ fn handle_place_input(
         let Some(target) = targeting.target else {
             warn!(
                 "[PlaceBlock] Right click pressed, but BlockTargeting.target is None (raycast hit air, unloaded chunk, or reached max distance)"
+            );
+            continue;
+        };
+
+        // A right-click that lands on an existing animating block (a door, a
+        // bed, ...) is a *use*, not a placement: drive the block's animation
+        // state through `UseBlock` instead of placing one. Only on the initial
+        // press — holding the button must not keep toggling the block.
+        let use_action = read_block(&registry, &chunks, target.pos).and_then(|id| {
+            let blocks = blocks.as_ref()?;
+            let mut name = blocks.0.def(id)?.name.clone();
+            // Multiblock parts resolve to their master's animation set.
+            if let Some(master) = blocks.0.master_for_part(&name)
+                && let Some(master_name) = blocks.0.def(master)
+            {
+                name = master_name.name.clone();
+            }
+            anims
+                .get(&name)
+                .filter(|s| s.states.len() > 1)
+                .map(|_| "toggle".to_string())
+        });
+        if let Some(action) = use_action {
+            if !mouse.just_pressed(MouseButton::Right) {
+                continue;
+            }
+            info!(
+                "[UseBlock] Sending UseBlock packet for pos {:?} action {action}",
+                target.pos
+            );
+            outgoing.write(OutgoingPacket::reliable(ClientMessage::UseBlock {
+                pos: BlockPos::new(target.pos.x, target.pos.y, target.pos.z),
+                action,
+            }));
+            continue;
+        }
+
+        // An empty hand can still *use* a block (above), just not place one.
+        let Some(item) = inventory.selected_item() else {
+            warn!(
+                "[PlaceBlock] Right click pressed, but ClientInventory selected slot {} is empty/None! (slots: {:?})",
+                inventory.selected, inventory.slots
             );
             continue;
         };

@@ -40,6 +40,12 @@ pub enum EntityKind {
 | `SpawnEntity { entity_id, kind, state, model, scale, player_id }` | reliable | Bring an entity into existence. |
 | `DespawnEntity { entity_id }` | reliable | Remove it. Unknown ids are ignored. |
 | `EntityStateUpdate { entity_id, state }` | unreliable | It moved. |
+| `BlockAnimState { entity_id, block, state }` | reliable | A block entity's animation state changed server-side; clients cross-fade to the clip the state names. |
+
+Client → server, for the same system: `ClientMessage::UseBlock { pos, action }`
+(reliable ordered) is the *intent*; the server resolves the action against the
+block's animation set and owns the resulting state. See
+[Block animation states](#block-animation-states-server-authoritative).
 
 `model` is a catalog asset path (`models/girl.glb`) or `None` for entities that render nothing on their own — a block entity renders *its block*, not a model. `player_id` is set only for `EntityKind::Player`, so the client can correlate the avatar with `YourPlayerId` and with mod effects that address players by id.
 
@@ -138,6 +144,51 @@ The reason for roles rather than names is in the source:
 `is_locomotion()` selects the walking family; `is_additive()` marks the clips that must never be entered through the transition graph because they layer on top of another clip. A clip's natural speed comes from its **root motion**, not from its name.
 
 The locomotion clip is chosen from the server's `speed` and `airborne` flags.
+
+### Block animation states (server-authoritative)
+
+Block entities can be posed by a small state machine instead of a locomotion
+clip. The player only ever asks; the server owns the answer:
+
+```
+right-click an animated block
+ → ClientMessage::UseBlock { pos, action }            (reliable, action ≤ 32 B)
+ → server: resolve the block's set, map the action, validate the state
+ → ServerMessage::BlockAnimState { entity_id, block, state }   (broadcast, reliable)
+ → client: EntityAnimState component → drive_block_animations
+```
+
+The catalog is `assets/animations/blocks.json`, read by **both** sides
+(`BlockAnimCatalog::from_json`), keyed by block name — the multiblock master
+for structures like doors, since parts resolve to it (`break_cells` gives the
+master cell, which is where the block entity lives):
+
+```json
+{
+  "minecraft:oak_door": {
+    "states": ["closed", "open"],
+    "clips": {
+      "closed": { "name": "door_closed", "duration": 0.2 },
+      "open":   { "name": "door_open",   "duration": 0.4 }
+    },
+    "transitions": [
+      { "from": "closed", "to": "open", "duration": 0.25 },
+      { "from": "open", "to": "closed", "duration": 0.25, "mask": "lower" }
+    ]
+  }
+}
+```
+
+`states` is the set of legal poses (`BlockAnimState`, appended-only wire enum);
+`clips` names the authored clip that poses each state; `transitions` gives the
+cross-fade duration and an optional `mask` (`full` | `upper` | `lower`, default
+`full`) so a background branch can keep animating. Authored block clips are
+looked up by **name** (`Skeleton::clip_index_by_name`), which is why block
+sets carry their own `overrides` map instead of the gameplay `ClipRole` table.
+
+Prerequisites for a block actually animating: it must have a block entity
+(the state is stored on the entity record and addressed by `entity_id`), and
+its render model must be a glTF whose clips carry the names used in `clips`.
 
 ## The first-person viewmodel
 

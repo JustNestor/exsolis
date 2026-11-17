@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Face;
+use crate::{BlockAnimState, Face};
 
 /// Numeric block handle. `0` is always air.
 pub type BlockId = u16;
@@ -80,11 +80,18 @@ impl Facing {
         if a < -PI {
             a += 2.0 * PI;
         }
-        if a.abs() <= PI / 4.0 {
+        let half = PI / 4.0;
+        let three_quarters = 3.0 * half; // 135°
+        // The camera looks along `forward = (-sin yaw, -cos yaw)` with yaw 0
+        // down -Z (north) and east = +X, so *positive* yaw turns west. This
+        // matches Minecraft's `facing` property ("the direction the player
+        // faces"). Quadrant boundaries sit on the diagonals (±45°, ±135°), so
+        // a placement resolves to the cardinal the player actually looked at.
+        if a.abs() <= half {
             Facing::North
-        } else if a > PI / 4.0 && a < 3.0 * PI / 4.0 {
+        } else if a > half && a <= three_quarters {
             Facing::West
-        } else if a < -PI / 4.0 && a > -3.0 * PI / 4.0 {
+        } else if a > -three_quarters && a < -half {
             Facing::East
         } else {
             Facing::South
@@ -532,6 +539,219 @@ pub fn is_air_like_name(name: &str) -> bool {
     )
 }
 
+// ---------------------------------------------------------------- block anim --
+
+/// One clip that poses a block in a given animation state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockAnimClip {
+    /// Name of the animation clip as authored (glTF `animation.name`, or the
+    /// bbmodel animator name). The client resolves it to a skeleton clip
+    /// index when the model is loaded.
+    pub name: String,
+    /// Clip duration in seconds; cross-fades should not outlast it.
+    pub duration: f32,
+}
+
+/// Which half of the rig a state transition blends, for models that pose
+/// independent branches (a chest lid is upper body; a door swinging is
+/// full body). Mirrors the client's `anim::Mask`; `Common` cannot name a
+/// client type, so the driver maps between the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BlockAnimMask {
+    /// Blend every joint.
+    #[default]
+    Full,
+    /// Blend head/hair/upper-body joints only.
+    Upper,
+    /// Blend hips/legs only.
+    Lower,
+}
+
+impl BlockAnimMask {
+    /// Stable name used by the animation config files.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlockAnimMask::Full => "full",
+            BlockAnimMask::Upper => "upper",
+            BlockAnimMask::Lower => "lower",
+        }
+    }
+
+    /// Inverse of [`BlockAnimMask::as_str`]; `None` for unknown masks.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "full" => Some(BlockAnimMask::Full),
+            "upper" | "upper_body" => Some(BlockAnimMask::Upper),
+            "lower" | "lower_body" => Some(BlockAnimMask::Lower),
+            _ => None,
+        }
+    }
+}
+
+/// One directed transition between two animation states: how long the
+/// cross-fade runs and which part of the rig it is allowed to move.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BlockAnimTransition {
+    pub from: BlockAnimState,
+    pub to: BlockAnimState,
+    pub duration: f32,
+    pub mask: BlockAnimMask,
+}
+
+/// Animation set for one block (a master, or the root of a multiblock such
+/// as a door or bed). The config file describes *how* the block animates and
+/// *between which states*; the runtime just plays the clip a state names and
+/// cross-fades along the transition durations, optionally masking the blend
+/// to one half of the rig.
+#[derive(Debug, Clone, Default)]
+pub struct BlockAnimSet {
+    pub block: String,
+    /// States this set knows about, in config order. The first state is the
+    /// at-rest pose.
+    pub states: Vec<BlockAnimState>,
+    /// State -> clip.
+    pub clips: HashMap<BlockAnimState, BlockAnimClip>,
+    /// Directed transitions between states, e.g. closed -> open.
+    pub transitions: Vec<BlockAnimTransition>,
+}
+
+impl BlockAnimSet {
+    /// The clip that poses `state`, if the set defines one.
+    pub fn clip_for(&self, state: BlockAnimState) -> Option<&BlockAnimClip> {
+        self.clips.get(&state)
+    }
+
+    /// The state whose clip has the given authoring name, if any.
+    pub fn state_for_clip_name(&self, name: &str) -> Option<BlockAnimState> {
+        self.clips
+            .iter()
+            .find(|(_, clip)| clip.name == name)
+            .map(|(state, _)| *state)
+    }
+
+    /// Duration of the transition `from -> to`, if the set defines one.
+    pub fn transition_duration(&self, from: BlockAnimState, to: BlockAnimState) -> Option<f32> {
+        self.transition(from, to).map(|t| t.duration)
+    }
+
+    /// The transition `from -> to`, if the set defines one.
+    pub fn transition(
+        &self,
+        from: BlockAnimState,
+        to: BlockAnimState,
+    ) -> Option<&BlockAnimTransition> {
+        self.transitions.iter().find(|t| t.from == from && t.to == to)
+    }
+}
+
+/// Catalog of block animation sets, keyed by block name (master for
+/// multiblock parts).
+#[derive(Debug, Clone, Default)]
+pub struct BlockAnimCatalog {
+    pub sets: HashMap<String, BlockAnimSet>,
+}
+
+impl BlockAnimCatalog {
+    /// Parse a block animation catalog from its JSON document:
+    ///
+    /// ```json
+    /// {
+    ///   "minecraft:oak_door": {
+    ///     "states": ["closed", "open"],
+    ///     "clips": {
+    ///       "closed": { "name": "door_closed", "duration": 0.2 },
+    ///       "open": { "name": "door_open", "duration": 0.4 }
+    ///     },
+    ///     "transitions": [
+    ///       { "from": "closed", "to": "open", "duration": 0.25 },
+    ///       { "from": "open", "to": "closed", "duration": 0.25, "mask": "lower" }
+    ///     ]
+    ///   }
+    /// }
+    /// ```
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let doc: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("parse block anims: {e}"))?;
+        let mut sets = HashMap::new();
+        let Some(obj) = doc.as_object() else {
+            return Err("block anims: top level must be an object".to_string());
+        };
+        for (block, value) in obj {
+            let Some(set) = value.as_object() else {
+                continue; // skip malformed entries
+            };
+            let mut states = Vec::new();
+            if let Some(arr) = set.get("states").and_then(|v| v.as_array()) {
+                for s in arr {
+                    if let Some(state) = BlockAnimState::parse(s.as_str().unwrap_or("")) {
+                        states.push(state);
+                    }
+                }
+            }
+            let mut clips = HashMap::new();
+            if let Some(clips_obj) = set.get("clips").and_then(|v| v.as_object()) {
+                for (state, clip) in clips_obj {
+                    let Some(clip) = clip.as_object() else { continue };
+                    let name = clip.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+                    let duration = clip
+                        .get("duration")
+                        .and_then(|d| d.as_f64())
+                        .unwrap_or(0.0) as f32;
+                    if let Some(state) = BlockAnimState::parse(state) {
+                        clips.insert(state, BlockAnimClip { name, duration });
+                    }
+                }
+            }
+            let mut transitions = Vec::new();
+            if let Some(trs) = set.get("transitions").and_then(|v| v.as_array()) {
+                for t in trs {
+                    let Some(t) = t.as_object() else { continue };
+                    let Some(from) = BlockAnimState::parse(
+                        t.get("from").and_then(|v| v.as_str()).unwrap_or(""),
+                    ) else {
+                        continue;
+                    };
+                    let Some(to) = BlockAnimState::parse(
+                        t.get("to").and_then(|v| v.as_str()).unwrap_or(""),
+                    ) else {
+                        continue;
+                    };
+                    let duration = t.get("duration").and_then(|d| d.as_f64()).unwrap_or(0.0) as f32;
+                    let mask = t
+                        .get("mask")
+                        .and_then(|m| m.as_str())
+                        .and_then(BlockAnimMask::parse)
+                        .unwrap_or_default();
+                    transitions.push(BlockAnimTransition {
+                        from,
+                        to,
+                        duration,
+                        mask,
+                    });
+                }
+            }
+            if states.is_empty() && clips.is_empty() && transitions.is_empty() {
+                continue; // nothing usable declared for this block
+            }
+            sets.insert(
+                block.clone(),
+                BlockAnimSet {
+                    block: block.clone(),
+                    states,
+                    clips,
+                    transitions,
+                },
+            );
+        }
+        Ok(Self { sets })
+    }
+
+    /// The animation set for a block, if the catalog declares one.
+    pub fn get(&self, block: &str) -> Option<&BlockAnimSet> {
+        self.sets.get(block)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -550,6 +770,8 @@ mod tests {
     #[test]
     fn facing_from_yaw_cardinals() {
         use std::f32::consts::PI;
+        // Yaw 0 looks north; the camera's forward is (-sin yaw, -cos yaw),
+        // so positive yaw (mouse left) turns west and negative yaw east.
         assert_eq!(Facing::from_yaw(0.0), Facing::North);
         assert_eq!(Facing::from_yaw(-PI / 2.0), Facing::East);
         assert_eq!(Facing::from_yaw(PI / 2.0), Facing::West);
@@ -557,9 +779,49 @@ mod tests {
     }
 
     #[test]
+    fn facing_from_yaw_quadrants() {
+        use std::f32::consts::PI;
+        // Diagonals sit exactly on the ±45° boundaries; ties fall to north.
+        assert_eq!(Facing::from_yaw(PI / 4.0), Facing::North);
+        assert_eq!(Facing::from_yaw(-PI / 4.0), Facing::North);
+        // ... and the ±135° boundaries tie to the north/south side.
+        assert_eq!(Facing::from_yaw(3.0 * (PI / 4.0)), Facing::West);
+        assert_eq!(Facing::from_yaw(-3.0 * (PI / 4.0)), Facing::South);
+        // Mid-range values must agree with the cardinal neighbours.
+        assert_eq!(Facing::from_yaw(0.0), Facing::North);
+        assert_eq!(Facing::from_yaw(1.2), Facing::West);
+        assert_eq!(Facing::from_yaw(2.5), Facing::South);
+        assert_eq!(Facing::from_yaw(4.0), Facing::East);
+    }
+
+    #[test]
+    fn facing_matches_the_camera_forward_vector() {
+        // The invariant that matters for placement: `Facing` names the world
+        // direction the player looks, and the camera forward is
+        // `(-sin yaw, -cos yaw)` with north = -Z, east = +X. If the two ever
+        // disagree, beds/doors land on the wrong side and stairs turn around.
+        for deg in [
+            -170.0f32, -130.0, -100.0, -80.0, -50.0, -20.0, 0.0, 20.0, 50.0, 80.0, 100.0,
+            130.0, 170.0, 180.0, -180.0,
+        ] {
+            let yaw = deg.to_radians();
+            let (fx, fz) = (-yaw.sin(), -yaw.cos());
+            let expected = if fx.abs() > fz.abs() {
+                if fx > 0.0 { Facing::East } else { Facing::West }
+            } else if fz > 0.0 {
+                Facing::South
+            } else {
+                Facing::North
+            };
+            assert_eq!(Facing::from_yaw(yaw), expected, "yaw {deg}deg");
+        }
+    }
+
+    #[test]
     fn placement_pick_orients() {
         use crate::Face;
-        // Stairs face the player, slabs follow the clicked face.
+        // Stairs take the direction the player faces; slabs follow the
+        // clicked face.
         assert_eq!(
             placement_pick("minecraft:oak_stairs", Face::Top, Facing::East, false),
             Some("minecraft:oak_stairs__facing=east__half=bottom__shape=straight".to_string())
@@ -583,6 +845,64 @@ mod tests {
         );
         assert_eq!(placement_pick("minecraft:torch", Face::Top, Facing::North, false), None);
         assert_eq!(placement_pick("minecraft:stone", Face::Top, Facing::North, false), None);
+    }
+
+    #[test]
+    fn block_anim_catalog_parses_state_clips_and_transitions() {
+        let catalog = BlockAnimCatalog::from_json(
+            r#"{
+                "minecraft:oak_door": {
+                    "states": ["closed", "open"],
+                    "clips": {
+                        "closed": { "name": "door_closed", "duration": 0.2 },
+                        "open": { "name": "door_open", "duration": 0.4 }
+                    },
+                    "transitions": [
+                        { "from": "closed", "to": "open", "duration": 0.25 },
+                        { "from": "open", "to": "closed", "duration": 0.3, "mask": "lower" }
+                    ]
+                }
+            }"#,
+        )
+        .expect("door animation catalog parses");
+        let set = catalog.get("minecraft:oak_door").expect("door set present");
+        assert_eq!(set.states.len(), 2);
+        let open = set.clip_for(BlockAnimState::Open).expect("open clip");
+        assert_eq!(open.name, "door_open");
+        assert!((open.duration - 0.4).abs() < 1e-6);
+        assert_eq!(
+            set.transition_duration(BlockAnimState::Closed, BlockAnimState::Open),
+            Some(0.25)
+        );
+        // An absent mask means a full-body blend; an explicit one is parsed.
+        assert_eq!(
+            set.transition(BlockAnimState::Closed, BlockAnimState::Open)
+                .expect("closed -> open")
+                .mask,
+            BlockAnimMask::Full
+        );
+        assert_eq!(
+            set.transition(BlockAnimState::Open, BlockAnimState::Closed)
+                .expect("open -> closed")
+                .mask,
+            BlockAnimMask::Lower
+        );
+        assert_eq!(BlockAnimState::parse("sideways"), None);
+        assert_eq!(BlockAnimMask::parse("upper"), Some(BlockAnimMask::Upper));
+    }
+
+    #[test]
+    fn block_anim_catalog_tolerates_unusable_entries() {
+        let catalog = BlockAnimCatalog::from_json(r#"{ "minecraft:not_an_anim_block": { } }"#)
+            .expect("malformed entries are skipped, not fatal");
+        assert!(catalog.get("minecraft:not_an_anim_block").is_none());
+        assert!(catalog.get("minecraft:absent").is_none());
+    }
+
+    #[test]
+    fn block_anim_catalog_rejects_bad_json() {
+        assert!(BlockAnimCatalog::from_json("{ not json").is_err());
+        assert!(BlockAnimCatalog::from_json("[1, 2, 3]").is_err());
     }
 
     #[test]
