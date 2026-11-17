@@ -99,6 +99,30 @@ The hover card depends on two things from the main plan: **item entities** (so a
 
 ---
 
+## Engine hygiene: remove `creative.rs` from the core (queued, not urgent)
+
+`server/src/creative.rs` is misnamed. It started as "creative tab" but absorbed all inventory-authority logic because that is where UI actions landed. It currently mixes three unrelated things:
+
+| What is there | Where it belongs |
+|---|---|
+| `HotbarSyncLog`, `send_inventory_sync`, `hotbar_diff`, `sync_new_inventories` | Engine protocol core (`common`/`net`) — the hotbar delta contract every game uses. |
+| `apply_inventory_clicks`, `give_stack` | General inventory mechanics (`interaction`) — shared by every game, not just creative. |
+| `handle_creative_give`, `send_hud`, `sorted_block_names` | Game/content layer — with Lua removed these are **scripts of the first game bundle**, not engine code. |
+
+Why it hurts the target architecture:
+- games are scripts, so a creative mode is just one game/re among many — `CreativePlugin` does not belong in `main.rs`;
+- inventory sync is a contract all games depend on, so hiding it inside a module named "creative" creates fake coupling (this is what caused the `HotbarSyncLog` / `apply_script_requests` commit conflicts during the change-detection work);
+- `main.rs` should not know that "creative mode" exists.
+
+**Proposed split:**
+1. Move `HotbarSyncLog` + `send_inventory_sync` + `hotbar_diff` + `sync_new_inventories` into a neutral `inventory_sync` module (or `common`).
+2. Move `apply_inventory_clicks` / `give_stack` into `interaction` (or a shared inventory mechanics module).
+3. Delete `CreativePlugin`, `handle_creative_give`, `send_hud`, `sorted_block_names` from the core — reimplement as TS systems + XML in the first authored bundle. Keep `ClientMessage::CreativeGive` in the protocol only if a script needs it.
+
+Do this **after** change detection is stable — it touches `events.rs`, `interaction.rs`, `scripting.rs`, `ts_backend.rs` and the client inventory path, so it is a refactor with a real blast radius, not a cleanup.
+
+---
+
 ## Reconcile before building
 
 - My vision says modding flexibility is the point — if the fragment design ever hardens into a closed vocabulary, cut it.
