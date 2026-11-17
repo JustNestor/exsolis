@@ -28,6 +28,7 @@ mod entities;
 mod events;
 mod inventory_sync;
 mod interaction;
+mod mod_manifest;
 mod movement;
 mod net;
 mod network;

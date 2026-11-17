@@ -33,6 +33,19 @@ type Added<T> = T;
 /** As Added<T>, but matches components added or mutably accessed recently. */
 type Changed<T> = T;
 
+// ───────────────────────── cross-mod type imports ─────────────────────────
+// A mod can import a component type declared by another loaded mod. The host
+// registers every mod's exported layouts before compilation, so the imported
+// name resolves to a real Bevy component you can query.
+//
+//   import type { Lightning } from "@mymod/lightning";
+//   export function on_tick(q: Query<[Entity, Lightning]>): void { ... }
+//
+// Bundles declare their dependencies in a sibling TOML file (`<id>.toml`)
+// with only a `dependencies = ["other-mod"]` array. Missing dependencies are
+// a hard load error. Layouts are checked against the runtime registration at
+// compile time — a mismatch refuses to load rather than misreading memory.
+
 /** Query archetype must contain the component. */
 type With<T> = T;
 

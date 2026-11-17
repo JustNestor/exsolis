@@ -192,6 +192,82 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// Register an `import type { T } from "source"` as a local alias to a
+    /// host-registered component layout (Pass 0). This is how one mod queries
+    /// a component defined by another: the host registers every mod's exported
+    /// layouts into the `HostRegistry` before compilation, and the import just
+    /// binds a local name to one of them.
+    ///
+    /// Accepted sources:
+    ///   "mymod:Lightning"        -> host component "mymod:Lightning"
+    ///   "@mymod/lightning"       -> host component "mymod:Lightning"
+    /// Each imported specifier binds its *local* name to that layout, so
+    /// `import type { Lightning } from "@mymod/lightning"` makes `Lightning`
+    /// usable as a query term.
+    fn lower_import(&mut self, import: &oxc_ast::ast::ImportDeclaration<'_>) {
+        use oxc_ast::ast::{
+            ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName,
+        };
+
+        // Value imports are not supported — JIT modules are isolated.
+        if import.import_kind != ImportOrExportKind::Type {
+            self.at(import.span, "only `import type` is supported in mods");
+            return;
+        }
+        let source = import.source.value.as_str();
+        let host_name = if let Some(rest) = source.strip_prefix('@') {
+            // "@ns/name" -> "ns:Name"
+            match rest.split_once('/') {
+                Some((ns, name)) => {
+                    let mut chars = name.chars();
+                    let cap = chars.next().map(|c| c.to_ascii_uppercase()).into_iter().collect::<String>()
+                        + chars.as_str();
+                    format!("{ns}:{cap}")
+                }
+                None => {
+                    self.at(import.span, format!("invalid type import source `{source}`"));
+                    return;
+                }
+            }
+        } else {
+            source.to_owned()
+        };
+        let Some(specifiers) = &import.specifiers else {
+            self.at(import.span, "`import type` must name at least one component");
+            return;
+        };
+        for spec in specifiers {
+            let ImportDeclarationSpecifier::ImportSpecifier(s) = spec else {
+                self.at(import.span, "only named `import type { T }` is supported");
+                continue;
+            };
+            // `import type { ... }` marks the whole declaration as type-only;
+            // oxc still tags individual members as Value, so that tag is not
+            // meaningful here. The declaration-level check above is enough.
+            let imported = match &s.imported {
+                ModuleExportName::IdentifierName(id) => id.name.as_str(),
+                _ => {
+                    self.at(s.span, "imported component names must be plain identifiers");
+                    continue;
+                }
+            };
+            let host_key = if host_name.contains(':') {
+                host_name.clone()
+            } else {
+                host_name.clone()
+            };
+            let Some(layout) = self.host.component(&host_key).cloned() else {
+                self.at(
+                    s.span,
+                    format!("imported component `{imported}` (host `{host_key}`) is not registered by any loaded mod"),
+                );
+                continue;
+            };
+            let _ = imported; // local name is what matters for the alias
+            self.types.insert(s.local.name.to_string(), Ty::Struct(layout));
+        }
+    }
+
     /// Process an `interface Pos { x: f32; ... }` at the module level (Pass 0).
     fn lower_interface(&mut self, iface: &oxc_ast::ast::TSInterfaceDeclaration<'_>) {
         let name = iface.id.name.to_string();
@@ -274,6 +350,9 @@ impl<'a> Lowerer<'a> {
                 }
                 Statement::TSInterfaceDeclaration(iface) => {
                     self.lower_interface(iface);
+                }
+                Statement::ImportDeclaration(import) => {
+                    self.lower_import(import);
                 }
                 // export default { update: foo } — collect system schedule.
                 Statement::ExportDefaultDeclaration(e) => {

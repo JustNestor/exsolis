@@ -1231,6 +1231,13 @@ impl TsRuntime {
         let Ok(sources) = discover_ts_files(&self.root) else {
             return;
         };
+        // TOML manifests (dependencies only) gate mod loading: a mod whose
+        // dependency is absent is skipped with a clear diagnostic rather than
+        // compiling into silent empty queries.
+        let manifests = crate::mod_manifest::load_all(&self.root);
+        for error in crate::mod_manifest::check_dependencies(&manifests) {
+            bevy_log::warn!("[ts mod] {error}");
+        }
         let mut next_stamps = HashMap::new();
         let mut next_mods = Vec::new();
         let mut failures = HashMap::new();

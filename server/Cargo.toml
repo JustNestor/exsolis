@@ -42,6 +42,8 @@ rustc-hash.workspace = true
 nonmax = "0.5"
 bincode.workspace = true
 serde_json.workspace = true
+toml.workspace = true
+serde.workspace = true
 roxmltree.workspace = true
 mlua.workspace = true
 

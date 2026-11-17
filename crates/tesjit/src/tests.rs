@@ -139,6 +139,47 @@ fn query_component_filters_are_typed() {
 }
 
 #[test]
+fn import_type_binds_another_mods_component() {
+    let lightning = std::sync::Arc::new(
+        StructLayout::repr_c("Lightning", vec![("level".into(), Ty::I32)]).unwrap(),
+    );
+    let src = r#"
+        import type { Lightning } from "@mymod/lightning";
+        export function tick(q: Query<[Entity, Lightning]>): void {}
+    "#;
+    let mut jit = JitBuilder::new("<import-type>", std::sync::Arc::from(src))
+        .component("mymod:Lightning", lightning)
+        .unwrap()
+        .build()
+        .unwrap();
+    jit.compile(src).unwrap();
+    let compiled = jit.finish().unwrap();
+    let entry = compiled.entry("tick").unwrap();
+    let Ty::Query(row, _) = &entry.params[0] else {
+        panic!("expected a Query parameter");
+    };
+    let Ty::Tuple(terms) = row.as_ref() else {
+        panic!("expected tuple query row");
+    };
+    assert_eq!(terms.len(), 2);
+    assert!(matches!(&terms[1], Ty::Struct(l) if l.name == "Lightning"));
+}
+
+#[test]
+fn import_type_unknown_component_is_an_error() {
+    let src = r#"
+        import type { Ghost } from "nomod:ghost";
+        export function tick(q: Query<[Entity, Ghost]>): void {}
+    "#;
+    let mut jit = JitBuilder::new("<import-type-bad>", std::sync::Arc::from(src))
+        .build()
+        .unwrap();
+    let errors = jit.compile(src).unwrap_err();
+    assert!(!errors.0.is_empty());
+    assert!(errors.0.iter().any(|e| e.to_string().contains("not registered")));
+}
+
+#[test]
 fn component_literals_stage_typed_spawn_values() {
     let mut position = StructLayout::from_parts(
         "Position",
