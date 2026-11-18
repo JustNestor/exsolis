@@ -145,9 +145,19 @@ The reason to go first: `creative.rs` currently owns `HotbarSyncLog`, `send_inve
 
 ### B.3 Wire protocol / presentation
 
-**Key realization (2026-11-18): the hotbar is already an XML document.** `ui::send_hud` renders `assets/xml/hud.xml` and mounts it as `ServerMessage::UiShow { id: "hud" }`. There is no reason for the wire to carry a hardcoded slot array — that is a leftover from when the client drew the HUD itself. Do **not** add presentation fields (`glint`, icons, names-for-display) to `InventorySync`: those belong in the XML the server already sends. Verify first, then simplify.
+**Key realization (2026-11-18): the hotbar is already an XML document.** `ui::send_hud` renders `assets/xml/hud.xml` and mounts it as `ServerMessage::UiShow { id: "hud" }`. There is no reason for the wire to carry a hardcoded slot array — that is a leftover from when the client drew the HUD itself. Do **not** add presentation fields (`glint`, icons, names-for-display) to `InventorySync`: those belong in the XML the server already sends.
 
-- [ ] **B3.0 Verify** whether the client still renders any hotbar from `InventorySync`/`InventorySyncDiff` (`client/src/ui/*`) or whether `UiShow { id: "hud" }` is the only path. If the XML path is complete, `InventorySync*` becomes presentation-dead and can be reduced to a minimal "selection changed" signal (or removed entirely in a later protocol bump).
+**Goal: remove the hotbar from Rust entirely.** Verified client-side state (2026-11-18):
+- `client/src/streaming.rs:145-170` fills `ClientInventory.slots` from `InventorySync`/`InventorySyncDiff` — this is the legacy presentation path.
+- `client/src/interaction.rs:52-73` `ClientInventory { slots, selected }` and `selected_item()` — used for **placement logic** (`:385,461`), not just drawing.
+- The XML path is live: `client/src/ui/mod.rs:366` handles `UiShow { id: "hud" }`.
+
+So the removal needs a split — presentation can go, but placement needs one bit of data:
+
+- [ ] **B3.0a Remove presentation from Rust.** Delete `ClientInventory.slots` and the `InventorySync`/`InventorySyncDiff` handlers in `client/src/streaming.rs`. The HUD is drawn only from `ServerMessage::UiShow { id: "hud" }` (XML). No Rust code renders slot colors/icons/counts anymore.
+- [ ] **B3.0b Keep placement data minimal.** Placement needs to know *which block is selected*. Replace the full slot array with one minimal signal from the server: `SelectedItem { item: String }` (new message variant, `#[serde(default)]`-safe as a fresh variant), or read a `selected-item` attribute from the `hud` XML. Keep `ClientInventory.selected_index()` only if number-key selection still needs it — but note the server is authoritative (`ClientMessage::SelectHotbar` goes server→sync), so the client should not keep its own selection at all: send `SelectHotbar` on input and let the XML reflect it. Remove `ClientInventory` entirely if placement uses the server-sent `SelectedItem`.
+- [ ] **B3.0c** Update `client/src/interaction.rs` placement (`selected_item()` at `:71`, use at `:385,461`) to read the server-sent selected block; delete the "slots empty" debug log that printed the whole slot array.
+- [ ] **B3.0d** Server: stop sending `InventorySync`/`InventorySyncDiff` as presentation; `ui::send_hud` (XML) owns display; send `SelectedItem` from the same path that currently sends inventory sync. Keep `InventorySync*` in the protocol enum only if Lua/mod code still reads them — otherwise remove in a protocol bump.
 - [ ] **B3.1** Do **not** introduce `HotbarSlot`/`glint` or any presentation struct. If the wire payload must change for the entity model, keep it pure data (`item` name + `amount`); add a **new** message variant rather than changing an existing tuple arity (append-only). Presentation lives in `send_hud`'s XML.
 - [ ] **B3.2** `SpawnEntity` gains `item: Option<ItemStackSnapshot>` for `EntityKind::Item` (appended field with `#[serde(default)]`) — data only, no presentation.
 - [ ] **B3.3** Client: `send_hud` reads `inventory.hotbar()`; after the entity refactor that returns handles, so update `send_hud` to resolve names/amounts from `ItemStack` components (server-side — client untouched). Client renders whatever XML it is sent; it never resolves attributes or trusts mod component bytes.
