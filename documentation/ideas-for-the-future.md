@@ -69,7 +69,7 @@ This composes for the same reason the editable `HitContext` does: different mods
 
 ## 3. Flow — instant first, full card on demand
 
-- Whenever a card's components change, a small **presentation snapshot** (name, icon, glint, short description, "has interactive card" flag) rides along in the existing `InventorySyncDiff`. Hover shows it instantly — no round trip over UDP.
+- Whenever a card's components change, a small **presentation snapshot** (name, icon, a generic "has visual effects" flag, short description, "has interactive card" flag) rides along in the existing `InventorySyncDiff`. Hover shows it instantly — no round trip over UDP.
 - If the snapshot says the card is interactive, the client sends an "inspect this item" intent. The server renders the full XML from fragments and replies with `UiShow`; the client mounts it near the cursor and `UiHide`s on real leave.
 - Buttons inside use the existing `UiAction` round trip with a **server-side handle** in `ui_id` — never trust a client-supplied entity id, and validate that the player can actually see or hold that item.
 
